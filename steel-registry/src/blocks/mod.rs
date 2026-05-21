@@ -14,11 +14,32 @@ use crate::blocks::properties::{DynProperty, Property};
 /// Function type for shape lookups. Takes a state offset and returns the shape.
 pub type ShapeFn = fn(u16) -> &'static [shapes::AABB];
 
+/// Function type for light property lookups. Takes a state offset.
+pub type LightPropertiesFn = fn(u16) -> BlockLightProperties;
+
+/// Cached light behavior for a concrete block state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockLightProperties {
+    pub light_emission: u8,
+    pub light_dampening: u8,
+    pub use_shape_for_light_occlusion: bool,
+}
+
+impl BlockLightProperties {
+    pub const OPAQUE_FULL_BLOCK: Self = Self {
+        light_emission: 0,
+        light_dampening: 15,
+        use_shape_for_light_occlusion: false,
+    };
+}
+
 pub struct Block {
     pub key: Identifier,
     pub config: BlockConfig,
     pub properties: &'static [&'static dyn DynProperty],
     pub default_state_offset: u16,
+    /// Function to get light behavior for a state offset.
+    pub light_properties: LightPropertiesFn,
     /// Function to get collision shape for a state offset
     pub collision_shape: ShapeFn,
     /// Function to get block support shape for a state offset
@@ -56,6 +77,10 @@ const fn empty_shape(_offset: u16) -> &'static [shapes::AABB] {
     &[]
 }
 
+const fn opaque_full_block_light_properties(_offset: u16) -> BlockLightProperties {
+    BlockLightProperties::OPAQUE_FULL_BLOCK
+}
+
 impl Block {
     pub const fn new(
         key: Identifier,
@@ -67,6 +92,7 @@ impl Block {
             config,
             properties,
             default_state_offset: 0,
+            light_properties: opaque_full_block_light_properties,
             collision_shape: full_block_shape,
             support_shape: full_block_shape,
             outline_shape: full_block_shape,
@@ -75,6 +101,18 @@ impl Block {
             visual_shape: full_block_shape,
             id: OnceLock::new(),
         }
+    }
+
+    /// Sets the light property function for this block.
+    pub const fn with_light_properties(mut self, light_properties: LightPropertiesFn) -> Self {
+        self.light_properties = light_properties;
+        self
+    }
+
+    /// Gets the light properties for a given state offset.
+    #[inline]
+    pub fn get_light_properties(&self, offset: u16) -> BlockLightProperties {
+        (self.light_properties)(offset)
     }
 
     /// Sets the shape functions for this block.
@@ -542,23 +580,35 @@ crate::impl_tagged_registry!(BlockRegistry, blocks_by_key, "block");
 
 // Shape lookup methods
 impl BlockRegistry {
+    fn block_and_offset_for_state(&self, state_id: BlockStateId) -> Option<(BlockRef, u16)> {
+        let block = self
+            .state_to_block_lookup
+            .get(state_id.0 as usize)
+            .copied()?;
+        let block_id = self.state_to_block_id.get(state_id.0 as usize).copied()?;
+        let base_state = self.block_to_base_state.get(block_id).copied()?;
+        let offset = state_id.0.saturating_sub(base_state);
+        Some((block, offset))
+    }
+
     fn shape_for_state(
         &self,
         state_id: BlockStateId,
         shape: fn(&Block, u16) -> &'static [shapes::AABB],
     ) -> &'static [shapes::AABB] {
-        let block = self.state_to_block_lookup.get(state_id.0 as usize).copied();
-        let Some(block) = block else {
+        let Some((block, offset)) = self.block_and_offset_for_state(state_id) else {
             return &[shapes::AABB::FULL_BLOCK];
         };
-        let block_id = self
-            .state_to_block_id
-            .get(state_id.0 as usize)
-            .copied()
-            .unwrap_or(0);
-        let base_state = self.block_to_base_state.get(block_id).copied().unwrap_or(0);
-        let offset = state_id.0.saturating_sub(base_state);
         shape(block, offset)
+    }
+
+    /// Gets the light properties for a block state.
+    #[must_use]
+    pub fn get_light_properties(&self, state_id: BlockStateId) -> BlockLightProperties {
+        let Some((block, offset)) = self.block_and_offset_for_state(state_id) else {
+            return BlockLightProperties::OPAQUE_FULL_BLOCK;
+        };
+        block.get_light_properties(offset)
     }
 
     /// Gets the collision shape for a block state.
