@@ -2,7 +2,10 @@
 
 use rustc_hash::FxHashMap;
 use steel_protocol::packets::game::LightUpdatePacketData;
-use steel_utils::{ChunkPos, PackedSectionPos, SectionPos, codec::BitSet};
+use steel_registry::{blocks::block_state_ext::BlockStateExt, vanilla_blocks};
+use steel_utils::{BlockStateId, ChunkPos, Direction, PackedSectionPos, SectionPos, codec::BitSet};
+
+use crate::{chunk::section::Sections, physics::shapes::merged_face_occludes};
 
 /// Maximum light value stored by vanilla lighting.
 pub const MAX_LIGHT_LEVEL: u8 = 15;
@@ -15,6 +18,9 @@ pub const DATA_LAYER_EDGE: usize = 16;
 pub const DATA_LAYER_BLOCK_COUNT: usize = DATA_LAYER_EDGE * DATA_LAYER_EDGE * DATA_LAYER_EDGE;
 /// Number of packed bytes in a light section.
 pub const DATA_LAYER_SIZE: usize = DATA_LAYER_BLOCK_COUNT / 2;
+const CHUNK_EDGE: usize = 16;
+const CHUNK_COLUMN_COUNT: usize = CHUNK_EDGE * CHUNK_EDGE;
+const NEGATIVE_INFINITY: i32 = i32::MIN;
 
 /// Vanilla light layer kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -271,6 +277,279 @@ fn prepare_section_data(
     }
 }
 
+/// Per-chunk cache of the lowest skylight source edge in each X/Z column.
+///
+/// Vanilla stores this in a 256-entry `SimpleBitStorage`. Steel keeps absolute
+/// `i32` Y values instead; the cached semantics are the same, and this avoids a
+/// new bit-storage abstraction before another system needs one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkSkyLightSources {
+    min_y: i32,
+    heightmap: [i32; CHUNK_COLUMN_COUNT],
+}
+
+impl ChunkSkyLightSources {
+    /// Creates an empty skylight-source cache for a level height.
+    pub fn new(min_y: i32, height: i32) -> Result<Self, LightSectionRangeError> {
+        if height <= 0 || min_y.checked_sub(1).is_none() || min_y.checked_add(height).is_none() {
+            return Err(LightSectionRangeError { min_y, height });
+        }
+
+        let min_y = min_y - 1;
+        Ok(Self {
+            min_y,
+            heightmap: [min_y; CHUNK_COLUMN_COUNT],
+        })
+    }
+
+    /// Fills this cache from a chunk's sections.
+    pub fn fill_from_sections(&mut self, sections: &Sections) {
+        let Some(top_section_index) = sections
+            .sections
+            .iter()
+            .rposition(|section| !section.read().is_empty())
+        else {
+            self.fill(self.min_y);
+            return;
+        };
+
+        for z in 0..CHUNK_EDGE {
+            for x in 0..CHUNK_EDGE {
+                let initial_edge_y = self.find_lowest_source_y(sections, top_section_index, x, z);
+                self.set(Self::index(x, z), initial_edge_y.max(self.min_y));
+            }
+        }
+    }
+
+    /// Updates one column after a block change.
+    ///
+    /// `state_at` is called with section-local X/Z and world Y coordinates.
+    /// Returns true when the cached source edge changed.
+    pub fn update(
+        &mut self,
+        x: usize,
+        y: i32,
+        z: usize,
+        mut state_at: impl FnMut(usize, i32, usize) -> BlockStateId,
+    ) -> bool {
+        debug_assert!(x < CHUNK_EDGE);
+        debug_assert!(z < CHUNK_EDGE);
+
+        let Some(upper_edge_y) = y.checked_add(1) else {
+            return false;
+        };
+        let index = Self::index(x, z);
+        let current_lowest_source_y = self.get(index);
+        if upper_edge_y < current_lowest_source_y {
+            return false;
+        }
+
+        let top_state = state_at(x, upper_edge_y, z);
+        let middle_state = state_at(x, y, z);
+        if self.update_edge(
+            index,
+            current_lowest_source_y,
+            x,
+            z,
+            upper_edge_y,
+            top_state,
+            y,
+            middle_state,
+            &mut state_at,
+        ) {
+            return true;
+        }
+
+        let Some(bottom_y) = y.checked_sub(1) else {
+            return false;
+        };
+        let bottom_state = state_at(x, bottom_y, z);
+        self.update_edge(
+            index,
+            current_lowest_source_y,
+            x,
+            z,
+            y,
+            middle_state,
+            bottom_y,
+            bottom_state,
+            &mut state_at,
+        )
+    }
+
+    /// Returns the lowest skylight source Y for a local X/Z column.
+    #[must_use]
+    pub fn get_lowest_source_y(&self, x: usize, z: usize) -> i32 {
+        self.extend_sources_below_world(self.get(Self::index(x, z)))
+    }
+
+    /// Returns the highest cached lowest-source Y across all columns.
+    #[must_use]
+    pub fn get_highest_lowest_source_y(&self) -> i32 {
+        let mut max_value = NEGATIVE_INFINITY;
+        for value in self.heightmap {
+            if value > max_value {
+                max_value = value;
+            }
+        }
+        self.extend_sources_below_world(max_value)
+    }
+
+    fn find_lowest_source_y(
+        &self,
+        sections: &Sections,
+        top_section_index: usize,
+        x: usize,
+        z: usize,
+    ) -> i32 {
+        let mut top_y =
+            Self::section_to_block_coord(self.section_y_from_index(top_section_index) + 1);
+        let mut bottom_y = top_y - 1;
+        let mut top_state = Self::air_state();
+
+        for section_index in (0..=top_section_index).rev() {
+            let section = sections.sections[section_index].read();
+            if section.is_empty() {
+                top_state = Self::air_state();
+                top_y = Self::section_to_block_coord(self.section_y_from_index(section_index));
+                bottom_y = top_y - 1;
+                continue;
+            }
+
+            for y in (0..CHUNK_EDGE).rev() {
+                let bottom_state = section.states.get(x, y, z);
+                if Self::is_edge_occluded(top_state, bottom_state) {
+                    return top_y;
+                }
+
+                top_state = bottom_state;
+                top_y = bottom_y;
+                bottom_y -= 1;
+            }
+        }
+
+        self.min_y
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla's updateEdge inputs without bundling temporary positions"
+    )]
+    fn update_edge(
+        &mut self,
+        index: usize,
+        old_top_edge_y: i32,
+        x: usize,
+        z: usize,
+        checked_edge_y: i32,
+        top_state: BlockStateId,
+        bottom_y: i32,
+        bottom_state: BlockStateId,
+        state_at: &mut impl FnMut(usize, i32, usize) -> BlockStateId,
+    ) -> bool {
+        if Self::is_edge_occluded(top_state, bottom_state) {
+            if checked_edge_y > old_top_edge_y {
+                self.set(index, checked_edge_y);
+                return true;
+            }
+        } else if checked_edge_y == old_top_edge_y {
+            let new_source_y =
+                self.find_lowest_source_below(x, z, bottom_y, bottom_state, state_at);
+            self.set(index, new_source_y);
+            return true;
+        }
+
+        false
+    }
+
+    fn find_lowest_source_below(
+        &self,
+        x: usize,
+        z: usize,
+        start_y: i32,
+        start_state: BlockStateId,
+        state_at: &mut impl FnMut(usize, i32, usize) -> BlockStateId,
+    ) -> i32 {
+        let mut top_y = start_y;
+        let mut top_state = start_state;
+        let Some(mut bottom_y) = start_y.checked_sub(1) else {
+            return self.min_y;
+        };
+
+        while bottom_y >= self.min_y {
+            let bottom_state = state_at(x, bottom_y, z);
+            if Self::is_edge_occluded(top_state, bottom_state) {
+                return top_y;
+            }
+
+            top_state = bottom_state;
+            top_y = bottom_y;
+            let Some(next_bottom_y) = bottom_y.checked_sub(1) else {
+                break;
+            };
+            bottom_y = next_bottom_y;
+        }
+
+        self.min_y
+    }
+
+    fn is_edge_occluded(top_state: BlockStateId, bottom_state: BlockStateId) -> bool {
+        if bottom_state.get_light_dampening() != 0 {
+            return true;
+        }
+
+        let top_shape = Self::light_occlusion_shape(top_state);
+        let bottom_shape = Self::light_occlusion_shape(bottom_state);
+        merged_face_occludes(top_shape, bottom_shape, Direction::Down)
+    }
+
+    fn light_occlusion_shape(
+        state: BlockStateId,
+    ) -> &'static [steel_registry::blocks::shapes::AABB] {
+        if !state.get_block().config.can_occlude || !state.use_shape_for_light_occlusion() {
+            return &[];
+        }
+
+        state.get_occlusion_shape()
+    }
+
+    fn fill(&mut self, lowest_source_y: i32) {
+        self.heightmap.fill(lowest_source_y);
+    }
+
+    fn set(&mut self, index: usize, value: i32) {
+        self.heightmap[index] = value;
+    }
+
+    fn get(&self, index: usize) -> i32 {
+        self.heightmap[index]
+    }
+
+    fn extend_sources_below_world(&self, value: i32) -> i32 {
+        if value == self.min_y {
+            NEGATIVE_INFINITY
+        } else {
+            value
+        }
+    }
+
+    fn section_y_from_index(&self, section_index: usize) -> i32 {
+        SectionPos::block_to_section_coord(self.min_y + 1) + section_index as i32
+    }
+
+    const fn section_to_block_coord(section_y: i32) -> i32 {
+        section_y << 4
+    }
+
+    const fn index(x: usize, z: usize) -> usize {
+        x + z * CHUNK_EDGE
+    }
+
+    fn air_state() -> BlockStateId {
+        vanilla_blocks::AIR.default_state()
+    }
+}
+
 /// Error returned when packed light data has the wrong length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataLayerLengthError {
@@ -431,12 +710,44 @@ impl Default for DataLayer {
 
 #[cfg(test)]
 mod tests {
+    use steel_registry::{test_support::init_test_registry, vanilla_blocks};
+    use steel_utils::BlockStateId;
     use steel_utils::{ChunkPos, SectionPos};
 
+    use crate::{
+        behavior::init_behaviors,
+        chunk::section::{ChunkSection, Sections},
+    };
+
     use super::{
-        DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap, LightSectionRange,
+        ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap, LightSectionRange,
         build_light_update_packet,
     };
+
+    fn init_light_tests() {
+        init_test_registry();
+        init_behaviors();
+    }
+
+    fn empty_sections(section_count: usize) -> Sections {
+        let sections: Vec<ChunkSection> = (0..section_count)
+            .map(|_| ChunkSection::new_empty())
+            .collect();
+        Sections::from_owned(sections.into_boxed_slice())
+    }
+
+    fn single_section_with_block(local_y: usize, state: BlockStateId) -> Sections {
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(0, local_y, 0, state);
+        Sections::from_owned(vec![section].into_boxed_slice())
+    }
+
+    fn new_test_sky_sources() -> ChunkSkyLightSources {
+        let Ok(sources) = ChunkSkyLightSources::new(0, 16) else {
+            panic!("valid single-section height rejected");
+        };
+        sources
+    }
 
     #[test]
     fn new_layer_is_homogeneous_zero() {
@@ -628,5 +939,66 @@ mod tests {
         assert_eq!(packet.empty_block_y_mask.0[0], 0);
         assert!(packet.sky_updates.is_empty());
         assert!(packet.block_updates.is_empty());
+    }
+
+    #[test]
+    fn sky_light_sources_empty_chunk_extends_below_world() {
+        init_light_tests();
+        let sections = empty_sections(1);
+        let mut sources = new_test_sky_sources();
+
+        sources.fill_from_sections(&sections);
+
+        assert_eq!(sources.get_lowest_source_y(0, 0), i32::MIN);
+        assert_eq!(sources.get_lowest_source_y(15, 15), i32::MIN);
+        assert_eq!(sources.get_highest_lowest_source_y(), i32::MIN);
+    }
+
+    #[test]
+    fn sky_light_sources_find_lowest_occluding_edge() {
+        init_light_tests();
+        let stone = vanilla_blocks::STONE.default_state();
+        let sections = single_section_with_block(4, stone);
+        let mut sources = new_test_sky_sources();
+
+        sources.fill_from_sections(&sections);
+
+        assert_eq!(sources.get_lowest_source_y(0, 0), 5);
+        assert_eq!(sources.get_lowest_source_y(1, 0), i32::MIN);
+        assert_eq!(sources.get_highest_lowest_source_y(), 5);
+    }
+
+    #[test]
+    fn sky_light_sources_update_adds_and_removes_occluding_edge() {
+        init_light_tests();
+        let air = vanilla_blocks::AIR.default_state();
+        let stone = vanilla_blocks::STONE.default_state();
+        let sections = empty_sections(1);
+        let mut sources = new_test_sky_sources();
+        sources.fill_from_sections(&sections);
+
+        let added = sources.update(0, 4, 0, |_x, y, _z| if y == 4 { stone } else { air });
+
+        assert!(added);
+        assert_eq!(sources.get_lowest_source_y(0, 0), 5);
+
+        let removed = sources.update(0, 4, 0, |_x, _y, _z| air);
+
+        assert!(removed);
+        assert_eq!(sources.get_lowest_source_y(0, 0), i32::MIN);
+    }
+
+    #[test]
+    fn sky_light_sources_update_ignores_changes_below_current_source_edge() {
+        init_light_tests();
+        let stone = vanilla_blocks::STONE.default_state();
+        let sections = single_section_with_block(10, stone);
+        let mut sources = new_test_sky_sources();
+        sources.fill_from_sections(&sections);
+
+        let changed = sources.update(0, 4, 0, |_x, _y, _z| stone);
+
+        assert!(!changed);
+        assert_eq!(sources.get_lowest_source_y(0, 0), 11);
     }
 }
