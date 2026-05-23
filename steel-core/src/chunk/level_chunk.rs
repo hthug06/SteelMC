@@ -807,6 +807,7 @@ impl LevelChunk {
     /// Extracts the light data for sending to the client.
     #[must_use]
     pub fn extract_light_data(&self) -> LightUpdatePacketData {
+        // TODO: Read from LevelLightEngine storage once Steel owns live light data.
         // Vanilla's light section count is sectionsCount + 2 (one below and one above the world)
         let light_section_count = self.sections.sections.len() + 2;
         let mut sky_y_mask = BitSet(vec![0; light_section_count.div_ceil(64)].into_boxed_slice());
