@@ -31,6 +31,16 @@ pub enum LightLayer {
     Block,
 }
 
+/// Returns whether vanilla must re-check lighting after a block-state change.
+#[must_use]
+pub fn has_different_light_properties(old_state: BlockStateId, new_state: BlockStateId) -> bool {
+    old_state != new_state
+        && (old_state.get_light_dampening() != new_state.get_light_dampening()
+            || old_state.get_light_emission() != new_state.get_light_emission()
+            || old_state.use_shape_for_light_occlusion()
+            || new_state.use_shape_for_light_occlusion())
+}
+
 /// Error returned when a world height cannot produce a valid light-section range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LightSectionRangeError {
@@ -300,6 +310,18 @@ impl ChunkSkyLightSources {
             min_y,
             heightmap: [min_y; CHUNK_COLUMN_COUNT],
         })
+    }
+
+    /// Creates a cache for world heights already accepted by chunk construction.
+    ///
+    /// Invalid world heights are fatal because chunks and light sections cannot
+    /// be indexed coherently without a valid vertical range.
+    #[must_use]
+    pub fn for_valid_world_height(min_y: i32, height: i32) -> Self {
+        match Self::new(min_y, height) {
+            Ok(sources) => sources,
+            Err(error) => panic!("invalid world height for skylight sources: {error:?}"),
+        }
     }
 
     /// Fills this cache from a chunk's sections.
@@ -710,6 +732,7 @@ impl Default for DataLayer {
 
 #[cfg(test)]
 mod tests {
+    use steel_registry::blocks::block_state_ext::BlockStateExt;
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
     use steel_utils::BlockStateId;
     use steel_utils::{ChunkPos, SectionPos};
@@ -721,7 +744,7 @@ mod tests {
 
     use super::{
         ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap, LightSectionRange,
-        build_light_update_packet,
+        build_light_update_packet, has_different_light_properties,
     };
 
     fn init_light_tests() {
@@ -939,6 +962,23 @@ mod tests {
         assert_eq!(packet.empty_block_y_mask.0[0], 0);
         assert!(packet.sky_updates.is_empty());
         assert!(packet.block_updates.is_empty());
+    }
+
+    #[test]
+    fn different_light_properties_match_vanilla_conditions() {
+        init_light_tests();
+        let air = vanilla_blocks::AIR.default_state();
+        let stone = vanilla_blocks::STONE.default_state();
+
+        assert!(!has_different_light_properties(air, air));
+        assert!(has_different_light_properties(air, stone));
+
+        let light = vanilla_blocks::LIGHT.default_state();
+        let dim_light = light.set_value(
+            &steel_registry::blocks::properties::BlockStateProperties::LEVEL,
+            7,
+        );
+        assert!(has_different_light_properties(light, dim_light));
     }
 
     #[test]

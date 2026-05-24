@@ -24,6 +24,7 @@ use crate::block_entity::{BlockEntityStorage, SharedBlockEntity};
 use crate::chunk::{
     chunk_access::ChunkStatus,
     heightmap::{HeightmapType, ProtoHeightmaps},
+    light::{ChunkSkyLightSources, has_different_light_properties},
     section::Sections,
 };
 use crate::entity::{EntityStorage, SharedEntity};
@@ -83,6 +84,8 @@ pub struct ProtoChunk {
     pub block_ticks: SyncMutex<BlockTickList>,
     /// Scheduled fluid ticks queued while this chunk is still a proto chunk.
     pub fluid_ticks: SyncMutex<FluidTickList>,
+    /// Per-column skylight source cache owned by vanilla `ChunkAccess`.
+    pub sky_light_sources: SyncRwLock<ChunkSkyLightSources>,
     // TODO: research persisting NoiseChunk/Aquifer across stages like vanilla
     // does. Vanilla caches `NoiseChunk` on `ChunkAccess` so noise, surface,
     // and carvers share one instance; we currently rebuild per stage. Blocked
@@ -120,6 +123,9 @@ impl ProtoChunk {
             postprocessing: SyncRwLock::new(empty_postprocessing(height)),
             block_ticks: SyncMutex::new(BlockTickList::new()),
             fluid_ticks: SyncMutex::new(FluidTickList::new()),
+            sky_light_sources: SyncRwLock::new(ChunkSkyLightSources::for_valid_world_height(
+                min_y, height,
+            )),
         }
     }
 
@@ -143,7 +149,7 @@ impl ProtoChunk {
         fluid_ticks: FluidTickList,
         level: Weak<World>,
     ) -> Self {
-        Self {
+        let chunk = Self {
             sections,
             pos,
             dirty: AtomicBool::new(false),
@@ -161,7 +167,16 @@ impl ProtoChunk {
             postprocessing: SyncRwLock::new(postprocessing_from_disk(height, postprocessing)),
             block_ticks: SyncMutex::new(block_ticks),
             fluid_ticks: SyncMutex::new(fluid_ticks),
+            sky_light_sources: SyncRwLock::new(ChunkSkyLightSources::for_valid_world_height(
+                min_y, height,
+            )),
+        };
+
+        if status >= ChunkStatus::InitializeLight {
+            chunk.initialize_light_sources();
         }
+
+        chunk
     }
 
     /// Returns the minimum Y coordinate of the world.
@@ -253,6 +268,14 @@ impl ProtoChunk {
     #[must_use]
     pub fn level_weak(&self) -> Weak<World> {
         self.level.clone()
+    }
+
+    /// Fills the vanilla skylight-source cache from current section contents.
+    pub fn initialize_light_sources(&self) {
+        self.sections.recalculate_counts();
+        self.sky_light_sources
+            .write()
+            .fill_from_sections(&self.sections);
     }
 
     /// Gets a block entity at the given position.
@@ -369,12 +392,27 @@ impl ProtoChunk {
 
         let section_index = self.get_section_index(y);
         let section = &self.sections.sections[section_index];
-        let mut section_guard = section.write();
-        let old_state = section_guard.states.set(local_x, local_y, local_z, state);
-        drop(section_guard);
+        let (old_state, was_empty, is_empty) = {
+            let mut section_guard = section.write();
+            let was_empty = section_guard.is_empty();
+            let old_state = section_guard.set_block_state(local_x, local_y, local_z, state);
+            let is_empty = section_guard.is_empty();
+            (old_state, was_empty, is_empty)
+        };
 
         if old_state == state {
             return None;
+        }
+
+        if self.status() >= ChunkStatus::InitializeLight {
+            if was_empty != is_empty {
+                // TODO: Notify LevelLightEngine::update_section_status once Steel owns live light storage.
+            }
+
+            if has_different_light_properties(old_state, state) {
+                self.update_sky_light_sources(local_x, y, local_z);
+                // TODO: Notify LevelLightEngine::check_block once Steel owns live light storage.
+            }
         }
 
         self.update_status_heightmaps_after_block_change(local_x, y, local_z, state);
@@ -382,6 +420,20 @@ impl ProtoChunk {
         self.update_block_entity_lifecycle(pos, old_state, state, flags);
         self.mark_unsaved();
         Some(old_state)
+    }
+
+    fn update_sky_light_sources(&self, local_x: usize, y: i32, local_z: usize) {
+        let chunk_min_x = self.pos.0.x * 16;
+        let chunk_min_z = self.pos.0.y * 16;
+        self.sky_light_sources
+            .write()
+            .update(local_x, y, local_z, |scan_x, scan_y, scan_z| {
+                self.get_block_state(BlockPos::new(
+                    chunk_min_x + scan_x as i32,
+                    scan_y,
+                    chunk_min_z + scan_z as i32,
+                ))
+            });
     }
 
     /// Applies the heightmap side effect for an optimized direct section write.
@@ -502,6 +554,7 @@ mod tests {
 
     use super::ProtoChunk;
     use crate::behavior::init_behaviors;
+    use crate::chunk::chunk_access::ChunkStatus;
     use crate::chunk::section::{ChunkSection, Sections};
     use crate::world::tick_scheduler::TickPriority;
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
@@ -565,5 +618,26 @@ mod tests {
         proto.set_block_state(pos, cave_air, UpdateFlags::UPDATE_CLIENTS);
 
         assert_eq!(proto.get_block_state(pos), cave_air);
+    }
+
+    #[test]
+    fn proto_block_change_updates_sky_light_sources_after_light_initialization() {
+        init_test_registry();
+        init_behaviors();
+        let proto = ProtoChunk::new(
+            Sections::from_owned(vec![ChunkSection::new_empty()].into_boxed_slice()),
+            ChunkPos::new(0, 0),
+            0,
+            16,
+            Weak::new(),
+        );
+        let pos = BlockPos::new(0, 4, 0);
+        let stone = vanilla_blocks::STONE.default_state();
+
+        proto.initialize_light_sources();
+        proto.set_status(ChunkStatus::InitializeLight);
+        proto.set_block_state(pos, stone, UpdateFlags::UPDATE_CLIENTS);
+
+        assert_eq!(proto.sky_light_sources.read().get_lowest_source_y(0, 0), 5);
     }
 }

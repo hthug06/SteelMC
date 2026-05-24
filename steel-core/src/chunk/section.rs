@@ -93,6 +93,13 @@ impl Sections {
         Self { sections: holders }
     }
 
+    /// Recalculates cached counters for every section.
+    pub fn recalculate_counts(&self) {
+        for section in &self.sections {
+            section.write().recalculate_counts();
+        }
+    }
+
     /// Gets a block at a relative position in the chunk.
     #[must_use]
     pub fn get_relative_block(

@@ -27,6 +27,7 @@ use crate::behavior::{BLOCK_BEHAVIORS, BlockStateBehaviorExt, FLUID_BEHAVIORS};
 use crate::block_entity::{BlockEntityStorage, SharedBlockEntity};
 use crate::chunk::{
     heightmap::{ChunkHeightmaps, HeightmapType},
+    light::{ChunkSkyLightSources, has_different_light_properties},
     proto_chunk::ProtoChunk,
     section::Sections,
 };
@@ -74,6 +75,8 @@ pub struct LevelChunk {
     pub structure_references: SyncRwLock<StructureReferenceMap>,
     /// Vanilla proto postprocessing offsets carried through promotion and drained once.
     postprocessing: SyncMutex<Box<[Vec<u16>]>>,
+    /// Per-column skylight source cache owned by vanilla `ChunkAccess`.
+    pub sky_light_sources: SyncRwLock<ChunkSkyLightSources>,
 }
 
 impl LevelChunk {
@@ -205,15 +208,14 @@ impl LevelChunk {
         let chunk_heightmaps = ChunkHeightmaps::from_proto(&mut proto_heightmaps, min_y, height);
 
         // Recalculate section counts for random tick optimization
-        for section in &proto_chunk.sections.sections {
-            section.write().recalculate_counts();
-        }
+        proto_chunk.sections.recalculate_counts();
 
         let structure_starts = proto_chunk.structure_starts.into_inner();
         let structure_references = proto_chunk.structure_references.into_inner();
         let postprocessing = proto_chunk.postprocessing.into_inner();
         let block_ticks = proto_chunk.block_ticks.into_inner();
         let fluid_ticks = proto_chunk.fluid_ticks.into_inner();
+        let sky_light_sources = proto_chunk.sky_light_sources.into_inner();
         let block_entities = proto_chunk.block_entities;
         let entities = proto_chunk.entities;
 
@@ -234,6 +236,7 @@ impl LevelChunk {
             structure_starts: SyncRwLock::new(structure_starts),
             structure_references: SyncRwLock::new(structure_references),
             postprocessing: SyncMutex::new(postprocessing),
+            sky_light_sources: SyncRwLock::new(sky_light_sources),
         };
         let _ = chunk.register_existing_entities();
         chunk
@@ -273,11 +276,14 @@ impl LevelChunk {
         structure_references: StructureReferenceMap,
     ) -> Self {
         // Recalculate section counts for random tick optimization
-        for section in &sections.sections {
-            section.write().recalculate_counts();
-        }
+        sections.recalculate_counts();
 
         Self::populate_poi(&level, &sections, pos, min_y);
+        let sky_light_sources = {
+            let mut sources = ChunkSkyLightSources::for_valid_world_height(min_y, height);
+            sources.fill_from_sections(&sections);
+            sources
+        };
 
         Self {
             sections,
@@ -294,6 +300,7 @@ impl LevelChunk {
             structure_starts: SyncRwLock::new(structure_starts),
             structure_references: SyncRwLock::new(structure_references),
             postprocessing: SyncMutex::new(empty_postprocessing(height)),
+            sky_light_sources: SyncRwLock::new(sky_light_sources),
         }
     }
 
@@ -312,6 +319,13 @@ impl LevelChunk {
     #[must_use]
     pub fn level_weak(&self) -> Weak<World> {
         self.level.clone()
+    }
+
+    /// Fills the vanilla skylight-source cache from current section contents.
+    pub fn initialize_light_sources(&self) {
+        self.sky_light_sources
+            .write()
+            .fill_from_sections(&self.sections);
     }
 
     /// Drains the vanilla proto postprocessing offsets carried through promotion.
@@ -610,9 +624,13 @@ impl LevelChunk {
         let local_y = (y & 15) as usize;
         let local_z = (pos.0.z & 15) as usize;
 
-        let old_state = section
-            .write()
-            .set_block_state(local_x, local_y, local_z, state);
+        let (old_state, was_empty, is_empty) = {
+            let mut section_guard = section.write();
+            let was_empty = section_guard.is_empty();
+            let old_state = section_guard.set_block_state(local_x, local_y, local_z, state);
+            let is_empty = section_guard.is_empty();
+            (old_state, was_empty, is_empty)
+        };
 
         if old_state == state {
             return None;
@@ -634,19 +652,14 @@ impl LevelChunk {
         let old_block = old_state.get_block();
         let new_block = state.get_block();
 
-        // TODO: Light updates
-        // In vanilla, light engine is notified when section emptiness changes:
-        // let is_empty = section.read().states.has_only_air();
-        // if was_empty != is_empty {
-        //     level.chunk_source.light_engine.update_section_status(pos, is_empty);
-        //     level.chunk_source.on_section_emptiness_changed(chunk_pos.x, section_y, chunk_pos.z, is_empty);
-        // }
-        //
-        // And when light properties change:
-        // if LightEngine::has_different_light_properties(old_state, state) {
-        //     self.sky_light_sources.update(self, local_x, y, local_z);
-        //     level.chunk_source.light_engine.check_block(pos);
-        // }
+        if was_empty != is_empty {
+            // TODO: Notify LevelLightEngine::update_section_status and chunk source section emptiness.
+        }
+
+        if has_different_light_properties(old_state, state) {
+            self.update_sky_light_sources(local_x, y, local_z);
+            // TODO: Notify LevelLightEngine::check_block once Steel owns live light storage.
+        }
 
         // Re-read the block to verify it wasn't changed concurrently
         let current_block = section
@@ -717,6 +730,20 @@ impl LevelChunk {
 
         self.mark_unsaved();
         Some(old_state)
+    }
+
+    fn update_sky_light_sources(&self, local_x: usize, y: i32, local_z: usize) {
+        let chunk_min_x = self.pos.0.x * 16;
+        let chunk_min_z = self.pos.0.y * 16;
+        self.sky_light_sources
+            .write()
+            .update(local_x, y, local_z, |scan_x, scan_y, scan_z| {
+                self.get_block_state(BlockPos::new(
+                    chunk_min_x + scan_x as i32,
+                    scan_y,
+                    chunk_min_z + scan_z as i32,
+                ))
+            });
     }
 
     /// Gets a block state at the given position.
