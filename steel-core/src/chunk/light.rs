@@ -43,6 +43,12 @@ const QUEUE_ENTRY_DIRECTIONS_MASK: u64 = 0b11_1111_0000;
 const QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE: u64 = 1 << 10;
 const QUEUE_ENTRY_FLAG_INCREASE_FROM_EMISSION: u64 = 1 << 11;
 const LIGHT_QUEUE_MIN_CAPACITY: usize = 512;
+const REMOVE_TOP_SKY_SOURCE_ENTRY: LightQueueEntry =
+    LightQueueEntry::decrease_all_directions(MAX_LIGHT_LEVEL);
+const REMOVE_SKY_SOURCE_ENTRY: LightQueueEntry =
+    LightQueueEntry::decrease_skip_one_direction(MAX_LIGHT_LEVEL, Direction::Up);
+const ADD_SKY_SOURCE_ENTRY: LightQueueEntry =
+    LightQueueEntry::increase_skip_one_direction(MAX_LIGHT_LEVEL, false, Direction::Up);
 
 /// Vanilla light layer kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -975,6 +981,44 @@ impl LayerLightSectionStorage {
         Some(())
     }
 
+    /// Updates one sky-source column after its source edge changes.
+    ///
+    /// This mirrors vanilla `SkyLightEngine.updateSourcesInColumn`, split from
+    /// `checkNode` so the future engine can supply chunk-neighbor source data
+    /// without this storage type owning world chunk lookup.
+    pub fn update_sky_sources_in_column(
+        &mut self,
+        x: i32,
+        z: i32,
+        lowest_source_y: i32,
+        neighbor_lowest_source_y: i32,
+        queues: &mut LightPropagationQueues,
+    ) -> Result<Option<()>, MissingLightDataLayerError> {
+        if self.sky_data.is_none() {
+            return Ok(None);
+        }
+
+        let Some(bottom_section_y) = self.get_bottom_section_y() else {
+            return Ok(Some(()));
+        };
+        if bottom_section_y == POSITIVE_INFINITY {
+            return Ok(Some(()));
+        }
+
+        let world_bottom_y = Self::section_to_block_coord(bottom_section_y);
+        self.remove_sky_sources_below(x, z, lowest_source_y, world_bottom_y, queues)?;
+        self.add_sky_sources_above(
+            x,
+            z,
+            lowest_source_y,
+            neighbor_lowest_source_y,
+            world_bottom_y,
+            queues,
+        )?;
+
+        Ok(Some(()))
+    }
+
     /// Returns true when this section's column has light sources enabled.
     #[must_use]
     pub fn light_on_in_section(&self, section_pos: SectionPos) -> bool {
@@ -1259,6 +1303,104 @@ impl LayerLightSectionStorage {
 
     fn section_relative_coord(block_coord: i32) -> usize {
         (block_coord & 15) as usize
+    }
+
+    fn section_to_block_coord(section_y: i32) -> i32 {
+        section_y << 4
+    }
+
+    fn remove_sky_sources_below(
+        &mut self,
+        x: i32,
+        z: i32,
+        lowest_source_y: i32,
+        world_bottom_y: i32,
+        queues: &mut LightPropagationQueues,
+    ) -> Result<(), MissingLightDataLayerError> {
+        if lowest_source_y <= world_bottom_y {
+            return Ok(());
+        }
+
+        let section_x = SectionPos::block_to_section_coord(x);
+        let section_z = SectionPos::block_to_section_coord(z);
+        let start_y = lowest_source_y - 1;
+        let mut section_y = SectionPos::block_to_section_coord(start_y);
+
+        loop {
+            let Some(has_light_data) = self.has_light_data_at_or_below(section_y) else {
+                return Ok(());
+            };
+            if !has_light_data {
+                return Ok(());
+            }
+
+            let section_pos = SectionPos::new(section_x, section_y, section_z);
+            if self.storing_light_for_section(section_pos) {
+                let section_bottom_y = Self::section_to_block_coord(section_y);
+                let section_top_y = section_bottom_y + 15;
+
+                for y in (section_bottom_y..=section_top_y.min(start_y)).rev() {
+                    let block_pos = BlockPos::new(x, y, z);
+                    if self.get_stored_level(block_pos) != Some(MAX_LIGHT_LEVEL) {
+                        return Ok(());
+                    }
+
+                    self.set_stored_level(block_pos, 0)?;
+                    let entry = if y == start_y {
+                        REMOVE_TOP_SKY_SOURCE_ENTRY
+                    } else {
+                        REMOVE_SKY_SOURCE_ENTRY
+                    };
+                    queues.enqueue_decrease(block_pos, entry);
+                }
+            }
+
+            section_y -= 1;
+        }
+    }
+
+    fn add_sky_sources_above(
+        &mut self,
+        x: i32,
+        z: i32,
+        lowest_source_y: i32,
+        neighbor_lowest_source_y: i32,
+        world_bottom_y: i32,
+        queues: &mut LightPropagationQueues,
+    ) -> Result<(), MissingLightDataLayerError> {
+        let section_x = SectionPos::block_to_section_coord(x);
+        let section_z = SectionPos::block_to_section_coord(z);
+        let start_y = lowest_source_y.max(world_bottom_y);
+        let mut section_y = SectionPos::block_to_section_coord(start_y);
+
+        loop {
+            let section_pos = SectionPos::new(section_x, section_y, section_z);
+            let Some(is_above_data) = self.is_above_data(section_pos) else {
+                return Ok(());
+            };
+            if is_above_data {
+                return Ok(());
+            }
+
+            if self.storing_light_for_section(section_pos) {
+                let section_bottom_y = Self::section_to_block_coord(section_y);
+                let section_top_y = section_bottom_y + 15;
+
+                for y in section_bottom_y.max(start_y)..=section_top_y {
+                    let block_pos = BlockPos::new(x, y, z);
+                    if self.get_stored_level(block_pos) == Some(MAX_LIGHT_LEVEL) {
+                        return Ok(());
+                    }
+
+                    self.set_stored_level(block_pos, MAX_LIGHT_LEVEL)?;
+                    if y < neighbor_lowest_source_y || y == lowest_source_y {
+                        queues.enqueue_increase(block_pos, ADD_SKY_SOURCE_ENTRY);
+                    }
+                }
+            }
+
+            section_y += 1;
+        }
     }
 
     fn create_data_layer(&mut self, section_pos: SectionPos) -> DataLayer {
@@ -2750,6 +2892,94 @@ mod tests {
         );
         assert!(!queues.has_work());
         assert!(!storage.light_on_in_column(SectionPos::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn sky_storage_update_sources_column_adds_sources_and_queues_edges() {
+        let section = SectionPos::new(0, 4, 0);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        let mut queues = LightPropagationQueues::new();
+
+        assert_eq!(storage.update_section_status(section, false), Ok(()));
+        assert_eq!(
+            storage.update_sky_sources_in_column(0, 0, 78, 80, &mut queues),
+            Ok(Some(()))
+        );
+
+        assert_eq!(storage.get_stored_level(BlockPos::new(0, 78, 0)), Some(15));
+        assert_eq!(storage.get_stored_level(BlockPos::new(0, 79, 0)), Some(15));
+        assert_eq!(storage.get_stored_level(BlockPos::new(0, 80, 0)), Some(15));
+
+        let Some(first) = queues.dequeue_increase() else {
+            panic!("first skylight source edge was not queued");
+        };
+        assert_eq!(first.block_pos, BlockPos::new(0, 78, 0));
+        assert_eq!(first.entry, super::ADD_SKY_SOURCE_ENTRY);
+        assert!(first.entry.should_propagate_in_direction(Down));
+        assert!(!first.entry.should_propagate_in_direction(Up));
+
+        let Some(second) = queues.dequeue_increase() else {
+            panic!("second skylight source edge was not queued");
+        };
+        assert_eq!(second.block_pos, BlockPos::new(0, 79, 0));
+        assert_eq!(second.entry, super::ADD_SKY_SOURCE_ENTRY);
+        assert_eq!(queues.dequeue_increase(), None);
+    }
+
+    #[test]
+    fn sky_storage_update_sources_column_removes_old_sources_below_new_edge() {
+        let section = SectionPos::new(0, 4, 0);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        let mut queues = LightPropagationQueues::new();
+
+        assert_eq!(storage.update_section_status(section, false), Ok(()));
+        assert_eq!(
+            storage.set_stored_level(BlockPos::new(0, 78, 0), 15),
+            Ok(())
+        );
+        assert_eq!(
+            storage.set_stored_level(BlockPos::new(0, 79, 0), 15),
+            Ok(())
+        );
+        assert_eq!(
+            storage.set_stored_level(BlockPos::new(0, 80, 0), 15),
+            Ok(())
+        );
+
+        assert_eq!(
+            storage.update_sky_sources_in_column(0, 0, 80, 1000, &mut queues),
+            Ok(Some(()))
+        );
+
+        assert_eq!(storage.get_stored_level(BlockPos::new(0, 78, 0)), Some(0));
+        assert_eq!(storage.get_stored_level(BlockPos::new(0, 79, 0)), Some(0));
+        assert_eq!(storage.get_stored_level(BlockPos::new(0, 80, 0)), Some(15));
+
+        let Some(first) = queues.dequeue_decrease() else {
+            panic!("top skylight source removal was not queued");
+        };
+        assert_eq!(first.block_pos, BlockPos::new(0, 79, 0));
+        assert_eq!(first.entry, super::REMOVE_TOP_SKY_SOURCE_ENTRY);
+
+        let Some(second) = queues.dequeue_decrease() else {
+            panic!("lower skylight source removal was not queued");
+        };
+        assert_eq!(second.block_pos, BlockPos::new(0, 78, 0));
+        assert_eq!(second.entry, super::REMOVE_SKY_SOURCE_ENTRY);
+        assert_eq!(queues.dequeue_decrease(), None);
+        assert_eq!(queues.dequeue_increase(), None);
+    }
+
+    #[test]
+    fn block_storage_rejects_sky_source_column_update() {
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        let mut queues = LightPropagationQueues::new();
+
+        assert_eq!(
+            storage.update_sky_sources_in_column(0, 0, 80, 1000, &mut queues),
+            Ok(None)
+        );
+        assert!(!queues.has_work());
     }
 
     #[test]
