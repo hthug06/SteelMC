@@ -2,13 +2,23 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_protocol::packets::game::LightUpdatePacketData;
-use steel_registry::{blocks::block_state_ext::BlockStateExt, vanilla_blocks};
+use steel_registry::{
+    blocks::{block_state_ext::BlockStateExt, shapes::VoxelShape},
+    vanilla_blocks,
+};
 use steel_utils::{BlockStateId, ChunkPos, Direction, PackedSectionPos, SectionPos, codec::BitSet};
 
-use crate::{chunk::section::Sections, physics::shapes::merged_face_occludes};
+use crate::{
+    chunk::section::Sections,
+    physics::shapes::{face_shape_occludes, merged_face_occludes},
+};
 
 /// Maximum light value stored by vanilla lighting.
 pub const MAX_LIGHT_LEVEL: u8 = 15;
+/// Minimum opacity used while propagating vanilla light.
+pub const MIN_LIGHT_OPACITY: u8 = 1;
+/// Opacity returned when a block face fully blocks light.
+pub const LIGHT_BLOCKED: u8 = MAX_LIGHT_LEVEL + 1;
 /// Vanilla stores one extra light section below and above the build height.
 pub const LIGHT_SECTION_PADDING: i32 = 1;
 
@@ -48,6 +58,58 @@ pub fn has_different_light_properties(old_state: BlockStateId, new_state: BlockS
             || old_state.get_light_emission() != new_state.get_light_emission()
             || old_state.use_shape_for_light_occlusion()
             || new_state.use_shape_for_light_occlusion())
+}
+
+/// Returns vanilla's simple opacity for light propagation.
+///
+/// Vanilla clamps block light dampening to at least one while propagating
+/// through neighbors.
+#[must_use]
+pub fn get_light_opacity(state: BlockStateId) -> u8 {
+    state.get_light_dampening().max(MIN_LIGHT_OPACITY)
+}
+
+/// Returns the occlusion shape vanilla lighting uses for a block state.
+#[must_use]
+pub fn light_occlusion_shape(state: BlockStateId) -> VoxelShape {
+    if !state.get_block().config.can_occlude || !state.use_shape_for_light_occlusion() {
+        return &[];
+    }
+
+    state.get_occlusion_shape()
+}
+
+/// Returns vanilla's `LightEngine.getLightBlockInto` result.
+#[must_use]
+pub fn get_light_block_into(
+    from_state: BlockStateId,
+    to_state: BlockStateId,
+    direction: Direction,
+    simple_opacity: u8,
+) -> u8 {
+    let from_shape = light_occlusion_shape(from_state);
+    let to_shape = light_occlusion_shape(to_state);
+    if from_shape.is_empty() && to_shape.is_empty() {
+        return simple_opacity;
+    }
+
+    if merged_face_occludes(from_shape, to_shape, direction) {
+        LIGHT_BLOCKED
+    } else {
+        simple_opacity
+    }
+}
+
+/// Returns whether the selected state faces fully occlude light.
+#[must_use]
+pub fn light_face_occludes(
+    from_state: BlockStateId,
+    to_state: BlockStateId,
+    direction: Direction,
+) -> bool {
+    let from_shape = light_occlusion_shape(from_state);
+    let to_shape = light_occlusion_shape(to_state);
+    face_shape_occludes(from_shape, direction, to_shape, direction.opposite())
 }
 
 /// Vanilla's packed light-propagation queue entry.
@@ -1305,19 +1367,7 @@ impl ChunkSkyLightSources {
             return true;
         }
 
-        let top_shape = Self::light_occlusion_shape(top_state);
-        let bottom_shape = Self::light_occlusion_shape(bottom_state);
-        merged_face_occludes(top_shape, bottom_shape, Direction::Down)
-    }
-
-    fn light_occlusion_shape(
-        state: BlockStateId,
-    ) -> &'static [steel_registry::blocks::shapes::AABB] {
-        if !state.get_block().config.can_occlude || !state.use_shape_for_light_occlusion() {
-            return &[];
-        }
-
-        state.get_occlusion_shape()
+        light_face_occludes(top_state, bottom_state, Direction::Down)
     }
 
     fn fill(&mut self, lowest_source_y: i32) {
@@ -1522,6 +1572,7 @@ impl Default for DataLayer {
 #[cfg(test)]
 mod tests {
     use steel_registry::blocks::block_state_ext::BlockStateExt;
+    use steel_registry::blocks::properties::{BlockStateProperties, SlabType};
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
     use steel_utils::BlockStateId;
     use steel_utils::Direction::{Down, East, North, South, Up, West};
@@ -1536,7 +1587,8 @@ mod tests {
         ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
         LayerLightSectionStorage, LightLayer, LightQueueEntry, LightSectionRange,
         LightSectionState, LightSectionStateError, LightSectionType, build_light_update_packet,
-        has_different_light_properties,
+        get_light_block_into, get_light_opacity, has_different_light_properties,
+        light_face_occludes,
     };
 
     fn init_light_tests() {
@@ -1562,6 +1614,55 @@ mod tests {
             panic!("valid single-section height rejected");
         };
         sources
+    }
+
+    #[test]
+    fn light_opacity_uses_vanilla_minimum_opacity() {
+        init_light_tests();
+        let air = vanilla_blocks::AIR.default_state();
+        let stone = vanilla_blocks::STONE.default_state();
+
+        assert_eq!(get_light_opacity(air), 1);
+        assert_eq!(get_light_opacity(stone), 15);
+    }
+
+    #[test]
+    fn light_block_into_uses_simple_opacity_for_empty_light_shapes() {
+        init_light_tests();
+        let air = vanilla_blocks::AIR.default_state();
+        let stone = vanilla_blocks::STONE.default_state();
+
+        assert_eq!(get_light_block_into(air, stone, Down, 1), 1);
+        assert_eq!(get_light_block_into(stone, air, Up, 7), 7);
+    }
+
+    #[test]
+    fn light_block_into_uses_merged_shape_occlusion() {
+        init_light_tests();
+        let air = vanilla_blocks::AIR.default_state();
+        let bottom_slab = vanilla_blocks::STONE_SLAB
+            .default_state()
+            .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom);
+
+        assert_eq!(get_light_block_into(bottom_slab, air, Down, 1), 16);
+        assert_eq!(get_light_block_into(bottom_slab, air, Up, 1), 1);
+    }
+
+    #[test]
+    fn light_face_occludes_uses_face_occlusion_shapes() {
+        init_light_tests();
+        let air = vanilla_blocks::AIR.default_state();
+        let bottom_slab = vanilla_blocks::STONE_SLAB
+            .default_state()
+            .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom);
+        let top_slab = vanilla_blocks::STONE_SLAB
+            .default_state()
+            .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Top);
+
+        assert!(light_face_occludes(bottom_slab, air, Down));
+        assert!(!light_face_occludes(bottom_slab, air, Up));
+        assert!(light_face_occludes(top_slab, air, Up));
+        assert!(!light_face_occludes(top_slab, air, Down));
     }
 
     #[test]
