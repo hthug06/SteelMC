@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use crate::chunk::section::Sections;
+
 use super::{
     DATA_LAYER_EDGE, DATA_LAYER_SIZE, DATA_LAYER_Y_STRIDE, DataLayer, DataLayerLengthError,
-    LightLayer, LightSectionRange, LightSectionRangeError, MAX_LIGHT_LEVEL,
+    LIGHT_SECTION_PADDING, LightLayer, LightSectionRange, LightSectionRangeError, MAX_LIGHT_LEVEL,
 };
 
 /// ScalableLux-style light nibble state for one 16x16x16 light section.
@@ -436,6 +438,12 @@ impl ChunkLightLayerStorage {
         &mut self.nibbles
     }
 
+    /// Returns the number of real chunk sections tracked by the emptiness map.
+    #[must_use]
+    pub const fn chunk_section_count(&self) -> usize {
+        self.chunk_section_count
+    }
+
     /// Returns a light nibble for a section Y.
     #[must_use]
     pub fn nibble(&self, section_y: i32) -> Option<&LightNibbleArray> {
@@ -456,6 +464,15 @@ impl ChunkLightLayerStorage {
         self.emptiness_map.as_deref()
     }
 
+    /// Returns the known emptiness for one real chunk section Y.
+    #[must_use]
+    pub fn section_empty(&self, section_y: i32) -> Option<bool> {
+        let index = self.chunk_section_index(section_y)?;
+        self.emptiness_map
+            .as_deref()
+            .and_then(|emptiness_map| emptiness_map.get(index).copied())
+    }
+
     /// Replaces the section emptiness map.
     pub fn set_emptiness_map(
         &mut self,
@@ -472,6 +489,29 @@ impl ChunkLightLayerStorage {
         self.emptiness_map = Some(emptiness_map);
         Ok(())
     }
+
+    /// Replaces the section emptiness map from current section counters.
+    pub fn refresh_emptiness_map_from_sections(
+        &mut self,
+        sections: &Sections,
+    ) -> Result<(), ChunkLightEmptinessMapLengthError> {
+        self.set_emptiness_map(sections.section_emptiness_map())
+    }
+
+    /// Updates one known section emptiness entry, returning the previous value.
+    pub fn set_section_empty(&mut self, section_y: i32, empty: bool) -> Option<bool> {
+        let index = self.chunk_section_index(section_y)?;
+        let emptiness_map = self.emptiness_map.as_deref_mut()?;
+        let previous = *emptiness_map.get(index)?;
+        emptiness_map[index] = empty;
+        Some(previous)
+    }
+
+    fn chunk_section_index(&self, section_y: i32) -> Option<usize> {
+        let light_section_index = self.range.section_index(section_y)?;
+        let index = light_section_index.checked_sub(LIGHT_SECTION_PADDING as usize)?;
+        (index < self.chunk_section_count).then_some(index)
+    }
 }
 
 /// Chunk-owned block and sky light storage.
@@ -487,7 +527,7 @@ impl ChunkLightData {
     /// Creates empty ScalableLux-style light storage for one chunk.
     pub fn new(min_y: i32, height: i32) -> Result<Self, LightSectionRangeError> {
         let range = LightSectionRange::from_world_height(min_y, height)?;
-        let chunk_section_count = (height / DATA_LAYER_EDGE as i32) as usize;
+        let chunk_section_count = range.section_count() - (LIGHT_SECTION_PADDING as usize * 2);
         Ok(Self {
             block: ChunkLightLayerStorage::new(LightLayer::Block, range, chunk_section_count),
             sky: ChunkLightLayerStorage::new(LightLayer::Sky, range, chunk_section_count),
@@ -504,5 +544,27 @@ impl ChunkLightData {
             Ok(data) => data,
             Err(error) => panic!("invalid world height for chunk light data: {error:?}"),
         }
+    }
+
+    /// Refreshes both layer emptiness maps from current chunk section counters.
+    pub fn refresh_emptiness_maps_from_sections(
+        &mut self,
+        sections: &Sections,
+    ) -> Result<(), ChunkLightEmptinessMapLengthError> {
+        self.block.refresh_emptiness_map_from_sections(sections)?;
+        self.sky.refresh_emptiness_map_from_sections(sections)
+    }
+
+    /// Updates one real chunk section's known emptiness in both light layers.
+    pub fn set_section_empty(&mut self, section_y: i32, empty: bool) -> bool {
+        let block_changed = self
+            .block
+            .set_section_empty(section_y, empty)
+            .is_some_and(|previous| previous != empty);
+        let sky_changed = self
+            .sky
+            .set_section_empty(section_y, empty)
+            .is_some_and(|previous| previous != empty);
+        block_changed || sky_changed
     }
 }

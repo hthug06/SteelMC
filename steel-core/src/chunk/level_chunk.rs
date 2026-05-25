@@ -221,7 +221,10 @@ impl LevelChunk {
         let block_ticks = proto_chunk.block_ticks.into_inner();
         let fluid_ticks = proto_chunk.fluid_ticks.into_inner();
         let sky_light_sources = proto_chunk.sky_light_sources.into_inner();
-        let light = proto_chunk.light.into_inner();
+        let mut light = proto_chunk.light.into_inner();
+        if let Err(error) = light.refresh_emptiness_maps_from_sections(&proto_chunk.sections) {
+            panic!("invalid proto chunk light emptiness map length: {error:?}");
+        }
         let block_entities = proto_chunk.block_entities;
         let entities = proto_chunk.entities;
 
@@ -282,7 +285,7 @@ impl LevelChunk {
         heightmaps: ChunkHeightmaps,
         structure_starts: StructureStartMap,
         structure_references: StructureReferenceMap,
-        light: ChunkLightData,
+        mut light: ChunkLightData,
     ) -> Self {
         // Recalculate section counts for random tick optimization
         sections.recalculate_counts();
@@ -293,6 +296,9 @@ impl LevelChunk {
             sources.fill_from_sections(&sections);
             sources
         };
+        if let Err(error) = light.refresh_emptiness_maps_from_sections(&sections) {
+            panic!("invalid loaded chunk light emptiness map length: {error:?}");
+        }
         Self {
             sections,
             pos,
@@ -332,9 +338,20 @@ impl LevelChunk {
 
     /// Fills the vanilla skylight-source cache from current section contents.
     pub fn initialize_light_sources(&self) {
+        self.refresh_light_emptiness_maps();
         self.sky_light_sources
             .write()
             .fill_from_sections(&self.sections);
+    }
+
+    fn refresh_light_emptiness_maps(&self) {
+        if let Err(error) = self
+            .light
+            .write()
+            .refresh_emptiness_maps_from_sections(&self.sections)
+        {
+            panic!("invalid chunk light emptiness map length: {error:?}");
+        }
     }
 
     /// Drains the vanilla proto postprocessing offsets carried through promotion.
@@ -662,7 +679,8 @@ impl LevelChunk {
         let new_block = state.get_block();
 
         if was_empty != is_empty {
-            // TODO: Notify LevelLightEngine::update_section_status and chunk source section emptiness.
+            self.update_light_section_emptiness(y, is_empty);
+            // TODO: Notify LevelLightEngine::update_section_status once Steel owns live light storage.
         }
 
         if has_different_light_properties(old_state, state) {
@@ -739,6 +757,11 @@ impl LevelChunk {
 
         self.mark_unsaved();
         Some(old_state)
+    }
+
+    fn update_light_section_emptiness(&self, y: i32, is_empty: bool) {
+        let section_y = SectionPos::block_to_section_coord(y);
+        self.light.write().set_section_empty(section_y, is_empty);
     }
 
     fn update_sky_light_sources(&self, local_x: usize, y: i32, local_z: usize) {

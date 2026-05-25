@@ -513,6 +513,39 @@ mod tests {
     }
 
     #[test]
+    fn chunk_light_emptiness_maps_follow_section_counters() {
+        init_light_tests();
+
+        let mut non_empty_section = ChunkSection::new_empty();
+        non_empty_section.set_block_state(0, 0, 0, vanilla_blocks::STONE.default_state());
+        let sections = Sections::from_owned(
+            vec![ChunkSection::new_empty(), non_empty_section].into_boxed_slice(),
+        );
+
+        let Ok(mut light) = ChunkLightData::new(0, 32) else {
+            panic!("valid two-section height rejected");
+        };
+        assert_eq!(light.block.chunk_section_count(), 2);
+        assert!(light.block.emptiness_map().is_none());
+
+        if let Err(error) = light.refresh_emptiness_maps_from_sections(&sections) {
+            panic!("valid section count rejected: {error:?}");
+        }
+
+        assert_eq!(light.block.emptiness_map(), Some(&[true, false][..]));
+        assert_eq!(light.sky.emptiness_map(), Some(&[true, false][..]));
+        assert_eq!(light.block.section_empty(0), Some(true));
+        assert_eq!(light.block.section_empty(1), Some(false));
+        assert_eq!(light.block.section_empty(-1), None);
+        assert_eq!(light.block.section_empty(2), None);
+
+        assert!(light.set_section_empty(0, false));
+        assert!(!light.set_section_empty(0, false));
+        assert_eq!(light.block.emptiness_map(), Some(&[false, false][..]));
+        assert_eq!(light.sky.emptiness_map(), Some(&[false, false][..]));
+    }
+
+    #[test]
     fn chunk_light_update_packet_converts_chunk_owned_nibbles() {
         let Ok(mut light) = ChunkLightData::new(0, 16) else {
             panic!("valid single-section height rejected");

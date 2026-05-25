@@ -14,7 +14,7 @@ use steel_registry::{
     vanilla_blocks,
 };
 use steel_utils::{
-    BlockPos, BlockStateId, ChunkPos,
+    BlockPos, BlockStateId, ChunkPos, SectionPos,
     locks::{SyncMutex, SyncRwLock},
     types::UpdateFlags,
 };
@@ -278,9 +278,20 @@ impl ProtoChunk {
     /// Fills the vanilla skylight-source cache from current section contents.
     pub fn initialize_light_sources(&self) {
         self.sections.recalculate_counts();
+        self.refresh_light_emptiness_maps();
         self.sky_light_sources
             .write()
             .fill_from_sections(&self.sections);
+    }
+
+    fn refresh_light_emptiness_maps(&self) {
+        if let Err(error) = self
+            .light
+            .write()
+            .refresh_emptiness_maps_from_sections(&self.sections)
+        {
+            panic!("invalid proto chunk light emptiness map length: {error:?}");
+        }
     }
 
     /// Gets a block entity at the given position.
@@ -411,6 +422,7 @@ impl ProtoChunk {
 
         if self.status() >= ChunkStatus::InitializeLight {
             if was_empty != is_empty {
+                self.update_light_section_emptiness(y, is_empty);
                 // TODO: Notify LevelLightEngine::update_section_status once Steel owns live light storage.
             }
 
@@ -425,6 +437,11 @@ impl ProtoChunk {
         self.update_block_entity_lifecycle(pos, old_state, state, flags);
         self.mark_unsaved();
         Some(old_state)
+    }
+
+    fn update_light_section_emptiness(&self, y: i32, is_empty: bool) {
+        let section_y = SectionPos::block_to_section_coord(y);
+        self.light.write().set_section_empty(section_y, is_empty);
     }
 
     fn update_sky_light_sources(&self, local_x: usize, y: i32, local_z: usize) {
@@ -641,8 +658,10 @@ mod tests {
 
         proto.initialize_light_sources();
         proto.set_status(ChunkStatus::InitializeLight);
+        assert_eq!(proto.light.read().block.emptiness_map(), Some(&[true][..]));
         proto.set_block_state(pos, stone, UpdateFlags::UPDATE_CLIENTS);
 
         assert_eq!(proto.sky_light_sources.read().get_lowest_source_y(0, 0), 5);
+        assert_eq!(proto.light.read().block.emptiness_map(), Some(&[false][..]));
     }
 }

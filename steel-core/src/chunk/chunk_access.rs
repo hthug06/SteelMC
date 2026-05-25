@@ -831,8 +831,10 @@ mod tests {
         ));
         let stone = REGISTRY.blocks.get_default_state_id(&vanilla_blocks::STONE);
 
+        assert_eq!(chunk.light().block.emptiness_map(), Some(&[true][..]));
         chunk.set_block_state(BlockPos::new(0, 4, 0), stone, UpdateFlags::UPDATE_CLIENTS);
 
         assert_eq!(chunk.sky_light_sources().get_lowest_source_y(0, 0), 5);
+        assert_eq!(chunk.light().block.emptiness_map(), Some(&[false][..]));
     }
 }

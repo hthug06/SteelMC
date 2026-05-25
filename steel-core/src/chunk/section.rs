@@ -100,6 +100,15 @@ impl Sections {
         }
     }
 
+    /// Returns ScalableLux-style section emptiness for every real chunk section.
+    #[must_use]
+    pub fn section_emptiness_map(&self) -> Box<[bool]> {
+        self.sections
+            .iter()
+            .map(|section| section.read().is_empty())
+            .collect()
+    }
+
     /// Gets a block at a relative position in the chunk.
     #[must_use]
     pub fn get_relative_block(
