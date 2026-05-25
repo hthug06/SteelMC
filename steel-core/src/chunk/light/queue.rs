@@ -1,3 +1,5 @@
+use std::iter::FusedIterator;
+
 use steel_utils::{BlockPos, Direction};
 
 use super::{MAX_LIGHT_LEVEL, PackedLightBlockPos};
@@ -7,6 +9,7 @@ const QUEUE_ENTRY_DIRECTIONS_MASK: u64 = 0b11_1111_0000;
 const QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE: u64 = 1 << 10;
 const QUEUE_ENTRY_FLAG_INCREASE_FROM_EMISSION: u64 = 1 << 11;
 const LIGHT_QUEUE_MIN_CAPACITY: usize = 512;
+const PACKED_LIGHT_QUEUE_MIN_CAPACITY: usize = 16 * 16 * 16;
 const PACKED_LIGHT_QUEUE_POSITION_BITS: u64 = 28;
 const PACKED_LIGHT_QUEUE_LEVEL_BITS: u64 = 4;
 const PACKED_LIGHT_QUEUE_DIRECTION_BITS: u64 = 6;
@@ -74,6 +77,20 @@ impl LightAxisDirection {
             Direction::North => Self::NegativeZ,
             Direction::Up => Self::PositiveY,
             Direction::Down => Self::NegativeY,
+        }
+    }
+
+    /// Returns the ScalableLux axis direction for a direction-bit index.
+    #[must_use]
+    pub const fn from_bit_index(bit_index: u8) -> Option<Self> {
+        match bit_index {
+            0 => Some(Self::PositiveX),
+            1 => Some(Self::NegativeX),
+            2 => Some(Self::PositiveZ),
+            3 => Some(Self::NegativeZ),
+            4 => Some(Self::PositiveY),
+            5 => Some(Self::NegativeY),
+            _ => None,
         }
     }
 
@@ -186,7 +203,42 @@ impl LightDirectionSet {
     pub const fn contains(self, direction: LightAxisDirection) -> bool {
         self.0 & direction.bit() != 0
     }
+
+    /// Iterates selected directions in ScalableLux's propagation order.
+    #[must_use]
+    pub const fn directions(self) -> LightDirectionSetIter {
+        LightDirectionSetIter { remaining: self.0 }
+    }
 }
+
+/// Iterator over a `LightDirectionSet` in ScalableLux propagation order.
+#[derive(Debug, Clone)]
+pub struct LightDirectionSetIter {
+    remaining: u8,
+}
+
+impl Iterator for LightDirectionSetIter {
+    type Item = LightAxisDirection;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let bit_index = self.remaining.trailing_zeros() as u8;
+        self.remaining &= self.remaining - 1;
+        LightAxisDirection::from_bit_index(bit_index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.remaining.count_ones() as usize;
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for LightDirectionSetIter {}
+
+impl FusedIterator for LightDirectionSetIter {}
 
 /// ScalableLux state flags stored in the top three queue-entry bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,6 +362,116 @@ impl PackedLightQueueEntry {
     pub const fn has_sided_transparent_blocks(self) -> bool {
         self.flags()
             .contains(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS)
+    }
+}
+
+/// Array-backed FIFO used for ScalableLux packed light propagation entries.
+#[derive(Debug)]
+pub struct PackedLightPropagationQueue {
+    entries: Vec<PackedLightQueueEntry>,
+    read_index: usize,
+}
+
+impl PackedLightPropagationQueue {
+    /// Creates an empty ScalableLux packed propagation queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(PACKED_LIGHT_QUEUE_MIN_CAPACITY),
+            read_index: 0,
+        }
+    }
+
+    /// Returns true when no packed queued work remains.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.read_index >= self.entries.len()
+    }
+
+    /// Returns the number of packed entries that have not been dequeued yet.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len() - self.read_index
+    }
+
+    /// Adds packed propagation work to the back of the queue.
+    pub fn enqueue(&mut self, entry: PackedLightQueueEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Removes packed propagation work from the front of the queue.
+    pub fn dequeue(&mut self) -> Option<PackedLightQueueEntry> {
+        if self.is_empty() {
+            self.clear();
+            return None;
+        }
+
+        let entry = self.entries[self.read_index];
+        self.read_index += 1;
+        if self.is_empty() {
+            self.clear();
+        }
+
+        Some(entry)
+    }
+
+    /// Removes all queued packed work while keeping allocated storage for reuse.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.read_index = 0;
+    }
+}
+
+impl Default for PackedLightPropagationQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// ScalableLux's separate packed increase and decrease propagation queues.
+#[derive(Debug, Default)]
+pub struct PackedLightPropagationQueues {
+    increase: PackedLightPropagationQueue,
+    decrease: PackedLightPropagationQueue,
+}
+
+impl PackedLightPropagationQueues {
+    /// Creates empty packed increase and decrease queues.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true when either packed propagation queue contains work.
+    #[must_use]
+    pub fn has_work(&self) -> bool {
+        !self.increase.is_empty() || !self.decrease.is_empty()
+    }
+
+    /// Enqueues packed decrease propagation work.
+    pub fn enqueue_decrease(&mut self, entry: PackedLightQueueEntry) {
+        self.decrease.enqueue(entry);
+    }
+
+    /// Enqueues packed increase propagation work.
+    pub fn enqueue_increase(&mut self, entry: PackedLightQueueEntry) {
+        self.increase.enqueue(entry);
+    }
+
+    /// Dequeues packed decrease propagation work.
+    pub fn dequeue_decrease(&mut self) -> Option<PackedLightQueueEntry> {
+        self.decrease.dequeue()
+    }
+
+    /// Dequeues packed increase propagation work.
+    pub fn dequeue_increase(&mut self) -> Option<PackedLightQueueEntry> {
+        self.increase.dequeue()
+    }
+
+    /// Removes all packed increase and decrease work.
+    pub fn clear(&mut self) {
+        self.increase.clear();
+        self.decrease.clear();
     }
 }
 
@@ -602,6 +764,15 @@ impl LightPropagationQueues {
 mod tests {
     use super::*;
 
+    fn packed_entry(level: u8) -> PackedLightQueueEntry {
+        PackedLightQueueEntry::from_parts(
+            PackedLightBlockPos::from_raw(u32::from(level)),
+            level,
+            LightDirectionSet::all(),
+            LightQueueFlags::EMPTY,
+        )
+    }
+
     #[test]
     fn light_axis_direction_matches_scalable_lux_order() {
         assert_eq!(
@@ -684,6 +855,19 @@ mod tests {
     }
 
     #[test]
+    fn light_axis_direction_from_bit_index_masks_valid_range() {
+        assert_eq!(
+            LightAxisDirection::from_bit_index(0),
+            Some(LightAxisDirection::PositiveX)
+        );
+        assert_eq!(
+            LightAxisDirection::from_bit_index(5),
+            Some(LightAxisDirection::NegativeY)
+        );
+        assert_eq!(LightAxisDirection::from_bit_index(6), None);
+    }
+
+    #[test]
     fn light_direction_set_matches_scalable_lux_masks() {
         assert_eq!(LightDirectionSet::empty().raw(), 0);
         assert_eq!(LightDirectionSet::all().raw(), 0b11_1111);
@@ -708,6 +892,20 @@ mod tests {
         assert!(!set.contains(LightAxisDirection::NegativeX));
         assert!(!set.contains(LightAxisDirection::NegativeZ));
         assert!(!set.contains(LightAxisDirection::PositiveY));
+    }
+
+    #[test]
+    fn light_direction_set_iterates_in_scalable_lux_order() {
+        let mut directions = LightDirectionSet::from_raw(0b10_1101).directions();
+
+        assert_eq!(directions.len(), 4);
+        assert_eq!(directions.next(), Some(LightAxisDirection::PositiveX));
+        assert_eq!(directions.next(), Some(LightAxisDirection::PositiveZ));
+        assert_eq!(directions.len(), 2);
+        assert_eq!(directions.next(), Some(LightAxisDirection::NegativeZ));
+        assert_eq!(directions.next(), Some(LightAxisDirection::NegativeY));
+        assert_eq!(directions.next(), None);
+        assert_eq!(directions.next(), None);
     }
 
     #[test]
@@ -770,5 +968,59 @@ mod tests {
         assert!(entry.should_write_level());
         assert!(entry.should_recheck_level());
         assert!(entry.has_sided_transparent_blocks());
+    }
+
+    #[test]
+    fn packed_light_propagation_queue_preserves_fifo_order() {
+        let first = packed_entry(1);
+        let second = packed_entry(2);
+        let third = packed_entry(3);
+        let mut queue = PackedLightPropagationQueue::new();
+
+        assert!(queue.is_empty());
+        queue.enqueue(first);
+        queue.enqueue(second);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.dequeue(), Some(first));
+
+        queue.enqueue(third);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.dequeue(), Some(second));
+        assert_eq!(queue.dequeue(), Some(third));
+        assert_eq!(queue.dequeue(), None);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn packed_light_propagation_queue_processes_entries_enqueued_while_emptying() {
+        let first = packed_entry(4);
+        let second = packed_entry(5);
+        let mut queue = PackedLightPropagationQueue::new();
+
+        queue.enqueue(first);
+        assert_eq!(queue.dequeue(), Some(first));
+        queue.enqueue(second);
+        assert_eq!(queue.dequeue(), Some(second));
+        assert_eq!(queue.dequeue(), None);
+    }
+
+    #[test]
+    fn packed_light_propagation_queues_keep_increase_and_decrease_work_separate() {
+        let decrease_entry = packed_entry(6);
+        let increase_entry = packed_entry(7);
+        let mut queues = PackedLightPropagationQueues::new();
+
+        assert!(!queues.has_work());
+        queues.enqueue_decrease(decrease_entry);
+        queues.enqueue_increase(increase_entry);
+        assert!(queues.has_work());
+
+        assert_eq!(queues.dequeue_increase(), Some(increase_entry));
+        assert_eq!(queues.dequeue_increase(), None);
+        assert!(queues.has_work());
+
+        assert_eq!(queues.dequeue_decrease(), Some(decrease_entry));
+        assert_eq!(queues.dequeue_decrease(), None);
+        assert!(!queues.has_work());
     }
 }

@@ -122,8 +122,9 @@ pub(crate) use queue::{
     ADD_SKY_SOURCE_ENTRY, REMOVE_SKY_SOURCE_ENTRY, REMOVE_TOP_SKY_SOURCE_ENTRY,
 };
 pub use queue::{
-    LightAxisDirection, LightDirectionSet, LightPropagationQueue, LightPropagationQueues,
-    LightQueueEntry, LightQueueFlags, PackedLightQueueEntry, QueuedLightUpdate,
+    LightAxisDirection, LightDirectionSet, LightDirectionSetIter, LightPropagationQueue,
+    LightPropagationQueues, LightQueueEntry, LightQueueFlags, PackedLightPropagationQueue,
+    PackedLightPropagationQueues, PackedLightQueueEntry, QueuedLightUpdate,
 };
 pub use section_storage::{
     LayerLightSectionStorage, LightSectionRange, LightSectionRangeError, LightSectionState,
