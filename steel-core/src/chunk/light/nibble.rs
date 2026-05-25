@@ -4,8 +4,7 @@ use crate::chunk::section::Sections;
 
 use super::{
     DATA_LAYER_BLOCK_COUNT, DATA_LAYER_EDGE, DATA_LAYER_SIZE, DATA_LAYER_Y_STRIDE, DataLayer,
-    DataLayerLengthError, LIGHT_SECTION_PADDING, LightLayer, LightSectionRange,
-    LightSectionRangeError, MAX_LIGHT_LEVEL,
+    DataLayerLengthError, LightLayer, LightSectionRange, LightSectionRangeError, MAX_LIGHT_LEVEL,
 };
 
 /// ScalableLux-style light nibble state for one 16x16x16 light section.
@@ -565,8 +564,7 @@ impl ChunkLightLayerStorage {
     }
 
     fn chunk_section_index(&self, section_y: i32) -> Option<usize> {
-        let light_section_index = self.range.section_index(section_y)?;
-        let index = light_section_index.checked_sub(LIGHT_SECTION_PADDING as usize)?;
+        let index = self.range.chunk_section_index(section_y)?;
         (index < self.chunk_section_count).then_some(index)
     }
 }
@@ -584,10 +582,13 @@ impl ChunkLightData {
     /// Creates empty ScalableLux-style light storage for one chunk.
     pub fn new(min_y: i32, height: i32) -> Result<Self, LightSectionRangeError> {
         let range = LightSectionRange::from_world_height(min_y, height)?;
-        let chunk_section_count = range.section_count() - (LIGHT_SECTION_PADDING as usize * 2);
         Ok(Self {
-            block: ChunkLightLayerStorage::new(LightLayer::Block, range, chunk_section_count),
-            sky: ChunkLightLayerStorage::new(LightLayer::Sky, range, chunk_section_count),
+            block: ChunkLightLayerStorage::new(
+                LightLayer::Block,
+                range,
+                range.chunk_section_count(),
+            ),
+            sky: ChunkLightLayerStorage::new(LightLayer::Sky, range, range.chunk_section_count()),
         })
     }
 

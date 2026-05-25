@@ -155,6 +155,18 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
         }
     }
 
+    /// Returns whether this container's palette may contain a matching value.
+    ///
+    /// This checks palette entries instead of every cell, matching vanilla and
+    /// ScalableLux's fast pre-scan before doing a full section pass.
+    #[must_use]
+    pub fn maybe_has(&self, mut predicate: impl FnMut(V) -> bool) -> bool {
+        match self {
+            Self::Homogeneous(value) => predicate(*value),
+            Self::Heterogeneous(data) => data.palette.iter().any(|(value, _)| predicate(*value)),
+        }
+    }
+
     /// Collects all values in the container in y, z, x order.
     #[must_use]
     pub fn collect_values(&self) -> Vec<V> {
@@ -381,5 +393,20 @@ mod tests {
 
         assert_eq!(biomes.get_at_index(2 | (1 << 2) | (3 << 4)), 11);
         assert_eq!(biomes.get_at_index(0), 0);
+    }
+
+    #[test]
+    fn maybe_has_checks_palette_values_without_scanning_cells() {
+        let homogeneous = BlockPalette::Homogeneous(BlockStateId(7));
+        assert!(homogeneous.maybe_has(|state| state == BlockStateId(7)));
+        assert!(!homogeneous.maybe_has(|state| state == BlockStateId(8)));
+
+        let mut heterogeneous = BlockPalette::Homogeneous(BlockStateId(0));
+        heterogeneous.set(3, 4, 5, BlockStateId(42));
+        heterogeneous.set(15, 15, 15, BlockStateId(99));
+
+        assert!(heterogeneous.maybe_has(|state| state == BlockStateId(42)));
+        assert!(heterogeneous.maybe_has(|state| state == BlockStateId(99)));
+        assert!(!heterogeneous.maybe_has(|state| state == BlockStateId(7)));
     }
 }

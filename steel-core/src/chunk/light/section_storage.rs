@@ -165,6 +165,27 @@ impl LightSectionRange {
         self.section_count as usize
     }
 
+    /// Returns the first real chunk section Y coordinate.
+    ///
+    /// ScalableLux keeps emptiness maps indexed only by real chunk sections;
+    /// the padded light sections below and above the world are not included.
+    #[must_use]
+    pub const fn min_chunk_section_y(self) -> i32 {
+        self.min_section_y + LIGHT_SECTION_PADDING
+    }
+
+    /// Returns the real chunk section Y coordinate one past the last section.
+    #[must_use]
+    pub const fn max_chunk_section_y_exclusive(self) -> i32 {
+        self.max_section_y_exclusive() - LIGHT_SECTION_PADDING
+    }
+
+    /// Returns the number of real chunk sections inside this light range.
+    #[must_use]
+    pub const fn chunk_section_count(self) -> usize {
+        (self.section_count - LIGHT_SECTION_PADDING * 2) as usize
+    }
+
     /// Converts a packet light-section index to a section Y coordinate.
     #[must_use]
     pub fn section_y(self, section_index: usize) -> Option<i32> {
@@ -183,6 +204,28 @@ impl LightSectionRange {
         }
 
         Some((section_y - self.min_section_y) as usize)
+    }
+
+    /// Converts a real chunk-section index to a section Y coordinate.
+    #[must_use]
+    pub fn chunk_section_y(self, section_index: usize) -> Option<i32> {
+        if section_index >= self.chunk_section_count() {
+            return None;
+        }
+
+        Some(self.min_chunk_section_y() + section_index as i32)
+    }
+
+    /// Converts a real chunk section Y coordinate to an emptiness-map index.
+    #[must_use]
+    pub fn chunk_section_index(self, section_y: i32) -> Option<usize> {
+        if section_y < self.min_chunk_section_y()
+            || section_y >= self.max_chunk_section_y_exclusive()
+        {
+            return None;
+        }
+
+        Some((section_y - self.min_chunk_section_y()) as usize)
     }
 
     /// Creates a section position for this light range's chunk column.

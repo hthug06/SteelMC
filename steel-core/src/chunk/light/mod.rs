@@ -555,6 +555,30 @@ mod tests {
     }
 
     #[test]
+    fn sections_collect_block_light_sources_in_scalable_lux_order() {
+        init_light_tests();
+
+        let torch = vanilla_blocks::TORCH.default_state();
+        let lantern = vanilla_blocks::SEA_LANTERN.default_state();
+        let mut lower = ChunkSection::new_empty();
+        lower.set_block_state(3, 4, 5, torch);
+        lower.set_block_state(1, 0, 0, lantern);
+        let mut upper = ChunkSection::new_empty();
+        upper.set_block_state(15, 15, 15, lantern);
+        let sections =
+            Sections::from_owned(vec![lower, ChunkSection::new_empty(), upper].into_boxed_slice());
+
+        assert_eq!(
+            sections.block_light_sources(ChunkPos::new(2, -3), -16),
+            vec![
+                BlockPos::new(33, -16, -48),
+                BlockPos::new(35, -12, -43),
+                BlockPos::new(47, 31, -33),
+            ]
+        );
+    }
+
+    #[test]
     fn chunk_light_update_packet_converts_chunk_owned_nibbles() {
         let Ok(mut light) = ChunkLightData::new(0, 16) else {
             panic!("valid single-section height rejected");
@@ -705,6 +729,9 @@ mod tests {
         assert_eq!(range.min_section_y(), -5);
         assert_eq!(range.max_section_y_exclusive(), 21);
         assert_eq!(range.section_count(), 26);
+        assert_eq!(range.min_chunk_section_y(), -4);
+        assert_eq!(range.max_chunk_section_y_exclusive(), 20);
+        assert_eq!(range.chunk_section_count(), 24);
         assert_eq!(range.section_y(0), Some(-5));
         assert_eq!(range.section_y(25), Some(20));
         assert_eq!(range.section_y(26), None);
@@ -712,6 +739,13 @@ mod tests {
         assert_eq!(range.section_index(20), Some(25));
         assert_eq!(range.section_index(-6), None);
         assert_eq!(range.section_index(21), None);
+        assert_eq!(range.chunk_section_y(0), Some(-4));
+        assert_eq!(range.chunk_section_y(23), Some(19));
+        assert_eq!(range.chunk_section_y(24), None);
+        assert_eq!(range.chunk_section_index(-4), Some(0));
+        assert_eq!(range.chunk_section_index(19), Some(23));
+        assert_eq!(range.chunk_section_index(-5), None);
+        assert_eq!(range.chunk_section_index(20), None);
     }
 
     #[test]
