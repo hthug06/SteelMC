@@ -11,6 +11,54 @@ pub const LIGHT_CACHE_CHUNK_SLOTS: usize = LIGHT_CACHE_DIAMETER * LIGHT_CACHE_DI
 
 const LIGHT_CACHE_DIAMETER_I64: i64 = LIGHT_CACHE_DIAMETER as i64;
 const LIGHT_CACHE_CHUNK_SLOTS_I64: i64 = LIGHT_CACHE_CHUNK_SLOTS as i64;
+const LIGHT_ENCODED_HORIZONTAL_BITS: i64 = 6;
+const LIGHT_ENCODED_VERTICAL_BITS: i64 = 16;
+const LIGHT_ENCODED_HORIZONTAL_MASK: i64 = (1 << LIGHT_ENCODED_HORIZONTAL_BITS) - 1;
+const LIGHT_ENCODED_VERTICAL_MASK: i64 = (1 << LIGHT_ENCODED_VERTICAL_BITS) - 1;
+const LIGHT_ENCODED_POSITION_MASK: u32 =
+    (1 << (LIGHT_ENCODED_HORIZONTAL_BITS * 2 + LIGHT_ENCODED_VERTICAL_BITS)) - 1;
+const LIGHT_ENCODED_Z_SHIFT: u32 = LIGHT_ENCODED_HORIZONTAL_BITS as u32;
+const LIGHT_ENCODED_Y_SHIFT: u32 = (LIGHT_ENCODED_HORIZONTAL_BITS * 2) as u32;
+
+/// ScalableLux packed block position used in light propagation queue entries.
+///
+/// The lower 28 bits store `x | (z << 6) | (y << 12)`. X and Z are encoded in
+/// a 64-block window around the active chunk; Y is encoded relative to the
+/// section below the vanilla light-section range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedLightBlockPos(u32);
+
+impl PackedLightBlockPos {
+    /// Creates a packed light block position from raw queue bits.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw & LIGHT_ENCODED_POSITION_MASK)
+    }
+
+    /// Returns the raw lower 28 queue-position bits.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Returns the encoded 6-bit X coordinate.
+    #[must_use]
+    pub const fn encoded_x(self) -> u8 {
+        (self.0 & LIGHT_ENCODED_HORIZONTAL_MASK as u32) as u8
+    }
+
+    /// Returns the encoded 6-bit Z coordinate.
+    #[must_use]
+    pub const fn encoded_z(self) -> u8 {
+        ((self.0 >> LIGHT_ENCODED_Z_SHIFT) & LIGHT_ENCODED_HORIZONTAL_MASK as u32) as u8
+    }
+
+    /// Returns the encoded 16-bit Y coordinate.
+    #[must_use]
+    pub const fn encoded_y(self) -> u16 {
+        ((self.0 >> LIGHT_ENCODED_Y_SHIFT) & LIGHT_ENCODED_VERTICAL_MASK as u32) as u16
+    }
+}
 
 /// ScalableLux cache-window layout for chunk, section, and nibble arrays.
 ///
@@ -27,6 +75,11 @@ pub struct LightCacheLayout {
     cached_section_count: usize,
     chunk_index_offset: i64,
     chunk_section_index_offset: i64,
+    encode_offset_x: i64,
+    encode_offset_y: i64,
+    encode_offset_z: i64,
+    encoded_min_block_x: i64,
+    encoded_min_block_z: i64,
 }
 
 impl LightCacheLayout {
@@ -40,6 +93,11 @@ impl LightCacheLayout {
         let chunk_offset_y = -i64::from(cached_min_section_y);
         let chunk_section_index_offset =
             chunk_index_offset + LIGHT_CACHE_CHUNK_SLOTS_I64 * chunk_offset_y;
+        let center_block_x = i64::from(center_chunk.0.x) * 16 + 7;
+        let center_block_z = i64::from(center_chunk.0.y) * 16 + 7;
+        let encode_offset_x = 31 - center_block_x;
+        let encode_offset_y = -(i64::from(cached_min_section_y) * 16);
+        let encode_offset_z = 31 - center_block_z;
 
         Self {
             center_chunk,
@@ -48,6 +106,11 @@ impl LightCacheLayout {
             cached_section_count: range.section_count() + 2,
             chunk_index_offset,
             chunk_section_index_offset,
+            encode_offset_x,
+            encode_offset_y,
+            encode_offset_z,
+            encoded_min_block_x: center_block_x - 31,
+            encoded_min_block_z: center_block_z - 31,
         }
     }
 
@@ -116,6 +179,75 @@ impl LightCacheLayout {
     #[must_use]
     pub fn section_slot_for_block(self, block_pos: BlockPos) -> Option<usize> {
         self.section_slot(SectionPos::from_block_pos(block_pos))
+    }
+
+    /// Returns the first block X coordinate that can be packed into queue entries.
+    #[must_use]
+    pub fn encoded_min_block_x(self) -> i32 {
+        self.encoded_min_block_x as i32
+    }
+
+    /// Returns the block X coordinate one past the packed queue window.
+    #[must_use]
+    pub fn encoded_max_block_x_exclusive(self) -> i32 {
+        (self.encoded_min_block_x + LIGHT_ENCODED_HORIZONTAL_MASK + 1) as i32
+    }
+
+    /// Returns the first block Z coordinate that can be packed into queue entries.
+    #[must_use]
+    pub fn encoded_min_block_z(self) -> i32 {
+        self.encoded_min_block_z as i32
+    }
+
+    /// Returns the block Z coordinate one past the packed queue window.
+    #[must_use]
+    pub fn encoded_max_block_z_exclusive(self) -> i32 {
+        (self.encoded_min_block_z + LIGHT_ENCODED_HORIZONTAL_MASK + 1) as i32
+    }
+
+    /// Packs a block position for ScalableLux queue storage.
+    #[must_use]
+    pub fn encode_block_pos(self, block_pos: BlockPos) -> Option<PackedLightBlockPos> {
+        if !self.contains_encoded_block_pos(block_pos) {
+            return None;
+        }
+
+        let encoded_x =
+            (i64::from(block_pos.x()) + self.encode_offset_x) & LIGHT_ENCODED_HORIZONTAL_MASK;
+        let encoded_y =
+            (i64::from(block_pos.y()) + self.encode_offset_y) & LIGHT_ENCODED_VERTICAL_MASK;
+        let encoded_z =
+            (i64::from(block_pos.z()) + self.encode_offset_z) & LIGHT_ENCODED_HORIZONTAL_MASK;
+
+        Some(PackedLightBlockPos::from_raw(
+            encoded_x as u32 | (encoded_z as u32) << 6 | (encoded_y as u32) << 12,
+        ))
+    }
+
+    /// Decodes ScalableLux queue-position bits back to a world block position.
+    #[must_use]
+    pub fn decode_block_pos(self, packed: PackedLightBlockPos) -> Option<BlockPos> {
+        let x = i64::from(packed.encoded_x()) - self.encode_offset_x;
+        let y = i64::from(packed.encoded_y()) - self.encode_offset_y;
+        let z = i64::from(packed.encoded_z()) - self.encode_offset_z;
+
+        Some(BlockPos::new(
+            i32::try_from(x).ok()?,
+            i32::try_from(y).ok()?,
+            i32::try_from(z).ok()?,
+        ))
+    }
+
+    /// Returns true if a block position is inside the packed queue-coordinate window.
+    #[must_use]
+    pub fn contains_encoded_block_pos(self, block_pos: BlockPos) -> bool {
+        let x = i64::from(block_pos.x());
+        let z = i64::from(block_pos.z());
+        x >= self.encoded_min_block_x
+            && x <= self.encoded_min_block_x + LIGHT_ENCODED_HORIZONTAL_MASK
+            && z >= self.encoded_min_block_z
+            && z <= self.encoded_min_block_z + LIGHT_ENCODED_HORIZONTAL_MASK
+            && self.contains_section_y(SectionPos::block_to_section_coord(block_pos.y()))
     }
 
     /// Returns the section/nibble slot for section coordinates.
@@ -250,5 +382,60 @@ mod tests {
         assert_eq!(layout.cached_max_section_y_exclusive(), 22);
         assert_eq!(layout.cached_section_count(), 28);
         assert_eq!(layout.section_slot_count(), 700);
+    }
+
+    #[test]
+    fn packed_light_block_pos_masks_to_scalable_lux_position_bits() {
+        let packed = PackedLightBlockPos::from_raw(u32::MAX);
+
+        assert_eq!(packed.raw(), (1 << 28) - 1);
+        assert_eq!(packed.encoded_x(), 63);
+        assert_eq!(packed.encoded_z(), 63);
+        assert_eq!(packed.encoded_y(), u16::MAX);
+    }
+
+    #[test]
+    fn cache_layout_encodes_scalable_lux_queue_position_window() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+
+        assert_eq!(layout.encoded_min_block_x(), -24);
+        assert_eq!(layout.encoded_max_block_x_exclusive(), 40);
+        assert_eq!(layout.encoded_min_block_z(), -24);
+        assert_eq!(layout.encoded_max_block_z_exclusive(), 40);
+
+        let Some(center) = layout.encode_block_pos(BlockPos::new(7, 0, 7)) else {
+            panic!("center chunk block should encode");
+        };
+        assert_eq!(center.encoded_x(), 31);
+        assert_eq!(center.encoded_z(), 31);
+        assert_eq!(center.encoded_y(), 32);
+        assert_eq!(
+            layout.decode_block_pos(center),
+            Some(BlockPos::new(7, 0, 7))
+        );
+
+        let Some(min) = layout.encode_block_pos(BlockPos::new(-24, -32, -24)) else {
+            panic!("minimum queue block should encode");
+        };
+        assert_eq!(min.raw(), 0);
+        assert_eq!(
+            layout.decode_block_pos(min),
+            Some(BlockPos::new(-24, -32, -24))
+        );
+
+        let Some(max) = layout.encode_block_pos(BlockPos::new(39, 47, 39)) else {
+            panic!("maximum queue block should encode");
+        };
+        assert_eq!(max.encoded_x(), 63);
+        assert_eq!(max.encoded_z(), 63);
+        assert_eq!(max.encoded_y(), 79);
+        assert_eq!(
+            layout.decode_block_pos(max),
+            Some(BlockPos::new(39, 47, 39))
+        );
+
+        assert_eq!(layout.encode_block_pos(BlockPos::new(40, 0, 0)), None);
+        assert_eq!(layout.encode_block_pos(BlockPos::new(0, 0, 40)), None);
+        assert_eq!(layout.encode_block_pos(BlockPos::new(0, 48, 0)), None);
     }
 }
