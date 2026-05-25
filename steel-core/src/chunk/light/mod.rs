@@ -101,12 +101,17 @@ pub fn light_face_occludes(
 }
 
 mod data_layer;
+mod nibble;
 mod packet;
 mod queue;
 mod section_storage;
 mod sky_sources;
 
 pub use data_layer::{DataLayer, DataLayerLengthError, DataLayerStorageMap};
+pub use nibble::{
+    ChunkLightData, ChunkLightEmptinessMapLengthError, ChunkLightLayerStorage, LightNibbleArray,
+    LightNibbleExtrudeNullSourceError, LightNibbleState,
+};
 pub use packet::build_light_update_packet;
 pub(crate) use queue::{
     ADD_SKY_SOURCE_ENTRY, REMOVE_SKY_SOURCE_ENTRY, REMOVE_TOP_SKY_SOURCE_ENTRY,
@@ -136,11 +141,12 @@ mod tests {
 
     use super::{
         ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
-        LayerLightSectionStorage, LightLayer, LightPropagationQueue, LightPropagationQueues,
-        LightQueueEntry, LightSectionRange, LightSectionState, LightSectionStateError,
-        LightSectionType, MissingLightDataLayerError, QueuedLightUpdate,
-        SkyLightSourceNeighborhood, build_light_update_packet, get_light_block_into,
-        get_light_opacity, has_different_light_properties, light_face_occludes,
+        LayerLightSectionStorage, LightLayer, LightNibbleArray, LightNibbleState,
+        LightPropagationQueue, LightPropagationQueues, LightQueueEntry, LightSectionRange,
+        LightSectionState, LightSectionStateError, LightSectionType, MissingLightDataLayerError,
+        QueuedLightUpdate, SkyLightSourceNeighborhood, build_light_update_packet,
+        get_light_block_into, get_light_opacity, has_different_light_properties,
+        light_face_occludes,
     };
 
     fn init_light_tests() {
@@ -387,6 +393,82 @@ mod tests {
             })
         );
         assert!(!queues.has_work());
+    }
+
+    #[test]
+    fn light_nibble_array_publishes_visible_state_after_update() {
+        let mut nibble = LightNibbleArray::null();
+
+        nibble.set(1, 2, 3, 12);
+
+        assert_eq!(nibble.updating_state(), LightNibbleState::Initialized);
+        assert_eq!(nibble.visible_state(), LightNibbleState::Null);
+        assert_eq!(nibble.get_updating(1, 2, 3), 12);
+        assert_eq!(nibble.get_visible(1, 2, 3), 0);
+        assert!(nibble.update_visible());
+        assert_eq!(nibble.visible_state(), LightNibbleState::Initialized);
+        assert_eq!(nibble.get_visible(1, 2, 3), 12);
+        assert!(!nibble.update_visible());
+    }
+
+    #[test]
+    fn light_nibble_array_converts_external_states_to_data_layer() {
+        let mut hidden = LightNibbleArray::filled(7);
+        hidden.set_hidden();
+        assert!(hidden.update_visible());
+
+        let null = LightNibbleArray::null();
+        let uninitialized = LightNibbleArray::uninitialized();
+        let initialized = LightNibbleArray::filled(5);
+
+        assert!(null.to_data_layer().is_none());
+        assert!(hidden.to_data_layer().is_none());
+
+        let Some(empty_layer) = uninitialized.to_data_layer() else {
+            panic!("uninitialized nibble should convert to an empty data layer");
+        };
+        assert!(empty_layer.is_empty());
+
+        let Some(filled_layer) = initialized.to_data_layer() else {
+            panic!("initialized nibble should convert to a data layer");
+        };
+        assert_eq!(filled_layer.get(3, 9, 11), 5);
+    }
+
+    #[test]
+    fn light_nibble_array_extrudes_lower_row_from_updating_source() {
+        let mut source = LightNibbleArray::null();
+        for z in 0..super::DATA_LAYER_EDGE {
+            for x in 0..super::DATA_LAYER_EDGE {
+                source.set(x, 0, z, ((x + z) & 15) as u8);
+            }
+        }
+
+        let mut target = LightNibbleArray::null();
+        if target.extrude_lower(&source).is_err() {
+            panic!("initialized source should extrude");
+        }
+
+        for y in 0..super::DATA_LAYER_EDGE {
+            assert_eq!(target.get_updating(3, y, 5), 8);
+            assert_eq!(target.get_updating(11, y, 14), 9);
+        }
+    }
+
+    #[test]
+    fn chunk_light_data_uses_vanilla_padded_light_section_count() {
+        let Ok(light) = super::ChunkLightData::new(-64, 384) else {
+            panic!("valid overworld height rejected");
+        };
+
+        assert_eq!(light.block.range().min_section_y(), -5);
+        assert_eq!(light.block.nibbles().len(), 26);
+        assert_eq!(light.sky.nibbles().len(), 26);
+        assert_eq!(
+            light.sky.nibble(-5).map(LightNibbleArray::visible_state),
+            Some(LightNibbleState::Null)
+        );
+        assert!(light.sky.nibble(21).is_none());
     }
 
     #[test]

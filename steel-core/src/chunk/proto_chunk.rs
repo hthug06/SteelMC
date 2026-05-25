@@ -24,7 +24,7 @@ use crate::block_entity::{BlockEntityStorage, SharedBlockEntity};
 use crate::chunk::{
     chunk_access::ChunkStatus,
     heightmap::{HeightmapType, ProtoHeightmaps},
-    light::{ChunkSkyLightSources, has_different_light_properties},
+    light::{ChunkLightData, ChunkSkyLightSources, has_different_light_properties},
     section::Sections,
 };
 use crate::entity::{EntityStorage, SharedEntity};
@@ -86,6 +86,8 @@ pub struct ProtoChunk {
     pub fluid_ticks: SyncMutex<FluidTickList>,
     /// Per-column skylight source cache owned by vanilla `ChunkAccess`.
     pub sky_light_sources: SyncRwLock<ChunkSkyLightSources>,
+    /// Chunk-owned light nibbles and section emptiness maps.
+    pub light: SyncRwLock<ChunkLightData>,
     // TODO: research persisting NoiseChunk/Aquifer across stages like vanilla
     // does. Vanilla caches `NoiseChunk` on `ChunkAccess` so noise, surface,
     // and carvers share one instance; we currently rebuild per stage. Blocked
@@ -126,6 +128,7 @@ impl ProtoChunk {
             sky_light_sources: SyncRwLock::new(ChunkSkyLightSources::for_valid_world_height(
                 min_y, height,
             )),
+            light: SyncRwLock::new(ChunkLightData::for_valid_world_height(min_y, height)),
         }
     }
 
@@ -170,6 +173,7 @@ impl ProtoChunk {
             sky_light_sources: SyncRwLock::new(ChunkSkyLightSources::for_valid_world_height(
                 min_y, height,
             )),
+            light: SyncRwLock::new(ChunkLightData::for_valid_world_height(min_y, height)),
         };
 
         if status >= ChunkStatus::InitializeLight {

@@ -27,7 +27,7 @@ use crate::behavior::{BLOCK_BEHAVIORS, BlockStateBehaviorExt, FLUID_BEHAVIORS};
 use crate::block_entity::{BlockEntityStorage, SharedBlockEntity};
 use crate::chunk::{
     heightmap::{ChunkHeightmaps, HeightmapType},
-    light::{ChunkSkyLightSources, has_different_light_properties},
+    light::{ChunkLightData, ChunkSkyLightSources, has_different_light_properties},
     proto_chunk::ProtoChunk,
     section::Sections,
 };
@@ -77,6 +77,8 @@ pub struct LevelChunk {
     postprocessing: SyncMutex<Box<[Vec<u16>]>>,
     /// Per-column skylight source cache owned by vanilla `ChunkAccess`.
     pub sky_light_sources: SyncRwLock<ChunkSkyLightSources>,
+    /// Chunk-owned light nibbles and section emptiness maps.
+    pub light: SyncRwLock<ChunkLightData>,
 }
 
 impl LevelChunk {
@@ -216,6 +218,7 @@ impl LevelChunk {
         let block_ticks = proto_chunk.block_ticks.into_inner();
         let fluid_ticks = proto_chunk.fluid_ticks.into_inner();
         let sky_light_sources = proto_chunk.sky_light_sources.into_inner();
+        let light = proto_chunk.light.into_inner();
         let block_entities = proto_chunk.block_entities;
         let entities = proto_chunk.entities;
 
@@ -237,6 +240,7 @@ impl LevelChunk {
             structure_references: SyncRwLock::new(structure_references),
             postprocessing: SyncMutex::new(postprocessing),
             sky_light_sources: SyncRwLock::new(sky_light_sources),
+            light: SyncRwLock::new(light),
         };
         let _ = chunk.register_existing_entities();
         chunk
@@ -284,6 +288,7 @@ impl LevelChunk {
             sources.fill_from_sections(&sections);
             sources
         };
+        let light = ChunkLightData::for_valid_world_height(min_y, height);
 
         Self {
             sections,
@@ -301,6 +306,7 @@ impl LevelChunk {
             structure_references: SyncRwLock::new(structure_references),
             postprocessing: SyncMutex::new(empty_postprocessing(height)),
             sky_light_sources: SyncRwLock::new(sky_light_sources),
+            light: SyncRwLock::new(light),
         }
     }
 
