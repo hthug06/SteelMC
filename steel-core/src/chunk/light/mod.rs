@@ -110,7 +110,7 @@ mod sky_sources;
 
 pub use cache::{
     CachedLightBlock, LIGHT_CACHE_CHUNK_SLOTS, LIGHT_CACHE_DIAMETER, LIGHT_CACHE_RADIUS,
-    LightCacheLayout, PackedLightBlockPos,
+    LightCacheLayout, LightUpdateNotificationCache, PackedLightBlockPos,
 };
 pub use data_layer::{DataLayer, DataLayerLengthError, DataLayerStorageMap};
 pub use nibble::{

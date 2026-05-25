@@ -78,6 +78,117 @@ pub struct CachedLightBlock {
     pub local_index: usize,
 }
 
+/// Section-slot notification flags used while publishing visible light updates.
+///
+/// ScalableLux keeps `notifyUpdateCache` beside its nibble cache and marks the
+/// cached sections touched by a block's one-block lighting neighborhood. The
+/// light engine later scans the same section slots while publishing dirty
+/// nibbles and notifying clients.
+#[derive(Debug, Clone)]
+pub struct LightUpdateNotificationCache {
+    layout: LightCacheLayout,
+    marked: Box<[bool]>,
+}
+
+impl LightUpdateNotificationCache {
+    /// Creates an empty notification cache for a light-engine cache window.
+    #[must_use]
+    pub fn new(layout: LightCacheLayout) -> Self {
+        Self {
+            layout,
+            marked: vec![false; layout.section_slot_count()].into_boxed_slice(),
+        }
+    }
+
+    /// Returns the layout this notification cache is indexed by.
+    #[must_use]
+    pub const fn layout(&self) -> LightCacheLayout {
+        self.layout
+    }
+
+    /// Returns true when no section slots are marked for notification.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.marked.iter().all(|marked| !marked)
+    }
+
+    /// Removes every pending section notification.
+    pub fn clear(&mut self) {
+        self.marked.fill(false);
+    }
+
+    /// Marks a cached section, returning true only when it was newly marked.
+    pub fn mark_section(&mut self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+
+        self.mark_section_slot(section_slot)
+    }
+
+    /// Marks every cached section touched by a block's lighting neighborhood.
+    ///
+    /// Returns `None` if the full one-block neighborhood is not inside this
+    /// cache window, so callers do not accidentally publish a partial update.
+    pub fn mark_block_neighborhood(&mut self, block_pos: BlockPos) -> Option<usize> {
+        let mut contained = true;
+        SectionPos::around_and_at_block_pos(block_pos, |section_pos| {
+            contained &= self.layout.section_slot(section_pos).is_some();
+        });
+        if !contained {
+            return None;
+        }
+
+        let mut newly_marked = 0;
+        SectionPos::around_and_at_block_pos(block_pos, |section_pos| {
+            if self.mark_section(section_pos) {
+                newly_marked += 1;
+            }
+        });
+        Some(newly_marked)
+    }
+
+    /// Returns whether a cached section is marked for notification.
+    #[must_use]
+    pub fn is_marked_section(&self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+
+        self.is_marked_section_slot(section_slot)
+    }
+
+    /// Returns whether a section slot is marked for notification.
+    #[must_use]
+    pub fn is_marked_section_slot(&self, section_slot: usize) -> bool {
+        self.marked.get(section_slot).copied().unwrap_or(false)
+    }
+
+    /// Iterates marked section positions in cache-slot order.
+    pub fn marked_section_positions(&self) -> impl Iterator<Item = SectionPos> + '_ {
+        self.marked
+            .iter()
+            .enumerate()
+            .filter_map(move |(section_slot, marked)| {
+                if *marked {
+                    self.layout.section_pos_for_slot(section_slot)
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn mark_section_slot(&mut self, section_slot: usize) -> bool {
+        let Some(marked) = self.marked.get_mut(section_slot) else {
+            return false;
+        };
+
+        let newly_marked = !*marked;
+        *marked = true;
+        newly_marked
+    }
+}
+
 /// ScalableLux cache-window layout for chunk, section, and nibble arrays.
 ///
 /// ScalableLux keeps a 5x5 chunk window around the active chunk and stores
@@ -197,6 +308,22 @@ impl LightCacheLayout {
     #[must_use]
     pub fn section_slot_for_block(self, block_pos: BlockPos) -> Option<usize> {
         self.section_slot(SectionPos::from_block_pos(block_pos))
+    }
+
+    /// Converts a section/nibble slot back to its cached section position.
+    #[must_use]
+    pub fn section_pos_for_slot(self, section_slot: usize) -> Option<SectionPos> {
+        if section_slot >= self.section_slot_count() {
+            return None;
+        }
+
+        let section_x = self.center_chunk.0.x - LIGHT_CACHE_RADIUS
+            + (section_slot % LIGHT_CACHE_DIAMETER) as i32;
+        let section_z = self.center_chunk.0.y - LIGHT_CACHE_RADIUS
+            + ((section_slot / LIGHT_CACHE_DIAMETER) % LIGHT_CACHE_DIAMETER) as i32;
+        let section_y = self.cached_min_section_y + (section_slot / LIGHT_CACHE_CHUNK_SLOTS) as i32;
+
+        Some(SectionPos::new(section_x, section_y, section_z))
     }
 
     /// Returns cache slot data for a block position.
@@ -426,6 +553,41 @@ mod tests {
     }
 
     #[test]
+    fn cache_layout_decodes_scalable_lux_section_slots() {
+        let layout = LightCacheLayout::new(ChunkPos::new(10, -20), range(0, 16));
+
+        assert_eq!(
+            layout.section_pos_for_slot(0),
+            Some(SectionPos::new(8, -2, -22))
+        );
+        assert_eq!(
+            layout.section_pos_for_slot(12),
+            Some(SectionPos::new(10, -2, -20))
+        );
+        assert_eq!(
+            layout.section_pos_for_slot(37),
+            Some(SectionPos::new(10, -1, -20))
+        );
+        assert_eq!(
+            layout.section_pos_for_slot(112),
+            Some(SectionPos::new(10, 2, -20))
+        );
+        assert_eq!(layout.section_pos_for_slot(125), None);
+    }
+
+    #[test]
+    fn cache_layout_section_slot_round_trips_every_cached_section() {
+        let layout = LightCacheLayout::new(ChunkPos::new(-4, 6), range(-64, 384));
+
+        for section_slot in 0..layout.section_slot_count() {
+            let Some(section_pos) = layout.section_pos_for_slot(section_slot) else {
+                panic!("valid cache slot did not decode");
+            };
+            assert_eq!(layout.section_slot(section_pos), Some(section_slot));
+        }
+    }
+
+    #[test]
     fn cache_layout_maps_block_positions_to_section_slots() {
         let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
 
@@ -566,5 +728,67 @@ mod tests {
             layout.cached_block_from_packed(PackedLightBlockPos::from_raw(u32::MAX)),
             None
         );
+    }
+
+    #[test]
+    fn notification_cache_marks_cached_sections_once() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let mut notifications = LightUpdateNotificationCache::new(layout);
+        let section = SectionPos::new(0, 0, 0);
+
+        assert_eq!(notifications.layout(), layout);
+        assert!(notifications.is_empty());
+        assert!(notifications.mark_section(section));
+        assert!(!notifications.is_empty());
+        assert!(notifications.is_marked_section(section));
+        assert!(!notifications.mark_section(section));
+        assert_eq!(
+            notifications.marked_section_positions().collect::<Vec<_>>(),
+            vec![section]
+        );
+
+        notifications.clear();
+        assert!(notifications.is_empty());
+        assert!(!notifications.is_marked_section(section));
+    }
+
+    #[test]
+    fn notification_cache_marks_one_block_light_neighborhood() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let mut notifications = LightUpdateNotificationCache::new(layout);
+
+        assert_eq!(
+            notifications.mark_block_neighborhood(BlockPos::new(8, 8, 8)),
+            Some(1)
+        );
+        assert_eq!(
+            notifications.marked_section_positions().collect::<Vec<_>>(),
+            vec![SectionPos::new(0, 0, 0)]
+        );
+
+        notifications.clear();
+        assert_eq!(
+            notifications.mark_block_neighborhood(BlockPos::new(16, 16, 16)),
+            Some(8)
+        );
+
+        let marked = notifications.marked_section_positions().collect::<Vec<_>>();
+        assert_eq!(marked.len(), 8);
+        assert!(marked.contains(&SectionPos::new(0, 0, 0)));
+        assert!(marked.contains(&SectionPos::new(1, 0, 0)));
+        assert!(marked.contains(&SectionPos::new(0, 1, 0)));
+        assert!(marked.contains(&SectionPos::new(1, 1, 1)));
+    }
+
+    #[test]
+    fn notification_cache_rejects_partial_block_neighborhoods() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let mut notifications = LightUpdateNotificationCache::new(layout);
+
+        assert_eq!(
+            notifications.mark_block_neighborhood(BlockPos::new(48, 8, 8)),
+            None
+        );
+        assert!(notifications.is_empty());
     }
 }
