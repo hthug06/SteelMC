@@ -712,6 +712,41 @@ impl LayerLightSectionStorage {
         }
     }
 
+    /// Enables sky sources and fills existing empty fully-sourced sky layers.
+    ///
+    /// Vanilla does this in `SkyLightEngine.setLightEnabled`; Steel keeps the
+    /// storage mutation here because it depends only on sky section metadata and
+    /// `ChunkSkyLightSources`.
+    pub fn enable_sky_light_sources(
+        &mut self,
+        section_zero_pos: SectionPos,
+        sources: &ChunkSkyLightSources,
+    ) -> Option<()> {
+        self.sky_data.as_ref()?;
+
+        self.set_light_enabled(section_zero_pos, true);
+
+        let highest_non_source_y = sources.get_highest_lowest_source_y().wrapping_sub(1);
+        let lowest_fully_source_section_y =
+            SectionPos::block_to_section_coord(highest_non_source_y) + 1;
+        let top_section_y = self.get_top_section_y(section_zero_pos)?;
+        let bottom_section_y = self
+            .get_bottom_section_y()?
+            .max(lowest_fully_source_section_y);
+
+        for section_y in (bottom_section_y..top_section_y).rev() {
+            let section_pos =
+                SectionPos::new(section_zero_pos.x(), section_y, section_zero_pos.z());
+            if let Some(data_layer) = self.get_data_layer_to_write(section_pos) {
+                if data_layer.is_empty() {
+                    data_layer.fill(MAX_LIGHT_LEVEL);
+                }
+            }
+        }
+
+        Some(())
+    }
+
     /// Returns true when this section's column has light sources enabled.
     #[must_use]
     pub fn light_on_in_section(&self, section_pos: SectionPos) -> bool {
@@ -1739,6 +1774,12 @@ mod tests {
         sources
     }
 
+    fn sky_sources_with_highest_lowest_source_y(source_y: i32) -> ChunkSkyLightSources {
+        let mut sources = new_test_sky_sources();
+        sources.heightmap.fill(source_y);
+        sources
+    }
+
     #[test]
     fn light_opacity_uses_vanilla_minimum_opacity() {
         init_light_tests();
@@ -2263,6 +2304,46 @@ mod tests {
             panic!("below layer missing");
         };
         assert!(below_layer.is_filled_with(super::MAX_LIGHT_LEVEL));
+    }
+
+    #[test]
+    fn sky_storage_enable_sky_sources_fills_existing_fully_sourced_layers() {
+        let zero = SectionPos::new(0, 0, 0);
+        let lower = SectionPos::new(0, 3, 0);
+        let upper = SectionPos::new(0, 6, 0);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        let sources = sky_sources_with_highest_lowest_source_y(72);
+
+        assert_eq!(storage.update_section_status(lower, false), Ok(()));
+        assert_eq!(storage.update_section_status(upper, false), Ok(()));
+
+        assert_eq!(storage.enable_sky_light_sources(zero, &sources), Some(()));
+        assert!(storage.light_on_in_column(zero));
+
+        for section_y in 5..=7 {
+            let section = SectionPos::new(0, section_y, 0);
+            let Some(layer) = storage.get_updating_data_layer(section) else {
+                panic!("fully sourced section layer missing");
+            };
+            assert!(layer.is_filled_with(super::MAX_LIGHT_LEVEL));
+        }
+
+        let Some(lower_layer) = storage.get_updating_data_layer(SectionPos::new(0, 4, 0)) else {
+            panic!("lower section layer missing");
+        };
+        assert!(lower_layer.is_empty());
+    }
+
+    #[test]
+    fn block_storage_rejects_sky_source_enable() {
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        let sources = sky_sources_with_highest_lowest_source_y(72);
+
+        assert_eq!(
+            storage.enable_sky_light_sources(SectionPos::new(0, 0, 0), &sources),
+            None
+        );
+        assert!(!storage.light_on_in_column(SectionPos::new(0, 0, 0)));
     }
 
     #[test]
