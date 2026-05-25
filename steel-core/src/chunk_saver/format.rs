@@ -50,7 +50,8 @@ pub const REGION_MAGIC: [u8; 4] = *b"STLR";
 /// v13: Split template processor persistence and added ruined-portal processors.
 /// v14: Added buried treasure procedural piece persistence.
 /// v15: Added procedural structure-piece payload persistence.
-pub const FORMAT_VERSION: u16 = 15;
+/// v16: Added chunk-owned light nibble persistence.
+pub const FORMAT_VERSION: u16 = 16;
 
 /// Number of chunks per region side (32×32 = 1024 chunks per region).
 pub const REGION_SIZE: usize = 32;
@@ -295,6 +296,54 @@ pub struct PersistentHeightmap {
     pub data: Vec<u16>,
 }
 
+/// Chunk-owned light data stored with a chunk.
+///
+/// Null light nibbles are omitted. Uninitialized, initialized, and hidden
+/// nibbles use ScalableLux's canonical save-state rules.
+#[derive(SchemaWrite, SchemaRead)]
+pub struct PersistentLightData {
+    /// Block-light nibbles indexed by light-section index.
+    pub block: Vec<PersistentLightNibble>,
+    /// Sky-light nibbles indexed by light-section index.
+    pub sky: Vec<PersistentLightNibble>,
+}
+
+/// One persisted chunk-owned light nibble.
+#[derive(SchemaWrite, SchemaRead)]
+pub enum PersistentLightNibble {
+    /// Non-null zero-filled nibble without backing bytes.
+    Uninitialized {
+        /// Index in the chunk's padded light-section array.
+        section_index: u32,
+    },
+    /// Visible initialized light bytes.
+    Initialized {
+        /// Index in the chunk's padded light-section array.
+        section_index: u32,
+        /// Packed 4-bit light values.
+        data: Vec<u8>,
+    },
+    /// Initialized bytes hidden from vanilla packet/save conversion.
+    Hidden {
+        /// Index in the chunk's padded light-section array.
+        section_index: u32,
+        /// Packed 4-bit light values.
+        data: Vec<u8>,
+    },
+}
+
+impl PersistentLightNibble {
+    /// Returns the padded light-section index.
+    #[must_use]
+    pub const fn section_index(&self) -> u32 {
+        match self {
+            Self::Uninitialized { section_index }
+            | Self::Initialized { section_index, .. }
+            | Self::Hidden { section_index, .. } => *section_index,
+        }
+    }
+}
+
 /// A persistent chunk containing sections and metadata.
 ///
 /// Each chunk stores its own block state and biome palettes, making it
@@ -319,6 +368,8 @@ pub struct PersistentChunk {
     pub fluid_ticks: Vec<PersistentTick>,
     /// Final heightmaps for full chunks (empty for proto chunks).
     pub heightmaps: Vec<PersistentHeightmap>,
+    /// Chunk-owned light nibbles.
+    pub light: PersistentLightData,
     /// Proto chunk carving mask as Steel's packed bitset layout.
     pub carving_mask: Option<Vec<u64>>,
     /// Proto chunk postprocessing offsets grouped by section index.

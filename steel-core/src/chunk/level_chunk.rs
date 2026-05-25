@@ -262,6 +262,7 @@ impl LevelChunk {
     /// * `block_ticks` - Scheduled block ticks loaded from disk
     /// * `fluid_ticks` - Scheduled fluid ticks loaded from disk
     /// * `heightmaps` - Heightmaps loaded from disk
+    /// * `light` - Chunk-owned light data loaded from disk
     ///
     /// # Panics
     /// Panics if the block behavior registry has not been initialized.
@@ -281,6 +282,7 @@ impl LevelChunk {
         heightmaps: ChunkHeightmaps,
         structure_starts: StructureStartMap,
         structure_references: StructureReferenceMap,
+        light: ChunkLightData,
     ) -> Self {
         // Recalculate section counts for random tick optimization
         sections.recalculate_counts();
@@ -291,8 +293,6 @@ impl LevelChunk {
             sources.fill_from_sections(&sections);
             sources
         };
-        let light = ChunkLightData::for_valid_world_height(min_y, height);
-
         Self {
             sections,
             pos,

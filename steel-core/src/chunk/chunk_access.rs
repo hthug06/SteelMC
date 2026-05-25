@@ -806,6 +806,7 @@ mod tests {
             ChunkHeightmaps::new(0, 16),
             StructureStartMap::default(),
             StructureReferenceMap::default(),
+            ChunkLightData::for_valid_world_height(0, 16),
         ));
 
         chunk.mark_pos_for_postprocessing(BlockPos::new(1, 2, 3));
@@ -826,6 +827,7 @@ mod tests {
             ChunkHeightmaps::new(0, 16),
             StructureStartMap::default(),
             StructureReferenceMap::default(),
+            ChunkLightData::for_valid_world_height(0, 16),
         ));
         let stone = REGISTRY.blocks.get_default_state_id(&vanilla_blocks::STONE);
 

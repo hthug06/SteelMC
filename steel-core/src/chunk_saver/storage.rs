@@ -2,6 +2,9 @@ use crate::block_entity::{BLOCK_ENTITIES, SharedBlockEntity};
 use crate::chunk::chunk_access::{ChunkAccess, ChunkStatus};
 use crate::chunk::heightmap::{ChunkHeightmaps, Heightmap, HeightmapType};
 use crate::chunk::level_chunk::LevelChunk;
+use crate::chunk::light::{
+    ChunkLightData, ChunkLightLayerStorage, DATA_LAYER_SIZE, LightNibbleArray, LightNibbleState,
+};
 use crate::chunk::paletted_container::PalettedContainer;
 use crate::chunk::proto_chunk::ProtoChunk;
 use crate::chunk::section::{ChunkSection, SectionHolder, Sections};
@@ -329,7 +332,8 @@ use super::{
     PersistentBiomeData, PersistentBlockEntity, PersistentBlockState, PersistentChunk,
     PersistentDesertPyramidPieceData, PersistentEntity, PersistentHeightmap,
     PersistentJigsawJunction, PersistentJigsawPieceData, PersistentJungleTemplePieceData,
-    PersistentMineshaftPieceData, PersistentMineshaftPieceKind, PersistentNetherFortressPieceData,
+    PersistentLightData, PersistentLightNibble, PersistentMineshaftPieceData,
+    PersistentMineshaftPieceKind, PersistentNetherFortressPieceData,
     PersistentOceanMonumentChildPiece, PersistentOceanMonumentChildPieceKind,
     PersistentOceanMonumentPieceData, PersistentOceanMonumentRoomData, PersistentPoi,
     PersistentPoolElement, PersistentProceduralPieceData, PersistentProcessorList,
@@ -537,6 +541,11 @@ impl ChunkStorage {
             .map(|c| Self::heightmaps_to_persistent(&c.heightmaps.read()))
             .unwrap_or_default();
 
+        let light = {
+            let light = chunk.light();
+            Self::light_to_persistent(&light)
+        };
+
         // Serialize structure data (works for both proto and full chunks)
         let structure_starts = Self::structure_starts_to_persistent(&chunk.structure_starts());
         let structure_references =
@@ -573,6 +582,7 @@ impl ChunkStorage {
             block_ticks,
             fluid_ticks,
             heightmaps,
+            light,
             carving_mask,
             postprocessing,
             structure_starts,
@@ -597,6 +607,7 @@ impl ChunkStorage {
         block_ticks: Vec<PersistentTick>,
         fluid_ticks: Vec<PersistentTick>,
         heightmaps: Vec<PersistentHeightmap>,
+        light: PersistentLightData,
         carving_mask: Option<Vec<u64>>,
         postprocessing: Vec<Vec<u16>>,
         structure_starts: Vec<PersistentStructureStart>,
@@ -683,6 +694,7 @@ impl ChunkStorage {
             block_ticks,
             fluid_ticks,
             heightmaps,
+            light,
             carving_mask,
             postprocessing,
             structure_starts,
@@ -787,6 +799,148 @@ impl ChunkStorage {
         }
     }
 
+    /// Converts chunk-owned light data to persistent format.
+    fn light_to_persistent(light: &ChunkLightData) -> PersistentLightData {
+        PersistentLightData {
+            block: Self::light_layer_to_persistent(&light.block),
+            sky: Self::light_layer_to_persistent(&light.sky),
+        }
+    }
+
+    fn light_layer_to_persistent(layer: &ChunkLightLayerStorage) -> Vec<PersistentLightNibble> {
+        layer
+            .nibbles()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, nibble)| {
+                let Ok(section_index) = u32::try_from(index) else {
+                    tracing::warn!(
+                        index,
+                        "Light section index does not fit in persistent format"
+                    );
+                    return None;
+                };
+
+                let save_state = nibble.to_save_state()?;
+                match save_state.state {
+                    LightNibbleState::Null => None,
+                    LightNibbleState::Uninitialized => {
+                        Some(PersistentLightNibble::Uninitialized { section_index })
+                    }
+                    LightNibbleState::Initialized | LightNibbleState::Hidden => {
+                        let Some(data) = save_state.data else {
+                            tracing::warn!(
+                                ?save_state.state,
+                                section_index,
+                                "Skipping initialized light nibble without data"
+                            );
+                            return None;
+                        };
+                        let data = Vec::from(*data);
+                        if save_state.state == LightNibbleState::Hidden {
+                            Some(PersistentLightNibble::Hidden {
+                                section_index,
+                                data,
+                            })
+                        } else {
+                            Some(PersistentLightNibble::Initialized {
+                                section_index,
+                                data,
+                            })
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn persistent_to_light(
+        persistent: &PersistentLightData,
+        min_y: i32,
+        height: i32,
+    ) -> ChunkLightData {
+        let mut light = ChunkLightData::for_valid_world_height(min_y, height);
+        Self::apply_persistent_light_layer(&mut light.block, &persistent.block, "block");
+        Self::apply_persistent_light_layer(&mut light.sky, &persistent.sky, "sky");
+        light
+    }
+
+    fn apply_persistent_light_layer(
+        layer: &mut ChunkLightLayerStorage,
+        persistent: &[PersistentLightNibble],
+        layer_name: &str,
+    ) {
+        for nibble in persistent {
+            let Ok(section_index) = usize::try_from(nibble.section_index()) else {
+                tracing::warn!(
+                    layer = layer_name,
+                    section_index = nibble.section_index(),
+                    "Persisted light section index does not fit this platform"
+                );
+                continue;
+            };
+
+            let Some(target) = layer.nibbles_mut().get_mut(section_index) else {
+                tracing::warn!(
+                    layer = layer_name,
+                    section_index,
+                    "Persisted light section index is outside world light range"
+                );
+                continue;
+            };
+
+            let Some(restored) = Self::persistent_to_light_nibble(nibble, layer_name) else {
+                continue;
+            };
+            *target = restored;
+        }
+    }
+
+    fn persistent_to_light_nibble(
+        persistent: &PersistentLightNibble,
+        layer_name: &str,
+    ) -> Option<LightNibbleArray> {
+        match persistent {
+            PersistentLightNibble::Uninitialized { .. } => Some(LightNibbleArray::uninitialized()),
+            PersistentLightNibble::Initialized {
+                section_index,
+                data,
+            } => Self::persistent_light_bytes_to_nibble(data, *section_index, layer_name, false),
+            PersistentLightNibble::Hidden {
+                section_index,
+                data,
+            } => Self::persistent_light_bytes_to_nibble(data, *section_index, layer_name, true),
+        }
+    }
+
+    fn persistent_light_bytes_to_nibble(
+        data: &[u8],
+        section_index: u32,
+        layer_name: &str,
+        hidden: bool,
+    ) -> Option<LightNibbleArray> {
+        let bytes = Box::<[u8]>::from(data);
+        let result = if hidden {
+            LightNibbleArray::hidden_from_bytes(bytes)
+        } else {
+            LightNibbleArray::initialized_from_bytes(bytes)
+        };
+
+        match result {
+            Ok(nibble) => Some(nibble),
+            Err(error) => {
+                tracing::warn!(
+                    layer = layer_name,
+                    section_index,
+                    actual = error.actual,
+                    expected = DATA_LAYER_SIZE,
+                    "Skipping persisted light nibble with invalid byte length"
+                );
+                None
+            }
+        }
+    }
+
     /// Converts a persistent chunk to runtime format.
     /// The returned chunk is not dirty (freshly loaded from disk).
     ///
@@ -815,6 +969,7 @@ impl ChunkStorage {
         let structure_starts = Self::persistent_to_structure_starts(&persistent.structure_starts);
         let structure_references =
             Self::persistent_to_structure_references(&persistent.structure_references);
+        let light = Self::persistent_to_light(&persistent.light, min_y, height);
 
         if status == ChunkStatus::Full {
             // Reconstruct scheduled ticks from persistent data
@@ -835,6 +990,7 @@ impl ChunkStorage {
                 heightmaps,
                 structure_starts,
                 structure_references,
+                light,
             );
 
             // Load block entities
@@ -899,6 +1055,7 @@ impl ChunkStorage {
                 block_ticks,
                 fluid_ticks,
                 level.clone(),
+                light,
             );
 
             for persistent_be in &persistent.block_entities {
@@ -2646,6 +2803,104 @@ mod tests {
             Some("minecraft:chests/simple_dungeon".to_owned())
         );
         assert_eq!(saved.long("LootTableSeed"), Some(42));
+    }
+
+    #[test]
+    fn chunk_owned_light_roundtrips_through_persistent_chunk() {
+        init_test_registry();
+        init_behaviors();
+
+        let pos = ChunkPos::new(2, -3);
+        let chunk = LevelChunk::from_disk(
+            single_empty_section(),
+            pos,
+            0,
+            16,
+            Weak::new(),
+            BlockTickList::new(),
+            FluidTickList::new(),
+            ChunkHeightmaps::new(0, 16),
+            StructureStartMap::default(),
+            StructureReferenceMap::default(),
+            ChunkLightData::for_valid_world_height(0, 16),
+        );
+
+        {
+            let mut light = chunk.light.write();
+            {
+                let Some(block) = light.block.nibble_mut(0) else {
+                    panic!("block light section should exist");
+                };
+                block.set(1, 2, 3, 12);
+                block.update_visible();
+            }
+            {
+                let Some(sky_bottom) = light.sky.nibble_mut(-1) else {
+                    panic!("bottom sky light section should exist");
+                };
+                sky_bottom.set_non_null();
+                sky_bottom.update_visible();
+            }
+            {
+                let Some(sky_hidden) = light.sky.nibble_mut(0) else {
+                    panic!("hidden sky light section should exist");
+                };
+                sky_hidden.set(4, 5, 6, 7);
+                sky_hidden.set_hidden();
+                sky_hidden.update_visible();
+            }
+        }
+
+        chunk.dirty.store(true, Ordering::Release);
+        let chunk = ChunkAccess::Full(chunk);
+        let Some(prepared) = ChunkStorage::prepare_chunk_save(&chunk) else {
+            panic!("dirty full chunk should prepare for saving");
+        };
+
+        assert_eq!(prepared.persistent.light.block.len(), 1);
+        match &prepared.persistent.light.block[0] {
+            PersistentLightNibble::Initialized {
+                section_index,
+                data,
+            } => {
+                assert_eq!(*section_index, 1);
+                assert_eq!(data.len(), DATA_LAYER_SIZE);
+            }
+            _ => panic!("block light should persist initialized data"),
+        }
+        assert_eq!(prepared.persistent.light.sky.len(), 2);
+
+        let loaded = ChunkStorage::persistent_to_chunk(
+            &prepared.persistent,
+            pos,
+            ChunkStatus::Full,
+            0,
+            16,
+            Weak::new(),
+        );
+        let ChunkAccess::Full(loaded) = loaded else {
+            panic!("full status should load as full chunk");
+        };
+        let light = loaded.light.read();
+
+        let Some(block) = light.block.nibble(0) else {
+            panic!("block light section should reload");
+        };
+        assert_eq!(block.visible_state(), LightNibbleState::Initialized);
+        assert_eq!(block.get_visible(1, 2, 3), 12);
+
+        let Some(sky_bottom) = light.sky.nibble(-1) else {
+            panic!("bottom sky light section should reload");
+        };
+        assert_eq!(sky_bottom.visible_state(), LightNibbleState::Uninitialized);
+        assert_eq!(sky_bottom.get_visible(0, 0, 0), 0);
+
+        let Some(sky_hidden) = light.sky.nibble(0) else {
+            panic!("hidden sky light section should reload");
+        };
+        assert_eq!(sky_hidden.visible_state(), LightNibbleState::Hidden);
+        assert_eq!(sky_hidden.get_visible(4, 5, 6), 7);
+        assert!(sky_hidden.to_data_layer().is_none());
     }
 
     #[test]

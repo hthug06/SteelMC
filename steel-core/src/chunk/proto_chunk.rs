@@ -151,6 +151,7 @@ impl ProtoChunk {
         block_ticks: BlockTickList,
         fluid_ticks: FluidTickList,
         level: Weak<World>,
+        light: ChunkLightData,
     ) -> Self {
         let chunk = Self {
             sections,
@@ -173,7 +174,7 @@ impl ProtoChunk {
             sky_light_sources: SyncRwLock::new(ChunkSkyLightSources::for_valid_world_height(
                 min_y, height,
             )),
-            light: SyncRwLock::new(ChunkLightData::for_valid_world_height(min_y, height)),
+            light: SyncRwLock::new(light),
         };
 
         if status >= ChunkStatus::InitializeLight {

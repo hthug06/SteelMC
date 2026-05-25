@@ -83,6 +83,14 @@ impl LightNibbleArray {
         Ok(Self::from_packed_data(data))
     }
 
+    /// Creates a hidden initialized nibble section from packed vanilla bytes.
+    pub fn hidden_from_bytes(bytes: Box<[u8]>) -> Result<Self, DataLayerLengthError> {
+        let mut nibble = Self::initialized_from_bytes(bytes)?;
+        nibble.updating_state = LightNibbleState::Hidden;
+        nibble.visible_state = LightNibbleState::Hidden;
+        Ok(nibble)
+    }
+
     /// Creates a nibble section from optional vanilla data.
     #[must_use]
     pub fn from_data_layer(layer: Option<&DataLayer>) -> Self {
