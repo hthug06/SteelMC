@@ -1,4 +1,4 @@
-use steel_utils::{BlockPos, ChunkPos, SectionPos};
+use steel_utils::{BlockPos, ChunkPos, Direction, SectionPos};
 
 use super::LightSectionRange;
 
@@ -353,6 +353,21 @@ impl LightCacheLayout {
         })
     }
 
+    /// Returns cache slot data for a cached block's neighboring block.
+    #[must_use]
+    pub fn cached_neighbor(
+        self,
+        cached_block: CachedLightBlock,
+        direction: Direction,
+    ) -> Option<CachedLightBlock> {
+        let (dx, dy, dz) = direction.offset();
+        self.cached_block_by_coords(
+            cached_block.block_pos.x().checked_add(dx)?,
+            cached_block.block_pos.y().checked_add(dy)?,
+            cached_block.block_pos.z().checked_add(dz)?,
+        )
+    }
+
     /// Decodes a packed queue position and returns its cache slot data.
     #[must_use]
     pub fn cached_block_from_packed(self, packed: PackedLightBlockPos) -> Option<CachedLightBlock> {
@@ -639,6 +654,70 @@ mod tests {
             })
         );
         assert_eq!(layout.cached_block(BlockPos::new(48, 0, 0)), None);
+    }
+
+    #[test]
+    fn cache_layout_maps_cached_neighbors_with_scalable_lux_local_indices() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let Some(block) = layout.cached_block(BlockPos::new(7, 7, 7)) else {
+            panic!("test block should be cached");
+        };
+
+        assert_eq!(
+            layout.cached_neighbor(block, Direction::East),
+            Some(CachedLightBlock {
+                block_pos: BlockPos::new(8, 7, 7),
+                section_slot: 62,
+                local_index: 8 | (7 << 4) | (7 << 8),
+            })
+        );
+        assert_eq!(
+            layout.cached_neighbor(block, Direction::Down),
+            Some(CachedLightBlock {
+                block_pos: BlockPos::new(7, 6, 7),
+                section_slot: 62,
+                local_index: 7 | (7 << 4) | (6 << 8),
+            })
+        );
+    }
+
+    #[test]
+    fn cache_layout_maps_cached_neighbors_across_section_edges() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let Some(block) = layout.cached_block(BlockPos::new(15, 15, 15)) else {
+            panic!("test block should be cached");
+        };
+
+        assert_eq!(
+            layout.cached_neighbor(block, Direction::East),
+            Some(CachedLightBlock {
+                block_pos: BlockPos::new(16, 15, 15),
+                section_slot: 63,
+                local_index: (15 << 4) | (15 << 8),
+            })
+        );
+        assert_eq!(
+            layout.cached_neighbor(block, Direction::Up),
+            Some(CachedLightBlock {
+                block_pos: BlockPos::new(15, 16, 15),
+                section_slot: 87,
+                local_index: 15 | (15 << 4),
+            })
+        );
+    }
+
+    #[test]
+    fn cache_layout_rejects_cached_neighbors_outside_cache_window() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let Some(east_edge) = layout.cached_block(BlockPos::new(47, 0, 0)) else {
+            panic!("edge block should be inside section cache");
+        };
+        let Some(bottom_edge) = layout.cached_block(BlockPos::new(0, -32, 0)) else {
+            panic!("bottom block should be inside section cache");
+        };
+
+        assert_eq!(layout.cached_neighbor(east_edge, Direction::East), None);
+        assert_eq!(layout.cached_neighbor(bottom_edge, Direction::Down), None);
     }
 
     #[test]
