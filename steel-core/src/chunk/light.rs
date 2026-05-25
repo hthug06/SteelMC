@@ -1,6 +1,6 @@
 //! Light storage primitives used by chunk and world lighting.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use steel_protocol::packets::game::LightUpdatePacketData;
 use steel_registry::{blocks::block_state_ext::BlockStateExt, vanilla_blocks};
 use steel_utils::{BlockStateId, ChunkPos, Direction, PackedSectionPos, SectionPos, codec::BitSet};
@@ -21,6 +21,9 @@ pub const DATA_LAYER_SIZE: usize = DATA_LAYER_BLOCK_COUNT / 2;
 const CHUNK_EDGE: usize = 16;
 const CHUNK_COLUMN_COUNT: usize = CHUNK_EDGE * CHUNK_EDGE;
 const NEGATIVE_INFINITY: i32 = i32::MIN;
+const SECTION_HAS_DATA_BIT: u8 = 0b0010_0000;
+const SECTION_NEIGHBOR_COUNT_BITS: u8 = 0b0001_1111;
+const MAX_SECTION_NEIGHBORS: i32 = 26;
 
 /// Vanilla light layer kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,6 +42,95 @@ pub fn has_different_light_properties(old_state: BlockStateId, new_state: BlockS
             || old_state.get_light_emission() != new_state.get_light_emission()
             || old_state.use_shape_for_light_occlusion()
             || new_state.use_shape_for_light_occlusion())
+}
+
+/// Error returned when a light section state would hold an invalid neighbor count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightSectionStateError {
+    /// Requested neighbor count.
+    pub neighbor_count: i32,
+}
+
+/// Vanilla's packed light-section state byte.
+///
+/// Bits 0..4 store the count of neighboring data sections and bit 5 stores
+/// whether this section itself has block data. A non-zero neighbor count keeps
+/// an otherwise empty section alive as `LIGHT_ONLY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightSectionState(u8);
+
+impl LightSectionState {
+    /// Empty section with no data and no neighboring data sections.
+    pub const EMPTY: Self = Self(0);
+
+    /// Creates a state from vanilla's packed byte representation.
+    #[must_use]
+    pub const fn from_raw(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    /// Returns vanilla's packed byte representation.
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// Returns true when this section contains chunk block data.
+    #[must_use]
+    pub const fn has_data(self) -> bool {
+        self.0 & SECTION_HAS_DATA_BIT != 0
+    }
+
+    /// Returns the count of neighboring data sections.
+    #[must_use]
+    pub const fn neighbor_count(self) -> u8 {
+        self.0 & SECTION_NEIGHBOR_COUNT_BITS
+    }
+
+    /// Returns this section's debug type.
+    #[must_use]
+    pub const fn section_type(self) -> LightSectionType {
+        if self.0 == 0 {
+            LightSectionType::Empty
+        } else if self.has_data() {
+            LightSectionType::LightAndData
+        } else {
+            LightSectionType::LightOnly
+        }
+    }
+
+    /// Sets the data bit.
+    #[must_use]
+    pub const fn with_has_data(self, has_data: bool) -> Self {
+        if has_data {
+            Self(self.0 | SECTION_HAS_DATA_BIT)
+        } else {
+            Self(self.0 & !SECTION_HAS_DATA_BIT)
+        }
+    }
+
+    /// Sets the neighboring data-section count.
+    pub fn with_neighbor_count(self, neighbor_count: i32) -> Result<Self, LightSectionStateError> {
+        if !(0..=MAX_SECTION_NEIGHBORS).contains(&neighbor_count) {
+            return Err(LightSectionStateError { neighbor_count });
+        }
+
+        Ok(Self(
+            self.0 & !SECTION_NEIGHBOR_COUNT_BITS
+                | (neighbor_count as u8 & SECTION_NEIGHBOR_COUNT_BITS),
+        ))
+    }
+}
+
+/// Debug type for a light section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightSectionType {
+    /// No light layer is stored for the section.
+    Empty,
+    /// Light-only section kept alive by neighboring block data.
+    LightOnly,
+    /// Section with block data and light storage.
+    LightAndData,
 }
 
 /// Error returned when a world height cannot produce a valid light-section range.
@@ -158,6 +250,12 @@ impl DataLayerStorageMap {
         self.layers.is_empty()
     }
 
+    /// Returns the number of stored section light layers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
     /// Returns true when a section has a stored light layer.
     #[must_use]
     pub fn has_layer(&self, section_pos: SectionPos) -> bool {
@@ -207,6 +305,312 @@ impl DataLayerStorageMap {
 
     fn key(section_pos: SectionPos) -> PackedSectionPos {
         PackedSectionPos::from(section_pos)
+    }
+}
+
+/// Common light-section storage state shared by vanilla block and sky lighting.
+///
+/// This mirrors vanilla `LayerLightSectionStorage` for section states, queued
+/// data, pending removals, and visible/updating data maps. Sky lighting will
+/// add its top-section bookkeeping on top of this storage.
+#[derive(Debug)]
+pub struct LayerLightSectionStorage {
+    layer: LightLayer,
+    section_states: FxHashMap<PackedSectionPos, LightSectionState>,
+    columns_with_sources: FxHashSet<PackedSectionPos>,
+    visible_section_data: DataLayerStorageMap,
+    updating_section_data: DataLayerStorageMap,
+    changed_sections: FxHashSet<PackedSectionPos>,
+    sections_affected_by_light_updates: FxHashSet<PackedSectionPos>,
+    queued_sections: FxHashMap<PackedSectionPos, DataLayer>,
+    columns_to_retain_queued_data_for: FxHashSet<PackedSectionPos>,
+    to_remove: FxHashSet<PackedSectionPos>,
+    has_inconsistencies: bool,
+}
+
+impl LayerLightSectionStorage {
+    /// Creates empty section storage for one light layer.
+    #[must_use]
+    pub fn new(layer: LightLayer) -> Self {
+        let updating_section_data = DataLayerStorageMap::new();
+        let visible_section_data = updating_section_data.copy_map();
+        Self {
+            layer,
+            section_states: FxHashMap::default(),
+            columns_with_sources: FxHashSet::default(),
+            visible_section_data,
+            updating_section_data,
+            changed_sections: FxHashSet::default(),
+            sections_affected_by_light_updates: FxHashSet::default(),
+            queued_sections: FxHashMap::default(),
+            columns_to_retain_queued_data_for: FxHashSet::default(),
+            to_remove: FxHashSet::default(),
+            has_inconsistencies: false,
+        }
+    }
+
+    /// Returns the layer kind stored here.
+    #[must_use]
+    pub const fn layer(&self) -> LightLayer {
+        self.layer
+    }
+
+    /// Returns whether pending queued/removal work needs to be reconciled.
+    #[must_use]
+    pub const fn has_inconsistencies(&self) -> bool {
+        self.has_inconsistencies
+    }
+
+    /// Returns whether the updating map stores light for this section.
+    #[must_use]
+    pub fn storing_light_for_section(&self, section_pos: SectionPos) -> bool {
+        self.updating_section_data.has_layer(section_pos)
+    }
+
+    /// Returns visible light data or queued replacement data for packet/saving reads.
+    #[must_use]
+    pub fn get_data_layer_data(&self, section_pos: SectionPos) -> Option<&DataLayer> {
+        let key = Self::key(section_pos);
+        if let Some(layer) = self.queued_sections.get(&key) {
+            return Some(layer);
+        }
+
+        self.visible_section_data.get_layer(section_pos)
+    }
+
+    /// Returns the updating data layer for this section.
+    #[must_use]
+    pub fn get_updating_data_layer(&self, section_pos: SectionPos) -> Option<&DataLayer> {
+        self.updating_section_data.get_layer(section_pos)
+    }
+
+    /// Returns a mutable copy-on-write updating layer for this section.
+    pub fn get_data_layer_to_write(&mut self, section_pos: SectionPos) -> Option<&mut DataLayer> {
+        if !self.updating_section_data.has_layer(section_pos) {
+            return None;
+        }
+
+        let key = Self::key(section_pos);
+        if self.changed_sections.insert(key) {
+            return self.updating_section_data.copy_data_layer(section_pos);
+        }
+
+        self.updating_section_data.get_layer_mut(section_pos)
+    }
+
+    /// Queues externally loaded section data.
+    pub fn queue_section_data(&mut self, section_pos: SectionPos, data: Option<DataLayer>) {
+        let key = Self::key(section_pos);
+        if let Some(data) = data {
+            self.queued_sections.insert(key, data);
+            self.has_inconsistencies = true;
+        } else {
+            self.queued_sections.remove(&key);
+        }
+    }
+
+    /// Keeps queued data for a chunk column when currently stored data is removed.
+    pub fn retain_data(&mut self, section_zero_pos: SectionPos, retain: bool) {
+        let zero_key = Self::zero_key(section_zero_pos);
+        if retain {
+            self.columns_to_retain_queued_data_for.insert(zero_key);
+        } else {
+            self.columns_to_retain_queued_data_for.remove(&zero_key);
+        }
+    }
+
+    /// Enables or disables light sources for a chunk column.
+    pub fn set_light_enabled(&mut self, section_zero_pos: SectionPos, enable: bool) {
+        let zero_key = Self::zero_key(section_zero_pos);
+        if enable {
+            self.columns_with_sources.insert(zero_key);
+        } else {
+            self.columns_with_sources.remove(&zero_key);
+        }
+    }
+
+    /// Returns true when this section's column has light sources enabled.
+    #[must_use]
+    pub fn light_on_in_section(&self, section_pos: SectionPos) -> bool {
+        self.columns_with_sources
+            .contains(&Self::zero_key(section_pos))
+    }
+
+    /// Returns true when this zero-section column has light sources enabled.
+    #[must_use]
+    pub fn light_on_in_column(&self, section_zero_pos: SectionPos) -> bool {
+        self.columns_with_sources
+            .contains(&Self::zero_key(section_zero_pos))
+    }
+
+    /// Updates whether a chunk section contains block data.
+    pub fn update_section_status(
+        &mut self,
+        section_pos: SectionPos,
+        section_empty: bool,
+    ) -> Result<(), LightSectionStateError> {
+        let state = self.section_state(section_pos);
+        let new_state = state.with_has_data(!section_empty);
+        if state == new_state {
+            return Ok(());
+        }
+
+        self.put_section_state(section_pos, new_state);
+        let neighbor_increment = if section_empty { -1 } else { 1 };
+
+        for offset_z in -1..=1 {
+            for offset_x in -1..=1 {
+                for offset_y in -1..=1 {
+                    if offset_x == 0 && offset_y == 0 && offset_z == 0 {
+                        continue;
+                    }
+
+                    let neighbor_pos = Self::offset(section_pos, offset_x, offset_y, offset_z);
+                    let neighbor_state = self.section_state(neighbor_pos);
+                    let neighbor_count =
+                        i32::from(neighbor_state.neighbor_count()) + neighbor_increment;
+                    self.put_section_state(
+                        neighbor_pos,
+                        neighbor_state.with_neighbor_count(neighbor_count)?,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reconciles queued section data and pending removals.
+    pub fn mark_new_inconsistencies(&mut self) {
+        if !self.has_inconsistencies {
+            return;
+        }
+
+        self.has_inconsistencies = false;
+        let to_remove = std::mem::take(&mut self.to_remove);
+        for key in &to_remove {
+            let section_pos = key.to_section_pos();
+            let queued = self.queued_sections.remove(key);
+            let stored = self.updating_section_data.remove_layer(section_pos);
+            if self
+                .columns_to_retain_queued_data_for
+                .contains(&Self::zero_key(section_pos))
+            {
+                if let Some(layer) = queued {
+                    self.queued_sections.insert(*key, layer);
+                } else if let Some(layer) = stored {
+                    self.queued_sections.insert(*key, layer);
+                }
+            }
+        }
+
+        for key in to_remove {
+            self.changed_sections.insert(key);
+        }
+
+        let queued_keys: Vec<PackedSectionPos> = self.queued_sections.keys().copied().collect();
+        for key in queued_keys {
+            let section_pos = key.to_section_pos();
+            if self.storing_light_for_section(section_pos) {
+                if let Some(data) = self.queued_sections.remove(&key) {
+                    self.updating_section_data.set_layer(section_pos, data);
+                    self.changed_sections.insert(key);
+                }
+            }
+        }
+    }
+
+    /// Copies changed updating data into the visible map and returns affected sections.
+    pub fn swap_section_map(&mut self) -> Vec<SectionPos> {
+        if !self.changed_sections.is_empty() {
+            self.visible_section_data = self.updating_section_data.copy_map();
+            self.changed_sections.clear();
+        }
+
+        let mut affected = Vec::with_capacity(self.sections_affected_by_light_updates.len());
+        for key in std::mem::take(&mut self.sections_affected_by_light_updates) {
+            affected.push(key.to_section_pos());
+        }
+        affected
+    }
+
+    /// Returns this section's debug type.
+    #[must_use]
+    pub fn get_debug_section_type(&self, section_pos: SectionPos) -> LightSectionType {
+        self.section_state(section_pos).section_type()
+    }
+
+    fn section_state(&self, section_pos: SectionPos) -> LightSectionState {
+        match self.section_states.get(&Self::key(section_pos)) {
+            Some(state) => *state,
+            None => LightSectionState::EMPTY,
+        }
+    }
+
+    fn put_section_state(&mut self, section_pos: SectionPos, state: LightSectionState) {
+        let key = Self::key(section_pos);
+        if state != LightSectionState::EMPTY {
+            if self.section_states.insert(key, state).is_none() {
+                self.initialize_section(section_pos);
+            }
+        } else if self.section_states.remove(&key).is_some() {
+            self.remove_section(section_pos);
+        }
+    }
+
+    fn initialize_section(&mut self, section_pos: SectionPos) {
+        let key = Self::key(section_pos);
+        if self.to_remove.remove(&key) {
+            return;
+        }
+
+        let data_layer = if let Some(layer) = self.queued_sections.remove(&key) {
+            layer
+        } else {
+            DataLayer::new()
+        };
+        self.updating_section_data
+            .set_layer(section_pos, data_layer);
+        self.changed_sections.insert(key);
+        self.mark_section_and_neighbors_as_affected(section_pos);
+        self.has_inconsistencies = true;
+    }
+
+    fn remove_section(&mut self, section_pos: SectionPos) {
+        self.to_remove.insert(Self::key(section_pos));
+        self.has_inconsistencies = true;
+    }
+
+    fn mark_section_and_neighbors_as_affected(&mut self, section_pos: SectionPos) {
+        for offset_z in -1..=1 {
+            for offset_x in -1..=1 {
+                for offset_y in -1..=1 {
+                    self.sections_affected_by_light_updates
+                        .insert(Self::key(Self::offset(
+                            section_pos,
+                            offset_x,
+                            offset_y,
+                            offset_z,
+                        )));
+                }
+            }
+        }
+    }
+
+    fn key(section_pos: SectionPos) -> PackedSectionPos {
+        PackedSectionPos::from(section_pos)
+    }
+
+    fn zero_key(section_pos: SectionPos) -> PackedSectionPos {
+        PackedSectionPos::from(SectionPos::new(section_pos.x(), 0, section_pos.z()))
+    }
+
+    fn offset(section_pos: SectionPos, x: i32, y: i32, z: i32) -> SectionPos {
+        SectionPos::new(
+            section_pos.x() + x,
+            section_pos.y() + y,
+            section_pos.z() + z,
+        )
     }
 }
 
@@ -735,7 +1139,7 @@ mod tests {
     use steel_registry::blocks::block_state_ext::BlockStateExt;
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
     use steel_utils::BlockStateId;
-    use steel_utils::{ChunkPos, SectionPos};
+    use steel_utils::{ChunkPos, PackedSectionPos, SectionPos};
 
     use crate::{
         behavior::init_behaviors,
@@ -743,8 +1147,10 @@ mod tests {
     };
 
     use super::{
-        ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap, LightSectionRange,
-        build_light_update_packet, has_different_light_properties,
+        ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
+        LayerLightSectionStorage, LightLayer, LightSectionRange, LightSectionState,
+        LightSectionStateError, LightSectionType, build_light_update_packet,
+        has_different_light_properties,
     };
 
     fn init_light_tests() {
@@ -909,6 +1315,121 @@ mod tests {
         };
         assert_eq!(original_layer.get(2, 3, 4), 1);
         assert_eq!(copied_layer.get(2, 3, 4), 6);
+    }
+
+    #[test]
+    fn light_section_state_matches_vanilla_bit_layout() {
+        let data = LightSectionState::EMPTY.with_has_data(true);
+        assert_eq!(data.raw(), 32);
+        assert!(data.has_data());
+        assert_eq!(data.neighbor_count(), 0);
+        assert_eq!(data.section_type(), LightSectionType::LightAndData);
+
+        let result = LightSectionState::EMPTY.with_neighbor_count(26);
+        let Ok(light_only) = result else {
+            panic!("valid neighbor count rejected");
+        };
+        assert_eq!(light_only.raw(), 26);
+        assert!(!light_only.has_data());
+        assert_eq!(light_only.neighbor_count(), 26);
+        assert_eq!(light_only.section_type(), LightSectionType::LightOnly);
+    }
+
+    #[test]
+    fn light_section_state_rejects_invalid_neighbor_count() {
+        assert_eq!(
+            LightSectionState::EMPTY.with_neighbor_count(27),
+            Err(LightSectionStateError { neighbor_count: 27 })
+        );
+        assert_eq!(
+            LightSectionState::EMPTY.with_neighbor_count(-1),
+            Err(LightSectionStateError { neighbor_count: -1 })
+        );
+    }
+
+    #[test]
+    fn layer_storage_creates_data_and_light_only_neighbors() {
+        let center = SectionPos::new(4, 5, 6);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+
+        assert_eq!(storage.update_section_status(center, false), Ok(()));
+
+        assert_eq!(
+            storage.get_debug_section_type(center),
+            LightSectionType::LightAndData
+        );
+        assert!(storage.storing_light_for_section(center));
+        assert_eq!(storage.updating_section_data.len(), 27);
+
+        let neighbor = SectionPos::new(5, 5, 6);
+        assert_eq!(
+            storage.get_debug_section_type(neighbor),
+            LightSectionType::LightOnly
+        );
+        assert!(storage.storing_light_for_section(neighbor));
+    }
+
+    #[test]
+    fn layer_storage_removes_data_after_section_becomes_empty() {
+        let center = SectionPos::new(4, 5, 6);
+        let neighbor = SectionPos::new(5, 5, 6);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        assert_eq!(storage.update_section_status(center, false), Ok(()));
+
+        assert_eq!(storage.update_section_status(center, true), Ok(()));
+
+        assert_eq!(
+            storage.get_debug_section_type(center),
+            LightSectionType::Empty
+        );
+        assert_eq!(
+            storage.get_debug_section_type(neighbor),
+            LightSectionType::Empty
+        );
+        assert!(storage.storing_light_for_section(center));
+        assert!(storage.has_inconsistencies());
+
+        storage.mark_new_inconsistencies();
+
+        assert!(!storage.storing_light_for_section(center));
+        assert!(!storage.storing_light_for_section(neighbor));
+        assert_eq!(storage.updating_section_data.len(), 0);
+    }
+
+    #[test]
+    fn layer_storage_retains_removed_column_data_when_requested() {
+        let center = SectionPos::new(4, 5, 6);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        assert_eq!(storage.update_section_status(center, false), Ok(()));
+
+        let Some(layer) = storage.get_data_layer_to_write(center) else {
+            panic!("center layer missing");
+        };
+        layer.set(1, 2, 3, 9);
+        storage.retain_data(SectionPos::new(4, 0, 6), true);
+        assert_eq!(storage.update_section_status(center, true), Ok(()));
+
+        storage.mark_new_inconsistencies();
+
+        let Some(retained) = storage.queued_sections.get(&PackedSectionPos::from(center)) else {
+            panic!("removed section data was not retained");
+        };
+        assert_eq!(retained.get(1, 2, 3), 9);
+    }
+
+    #[test]
+    fn layer_storage_swap_updates_visible_map_and_returns_affected_sections() {
+        let center = SectionPos::new(4, 5, 6);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        assert_eq!(storage.update_section_status(center, false), Ok(()));
+        assert!(storage.get_data_layer_data(center).is_none());
+
+        let affected = storage.swap_section_map();
+
+        assert!(affected.contains(&center));
+        assert!(storage.get_data_layer_data(center).is_some());
+        assert!(storage.changed_sections.is_empty());
+        assert!(storage.sections_affected_by_light_updates.is_empty());
     }
 
     #[test]
