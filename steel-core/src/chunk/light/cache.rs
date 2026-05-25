@@ -11,6 +11,9 @@ pub const LIGHT_CACHE_CHUNK_SLOTS: usize = LIGHT_CACHE_DIAMETER * LIGHT_CACHE_DI
 
 const LIGHT_CACHE_DIAMETER_I64: i64 = LIGHT_CACHE_DIAMETER as i64;
 const LIGHT_CACHE_CHUNK_SLOTS_I64: i64 = LIGHT_CACHE_CHUNK_SLOTS as i64;
+const LIGHT_LOCAL_BLOCK_MASK: usize = 15;
+const LIGHT_LOCAL_BLOCK_Z_SHIFT: usize = 4;
+const LIGHT_LOCAL_BLOCK_Y_SHIFT: usize = 8;
 const LIGHT_ENCODED_HORIZONTAL_BITS: i64 = 6;
 const LIGHT_ENCODED_VERTICAL_BITS: i64 = 16;
 const LIGHT_ENCODED_HORIZONTAL_MASK: i64 = (1 << LIGHT_ENCODED_HORIZONTAL_BITS) - 1;
@@ -58,6 +61,21 @@ impl PackedLightBlockPos {
     pub const fn encoded_y(self) -> u16 {
         ((self.0 >> LIGHT_ENCODED_Y_SHIFT) & LIGHT_ENCODED_VERTICAL_MASK as u32) as u16
     }
+}
+
+/// Cached section slot and local nibble index for one block.
+///
+/// ScalableLux propagation uses `sectionIndex` plus local index
+/// `x | (z << 4) | (y << 8)` instead of repeatedly materializing section
+/// positions and local coordinates inside the hot propagation loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedLightBlock {
+    /// World block position for this cached block.
+    pub block_pos: BlockPos,
+    /// Slot into ScalableLux's section/nibble cache arrays.
+    pub section_slot: usize,
+    /// Local block index inside the 16x16x16 light section.
+    pub local_index: usize,
 }
 
 /// ScalableLux cache-window layout for chunk, section, and nibble arrays.
@@ -179,6 +197,53 @@ impl LightCacheLayout {
     #[must_use]
     pub fn section_slot_for_block(self, block_pos: BlockPos) -> Option<usize> {
         self.section_slot(SectionPos::from_block_pos(block_pos))
+    }
+
+    /// Returns cache slot data for a block position.
+    #[must_use]
+    pub fn cached_block(self, block_pos: BlockPos) -> Option<CachedLightBlock> {
+        self.cached_block_by_coords(block_pos.x(), block_pos.y(), block_pos.z())
+    }
+
+    /// Returns cache slot data for block coordinates.
+    #[must_use]
+    pub fn cached_block_by_coords(
+        self,
+        block_x: i32,
+        block_y: i32,
+        block_z: i32,
+    ) -> Option<CachedLightBlock> {
+        let section_slot = self.section_slot_by_coords(
+            SectionPos::block_to_section_coord(block_x),
+            SectionPos::block_to_section_coord(block_y),
+            SectionPos::block_to_section_coord(block_z),
+        )?;
+
+        Some(CachedLightBlock {
+            block_pos: BlockPos::new(block_x, block_y, block_z),
+            section_slot,
+            local_index: Self::local_block_index_by_coords(block_x, block_y, block_z),
+        })
+    }
+
+    /// Decodes a packed queue position and returns its cache slot data.
+    #[must_use]
+    pub fn cached_block_from_packed(self, packed: PackedLightBlockPos) -> Option<CachedLightBlock> {
+        self.cached_block(self.decode_block_pos(packed)?)
+    }
+
+    /// Returns the local light-section index for a block position.
+    #[must_use]
+    pub const fn local_block_index(block_pos: BlockPos) -> usize {
+        Self::local_block_index_by_coords(block_pos.x(), block_pos.y(), block_pos.z())
+    }
+
+    /// Returns the local light-section index for block coordinates.
+    #[must_use]
+    pub const fn local_block_index_by_coords(block_x: i32, block_y: i32, block_z: i32) -> usize {
+        (block_x as usize & LIGHT_LOCAL_BLOCK_MASK)
+            | ((block_z as usize & LIGHT_LOCAL_BLOCK_MASK) << LIGHT_LOCAL_BLOCK_Z_SHIFT)
+            | ((block_y as usize & LIGHT_LOCAL_BLOCK_MASK) << LIGHT_LOCAL_BLOCK_Y_SHIFT)
     }
 
     /// Returns the first block X coordinate that can be packed into queue entries.
@@ -372,6 +437,49 @@ mod tests {
     }
 
     #[test]
+    fn cache_layout_uses_scalable_lux_local_block_indices() {
+        assert_eq!(
+            LightCacheLayout::local_block_index(BlockPos::new(0, 0, 0)),
+            0
+        );
+        assert_eq!(
+            LightCacheLayout::local_block_index(BlockPos::new(15, 15, 15)),
+            15 | (15 << 4) | (15 << 8)
+        );
+        assert_eq!(
+            LightCacheLayout::local_block_index(BlockPos::new(-1, -1, -1)),
+            15 | (15 << 4) | (15 << 8)
+        );
+        assert_eq!(
+            LightCacheLayout::local_block_index(BlockPos::new(16, 16, 16)),
+            0
+        );
+    }
+
+    #[test]
+    fn cache_layout_maps_block_positions_to_cached_blocks() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+
+        assert_eq!(
+            layout.cached_block(BlockPos::new(31, 0, -32)),
+            Some(CachedLightBlock {
+                block_pos: BlockPos::new(31, 0, -32),
+                section_slot: 53,
+                local_index: 15,
+            })
+        );
+        assert_eq!(
+            layout.cached_block(BlockPos::new(-1, -1, -1)),
+            Some(CachedLightBlock {
+                block_pos: BlockPos::new(-1, -1, -1),
+                section_slot: 31,
+                local_index: 4095,
+            })
+        );
+        assert_eq!(layout.cached_block(BlockPos::new(48, 0, 0)), None);
+    }
+
+    #[test]
     fn overworld_cache_layout_uses_light_sections_plus_two_buffers() {
         let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(-64, 384));
 
@@ -437,5 +545,26 @@ mod tests {
         assert_eq!(layout.encode_block_pos(BlockPos::new(40, 0, 0)), None);
         assert_eq!(layout.encode_block_pos(BlockPos::new(0, 0, 40)), None);
         assert_eq!(layout.encode_block_pos(BlockPos::new(0, 48, 0)), None);
+    }
+
+    #[test]
+    fn cache_layout_maps_packed_positions_to_cached_blocks() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let Some(packed) = layout.encode_block_pos(BlockPos::new(7, 0, 7)) else {
+            panic!("center block should encode");
+        };
+
+        assert_eq!(
+            layout.cached_block_from_packed(packed),
+            Some(CachedLightBlock {
+                block_pos: BlockPos::new(7, 0, 7),
+                section_slot: 62,
+                local_index: 7 | (7 << 4),
+            })
+        );
+        assert_eq!(
+            layout.cached_block_from_packed(PackedLightBlockPos::from_raw(u32::MAX)),
+            None
+        );
     }
 }
