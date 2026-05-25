@@ -623,6 +623,19 @@ impl LayerLightSectionStorage {
         self.updating_section_data.get_layer(section_pos)
     }
 
+    /// Returns the visible light value for a block.
+    ///
+    /// Vanilla implements this in separate block/sky storage subclasses. Steel
+    /// keeps shared section storage in one type, so the layer selects the
+    /// vanilla read path here.
+    #[must_use]
+    pub fn get_light_value(&self, block_pos: BlockPos) -> u8 {
+        match self.layer {
+            LightLayer::Block => self.get_block_light_value(block_pos),
+            LightLayer::Sky => self.get_sky_light_value(block_pos),
+        }
+    }
+
     /// Returns the updating light value stored for a block.
     ///
     /// Vanilla assumes the caller already checked `storingLightForSection`;
@@ -918,6 +931,45 @@ impl LayerLightSectionStorage {
         });
     }
 
+    fn get_block_light_value(&self, block_pos: BlockPos) -> u8 {
+        let section_pos = SectionPos::from_block_pos(block_pos);
+        match self.visible_section_data.get_layer(section_pos) {
+            Some(layer) => Self::get_data_layer_block_value(layer, block_pos),
+            None => 0,
+        }
+    }
+
+    fn get_sky_light_value(&self, block_pos: BlockPos) -> u8 {
+        let Some(sky_data) = self.sky_data.as_ref() else {
+            return MAX_LIGHT_LEVEL;
+        };
+
+        let section_pos = SectionPos::from_block_pos(block_pos);
+        let section_y = section_pos.y();
+        let top_section = sky_data.visible.top_section(Self::zero_key(section_pos));
+        if top_section == sky_data.visible.current_lowest_y || section_y >= top_section {
+            return MAX_LIGHT_LEVEL;
+        }
+
+        if let Some(layer) = self.visible_section_data.get_layer(section_pos) {
+            return Self::get_data_layer_block_value(layer, block_pos);
+        }
+
+        let mut current_section_pos = section_pos;
+        let mut current_section_y = section_y;
+        loop {
+            current_section_y += 1;
+            if current_section_y >= top_section {
+                return MAX_LIGHT_LEVEL;
+            }
+
+            current_section_pos = Self::offset(current_section_pos, 0, 1, 0);
+            if let Some(layer) = self.visible_section_data.get_layer(current_section_pos) {
+                return Self::get_data_layer_column_bottom_value(layer, block_pos);
+            }
+        }
+    }
+
     fn get_data_layer_block_value(layer: &DataLayer, block_pos: BlockPos) -> u8 {
         let local_pos = SectionPos::section_relative_pos(block_pos);
         layer.get(
@@ -935,6 +987,11 @@ impl LayerLightSectionStorage {
             local_pos.z() as usize,
             level,
         );
+    }
+
+    fn get_data_layer_column_bottom_value(layer: &DataLayer, block_pos: BlockPos) -> u8 {
+        let local_pos = SectionPos::section_relative_pos(block_pos);
+        layer.get(local_pos.x() as usize, 0, local_pos.z() as usize)
     }
 
     fn create_data_layer(&mut self, section_pos: SectionPos) -> DataLayer {
@@ -2109,6 +2166,67 @@ mod tests {
         assert!(affected.contains(&SectionPos::new(1, 1, 0)));
         assert!(affected.contains(&SectionPos::new(1, 2, -1)));
         assert!(affected.contains(&SectionPos::new(1, 2, 0)));
+    }
+
+    #[test]
+    fn block_storage_light_value_reads_visible_data() {
+        let section = SectionPos::new(1, 2, 3);
+        let block = BlockPos::new((1 << 4) + 2, (2 << 4) + 3, (3 << 4) + 4);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+
+        assert_eq!(storage.get_light_value(block), 0);
+        assert_eq!(storage.update_section_status(section, false), Ok(()));
+        assert_eq!(storage.set_stored_level(block, 11), Ok(()));
+        assert_eq!(storage.get_light_value(block), 0);
+
+        drop(storage.swap_section_map());
+
+        assert_eq!(storage.get_light_value(block), 11);
+    }
+
+    #[test]
+    fn sky_storage_light_value_defaults_to_full_bright_without_data() {
+        let storage = LayerLightSectionStorage::new(LightLayer::Sky);
+
+        assert_eq!(storage.get_light_value(BlockPos::new(1, -64, 1)), 15);
+    }
+
+    #[test]
+    fn sky_storage_light_value_reads_visible_data() {
+        let section = SectionPos::new(0, 4, 0);
+        let block = BlockPos::new(2, (4 << 4) + 3, 5);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+
+        assert_eq!(storage.update_section_status(section, false), Ok(()));
+        assert_eq!(storage.set_stored_level(block, 8), Ok(()));
+        assert_eq!(storage.get_light_value(block), 15);
+
+        drop(storage.swap_section_map());
+
+        assert_eq!(storage.get_light_value(block), 8);
+    }
+
+    #[test]
+    fn sky_storage_light_value_scans_to_first_visible_layer_above() {
+        let source_section = SectionPos::new(0, 5, 0);
+        let first_above_bottom_block = BlockPos::new(2, 4 << 4, 5);
+        let first_above_same_column_block = BlockPos::new(2, (4 << 4) + 11, 5);
+        let missing_section_block = BlockPos::new(2, (3 << 4) + 11, 5);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+
+        assert_eq!(storage.update_section_status(source_section, false), Ok(()));
+        assert_eq!(
+            storage.set_stored_level(first_above_bottom_block, 9),
+            Ok(())
+        );
+        assert_eq!(
+            storage.set_stored_level(first_above_same_column_block, 3),
+            Ok(())
+        );
+
+        drop(storage.swap_section_map());
+
+        assert_eq!(storage.get_light_value(missing_section_block), 9);
     }
 
     #[test]
