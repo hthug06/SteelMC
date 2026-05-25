@@ -3,8 +3,9 @@ use std::sync::Arc;
 use crate::chunk::section::Sections;
 
 use super::{
-    DATA_LAYER_EDGE, DATA_LAYER_SIZE, DATA_LAYER_Y_STRIDE, DataLayer, DataLayerLengthError,
-    LIGHT_SECTION_PADDING, LightLayer, LightSectionRange, LightSectionRangeError, MAX_LIGHT_LEVEL,
+    DATA_LAYER_BLOCK_COUNT, DATA_LAYER_EDGE, DATA_LAYER_SIZE, DATA_LAYER_Y_STRIDE, DataLayer,
+    DataLayerLengthError, LIGHT_SECTION_PADDING, LightLayer, LightSectionRange,
+    LightSectionRangeError, MAX_LIGHT_LEVEL,
 };
 
 /// ScalableLux-style light nibble state for one 16x16x16 light section.
@@ -227,6 +228,14 @@ impl LightNibbleArray {
         Self::get_from_data(&self.updating_data, Self::index(x, y, z))
     }
 
+    /// Returns an updating light value at a ScalableLux local section index.
+    #[must_use]
+    pub fn get_updating_at_index(&self, index: usize) -> u8 {
+        debug_assert!(index < DATA_LAYER_BLOCK_COUNT);
+
+        Self::get_from_data(&self.updating_data, index)
+    }
+
     /// Returns a visible light value at local section coordinates.
     #[must_use]
     pub fn get_visible(&self, x: usize, y: usize, z: usize) -> u8 {
@@ -237,6 +246,14 @@ impl LightNibbleArray {
         Self::get_from_data(&self.visible_data, Self::index(x, y, z))
     }
 
+    /// Returns a visible light value at a ScalableLux local section index.
+    #[must_use]
+    pub fn get_visible_at_index(&self, index: usize) -> u8 {
+        debug_assert!(index < DATA_LAYER_BLOCK_COUNT);
+
+        Self::get_from_data(&self.visible_data, index)
+    }
+
     /// Sets an updating light value at local section coordinates.
     pub fn set(&mut self, x: usize, y: usize, z: usize, value: u8) {
         debug_assert!(x < DATA_LAYER_EDGE);
@@ -244,6 +261,14 @@ impl LightNibbleArray {
         debug_assert!(z < DATA_LAYER_EDGE);
 
         let index = Self::index(x, y, z);
+        let data = self.ensure_updating_data();
+        Self::set_in_data(data, index, value);
+    }
+
+    /// Sets an updating light value at a ScalableLux local section index.
+    pub fn set_at_index(&mut self, index: usize, value: u8) {
+        debug_assert!(index < DATA_LAYER_BLOCK_COUNT);
+
         let data = self.ensure_updating_data();
         Self::set_in_data(data, index, value);
     }
@@ -372,6 +397,38 @@ impl LightNibbleArray {
 impl Default for LightNibbleArray {
     fn default() -> Self {
         Self::null()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn light_nibble_index_access_matches_scalable_lux_local_index() {
+        let mut nibble = LightNibbleArray::uninitialized();
+        let index = 1 | (3 << 4) | (2 << 8);
+
+        nibble.set_at_index(index, 12);
+
+        assert_eq!(nibble.get_updating_at_index(index), 12);
+        assert_eq!(nibble.get_updating(1, 2, 3), 12);
+        assert_eq!(nibble.get_updating(2, 2, 3), 0);
+        assert_eq!(nibble.get_visible_at_index(index), 0);
+
+        assert!(nibble.update_visible());
+        assert_eq!(nibble.get_visible_at_index(index), 12);
+        assert_eq!(nibble.get_visible(1, 2, 3), 12);
+    }
+
+    #[test]
+    fn light_nibble_index_access_masks_values_like_coordinate_access() {
+        let mut nibble = LightNibbleArray::null();
+
+        nibble.set_at_index(0, 31);
+
+        assert_eq!(nibble.get_updating_at_index(0), MAX_LIGHT_LEVEL);
+        assert_eq!(nibble.get_updating(0, 0, 0), MAX_LIGHT_LEVEL);
     }
 }
 
