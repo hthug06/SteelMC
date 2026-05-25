@@ -81,6 +81,29 @@ pub enum LightCacheChunkScope {
     Outer,
 }
 
+/// ScalableLux setup-cache radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightCacheSetupRadius {
+    /// Scan the inner 3x3 chunk window.
+    Inner,
+    /// Scan the full 5x5 chunk window.
+    Full,
+}
+
+impl LightCacheSetupRadius {
+    const fn chunk_radius(self) -> i32 {
+        match self {
+            Self::Inner => LIGHT_CACHE_SECTION_RADIUS,
+            Self::Full => LIGHT_CACHE_RADIUS,
+        }
+    }
+
+    const fn chunk_count(self) -> usize {
+        let diameter = self.chunk_radius() as usize * 2 + 1;
+        diameter * diameter
+    }
+}
+
 /// Cached chunk slot plus its ScalableLux cache role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedLightChunk {
@@ -114,6 +137,127 @@ pub struct CachedLightBlock {
     pub section_slot: usize,
     /// Local block index inside the 16x16x16 light section.
     pub local_index: usize,
+}
+
+/// Iterator over chunks scanned by ScalableLux cache setup.
+#[derive(Debug, Clone)]
+pub struct LightCacheSetupChunks {
+    layout: LightCacheLayout,
+    radius: i32,
+    next_dx: i32,
+    next_dz: i32,
+    remaining: usize,
+}
+
+impl Iterator for LightCacheSetupChunks {
+    type Item = CachedLightChunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let dx = self.next_dx;
+        let dz = self.next_dz;
+        self.remaining -= 1;
+
+        self.next_dx += 1;
+        if self.next_dx > self.radius {
+            self.next_dx = -self.radius;
+            self.next_dz += 1;
+        }
+
+        let chunk_x = self.layout.center_chunk.0.x + dx;
+        let chunk_z = self.layout.center_chunk.0.y + dz;
+        let chunk = self.layout.cached_chunk_by_coords(chunk_x, chunk_z);
+        if chunk.is_none() {
+            self.remaining = 0;
+        }
+        chunk
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for LightCacheSetupChunks {}
+
+impl FusedIterator for LightCacheSetupChunks {}
+
+/// Optional value slots for ScalableLux's 5x5 chunk cache arrays.
+#[derive(Debug, Clone)]
+pub struct LightChunkSlotArray<T> {
+    values: Box<[Option<T>]>,
+}
+
+impl<T> LightChunkSlotArray<T> {
+    /// Creates an empty 5x5 chunk slot array.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            values: empty_option_slots(LIGHT_CACHE_CHUNK_SLOTS),
+        }
+    }
+
+    /// Returns the number of chunk slots.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Returns true when no chunk slots hold values.
+    #[must_use]
+    pub fn is_clear(&self) -> bool {
+        self.values.iter().all(Option::is_none)
+    }
+
+    /// Clears every chunk slot.
+    pub fn clear(&mut self) {
+        for value in &mut self.values {
+            *value = None;
+        }
+    }
+
+    /// Inserts a value at a cached chunk slot.
+    pub fn insert(&mut self, chunk: CachedLightChunk, value: T) -> Option<T> {
+        self.insert_slot(chunk.chunk_slot, value)
+    }
+
+    /// Inserts a value at a raw chunk slot.
+    pub fn insert_slot(&mut self, chunk_slot: usize, value: T) -> Option<T> {
+        self.values
+            .get_mut(chunk_slot)
+            .and_then(|slot| slot.replace(value))
+    }
+
+    /// Returns the value at a cached chunk slot.
+    #[must_use]
+    pub fn get(&self, chunk: CachedLightChunk) -> Option<&T> {
+        self.get_slot(chunk.chunk_slot)
+    }
+
+    /// Returns the mutable value at a cached chunk slot.
+    pub fn get_mut(&mut self, chunk: CachedLightChunk) -> Option<&mut T> {
+        self.get_mut_slot(chunk.chunk_slot)
+    }
+
+    /// Returns the value at a raw chunk slot.
+    #[must_use]
+    pub fn get_slot(&self, chunk_slot: usize) -> Option<&T> {
+        self.values.get(chunk_slot).and_then(Option::as_ref)
+    }
+
+    /// Returns the mutable value at a raw chunk slot.
+    pub fn get_mut_slot(&mut self, chunk_slot: usize) -> Option<&mut T> {
+        self.values.get_mut(chunk_slot).and_then(Option::as_mut)
+    }
+}
+
+impl<T> Default for LightChunkSlotArray<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Iterator over one inner cached chunk's vanilla light-section slots.
@@ -155,6 +299,83 @@ impl Iterator for LightChunkSectionSlots {
 impl ExactSizeIterator for LightChunkSectionSlots {}
 
 impl FusedIterator for LightChunkSectionSlots {}
+
+/// Optional value slots for ScalableLux's section/nibble cache arrays.
+#[derive(Debug, Clone)]
+pub struct LightSectionSlotArray<T> {
+    layout: LightCacheLayout,
+    values: Box<[Option<T>]>,
+}
+
+impl<T> LightSectionSlotArray<T> {
+    /// Creates an empty section slot array sized for `layout`.
+    #[must_use]
+    pub fn new(layout: LightCacheLayout) -> Self {
+        Self {
+            layout,
+            values: empty_option_slots(layout.section_slot_count()),
+        }
+    }
+
+    /// Returns the layout this array is indexed by.
+    #[must_use]
+    pub const fn layout(&self) -> LightCacheLayout {
+        self.layout
+    }
+
+    /// Returns the number of section slots.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Returns true when no section slots hold values.
+    #[must_use]
+    pub fn is_clear(&self) -> bool {
+        self.values.iter().all(Option::is_none)
+    }
+
+    /// Clears every section slot.
+    pub fn clear(&mut self) {
+        for value in &mut self.values {
+            *value = None;
+        }
+    }
+
+    /// Inserts a value at a cached section slot.
+    pub fn insert(&mut self, section: CachedLightSection, value: T) -> Option<T> {
+        self.insert_slot(section.section_slot, value)
+    }
+
+    /// Inserts a value at a raw section slot.
+    pub fn insert_slot(&mut self, section_slot: usize, value: T) -> Option<T> {
+        self.values
+            .get_mut(section_slot)
+            .and_then(|slot| slot.replace(value))
+    }
+
+    /// Returns the value at a cached section slot.
+    #[must_use]
+    pub fn get(&self, section: CachedLightSection) -> Option<&T> {
+        self.get_slot(section.section_slot)
+    }
+
+    /// Returns the mutable value at a cached section slot.
+    pub fn get_mut(&mut self, section: CachedLightSection) -> Option<&mut T> {
+        self.get_mut_slot(section.section_slot)
+    }
+
+    /// Returns the value at a raw section slot.
+    #[must_use]
+    pub fn get_slot(&self, section_slot: usize) -> Option<&T> {
+        self.values.get(section_slot).and_then(Option::as_ref)
+    }
+
+    /// Returns the mutable value at a raw section slot.
+    pub fn get_mut_slot(&mut self, section_slot: usize) -> Option<&mut T> {
+        self.values.get_mut(section_slot).and_then(Option::as_mut)
+    }
+}
 
 /// Section-slot notification flags used while publishing visible light updates.
 ///
@@ -355,6 +576,20 @@ impl LightCacheLayout {
     #[must_use]
     pub const fn section_slot_count(self) -> usize {
         LIGHT_CACHE_CHUNK_SLOTS * self.cached_section_count
+    }
+
+    /// Iterates chunks in ScalableLux `setupCaches` scan order.
+    #[must_use]
+    pub fn setup_chunks(self, radius: LightCacheSetupRadius) -> LightCacheSetupChunks {
+        let remaining = radius.chunk_count();
+        let radius = radius.chunk_radius();
+        LightCacheSetupChunks {
+            layout: self,
+            radius,
+            next_dx: -radius,
+            next_dz: -radius,
+            remaining,
+        }
     }
 
     /// Returns cached chunk slot data for a chunk column.
@@ -677,6 +912,12 @@ impl LightCacheLayout {
     }
 }
 
+fn empty_option_slots<T>(len: usize) -> Box<[Option<T>]> {
+    let mut values = Vec::with_capacity(len);
+    values.resize_with(len, || None);
+    values.into_boxed_slice()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +1002,188 @@ mod tests {
                 Some(chunk_slot)
             );
         }
+    }
+
+    #[test]
+    fn cache_layout_iterates_inner_setup_chunks_in_scalable_lux_order() {
+        let layout = LightCacheLayout::new(ChunkPos::new(10, -20), range(0, 16));
+        let chunks = layout
+            .setup_chunks(LightCacheSetupRadius::Inner)
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), 9);
+        assert_eq!(
+            chunks,
+            vec![
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(9, -21),
+                    chunk_slot: 6,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(10, -21),
+                    chunk_slot: 7,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(11, -21),
+                    chunk_slot: 8,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(9, -20),
+                    chunk_slot: 11,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(10, -20),
+                    chunk_slot: 12,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(11, -20),
+                    chunk_slot: 13,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(9, -19),
+                    chunk_slot: 16,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(10, -19),
+                    chunk_slot: 17,
+                    scope: LightCacheChunkScope::Inner,
+                },
+                CachedLightChunk {
+                    chunk_pos: ChunkPos::new(11, -19),
+                    chunk_slot: 18,
+                    scope: LightCacheChunkScope::Inner,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_layout_iterates_full_setup_chunks_in_scalable_lux_order() {
+        let layout = LightCacheLayout::new(ChunkPos::new(10, -20), range(0, 16));
+        let chunks = layout
+            .setup_chunks(LightCacheSetupRadius::Full)
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), LIGHT_CACHE_CHUNK_SLOTS);
+        assert_eq!(
+            chunks.first(),
+            Some(&CachedLightChunk {
+                chunk_pos: ChunkPos::new(8, -22),
+                chunk_slot: 0,
+                scope: LightCacheChunkScope::Outer,
+            })
+        );
+        assert_eq!(
+            chunks.get(12),
+            Some(&CachedLightChunk {
+                chunk_pos: ChunkPos::new(10, -20),
+                chunk_slot: 12,
+                scope: LightCacheChunkScope::Inner,
+            })
+        );
+        assert_eq!(
+            chunks.last(),
+            Some(&CachedLightChunk {
+                chunk_pos: ChunkPos::new(12, -18),
+                chunk_slot: 24,
+                scope: LightCacheChunkScope::Outer,
+            })
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.scope == LightCacheChunkScope::Inner)
+                .count(),
+            9
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.scope == LightCacheChunkScope::Outer)
+                .count(),
+            16
+        );
+    }
+
+    #[test]
+    fn cache_layout_setup_chunk_iterator_tracks_exact_remaining_len() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let mut chunks = layout.setup_chunks(LightCacheSetupRadius::Inner);
+
+        assert_eq!(chunks.len(), 9);
+        assert_eq!(
+            chunks.next().map(|chunk| chunk.chunk_pos),
+            Some(ChunkPos::new(-1, -1))
+        );
+        assert_eq!(chunks.len(), 8);
+        assert_eq!(chunks.count(), 8);
+    }
+
+    #[test]
+    fn chunk_slot_array_stores_values_by_cached_chunk_slot() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let Some(center) = layout.cached_chunk(ChunkPos::new(0, 0)) else {
+            panic!("center chunk should be cached");
+        };
+        let mut slots = LightChunkSlotArray::new();
+
+        assert_eq!(slots.slot_count(), LIGHT_CACHE_CHUNK_SLOTS);
+        assert!(slots.is_clear());
+        assert_eq!(slots.insert(center, 5), None);
+        assert_eq!(slots.get(center), Some(&5));
+        assert_eq!(slots.get_slot(center.chunk_slot), Some(&5));
+        assert!(!slots.is_clear());
+
+        let Some(value) = slots.get_mut(center) else {
+            panic!("cached value missing");
+        };
+        *value = 9;
+        assert_eq!(slots.insert_slot(center.chunk_slot, 11), Some(9));
+        assert_eq!(slots.get(center), Some(&11));
+        assert_eq!(slots.insert_slot(LIGHT_CACHE_CHUNK_SLOTS, 4), None);
+
+        slots.clear();
+        assert!(slots.is_clear());
+        assert_eq!(slots.get(center), None);
+    }
+
+    #[test]
+    fn section_slot_array_stores_values_by_cached_section_slot() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+        let Some(section) = layout.cached_section(SectionPos::new(0, 0, 0)) else {
+            panic!("section should be cached");
+        };
+        let mut slots = LightSectionSlotArray::new(layout);
+
+        assert_eq!(slots.layout(), layout);
+        assert_eq!(slots.slot_count(), layout.section_slot_count());
+        assert!(slots.is_clear());
+        assert_eq!(slots.insert(section, "block"), None);
+        assert_eq!(slots.get(section), Some(&"block"));
+        assert_eq!(slots.get_slot(section.section_slot), Some(&"block"));
+        assert!(!slots.is_clear());
+
+        let Some(value) = slots.get_mut(section) else {
+            panic!("cached section value missing");
+        };
+        *value = "sky";
+        assert_eq!(slots.insert_slot(section.section_slot, "both"), Some("sky"));
+        assert_eq!(slots.get(section), Some(&"both"));
+        assert_eq!(
+            slots.insert_slot(layout.section_slot_count(), "outside"),
+            None
+        );
+
+        slots.clear();
+        assert!(slots.is_clear());
+        assert_eq!(slots.get(section), None);
     }
 
     #[test]
