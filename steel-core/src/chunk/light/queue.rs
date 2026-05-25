@@ -1,18 +1,317 @@
 use steel_utils::{BlockPos, Direction};
 
-use super::MAX_LIGHT_LEVEL;
+use super::{MAX_LIGHT_LEVEL, PackedLightBlockPos};
 
 const QUEUE_ENTRY_LEVEL_MASK: u64 = 0b1111;
 const QUEUE_ENTRY_DIRECTIONS_MASK: u64 = 0b11_1111_0000;
 const QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE: u64 = 1 << 10;
 const QUEUE_ENTRY_FLAG_INCREASE_FROM_EMISSION: u64 = 1 << 11;
 const LIGHT_QUEUE_MIN_CAPACITY: usize = 512;
+const PACKED_LIGHT_QUEUE_POSITION_BITS: u64 = 28;
+const PACKED_LIGHT_QUEUE_LEVEL_BITS: u64 = 4;
+const PACKED_LIGHT_QUEUE_DIRECTION_BITS: u64 = 6;
+const PACKED_LIGHT_QUEUE_LEVEL_MASK: u64 = (1 << PACKED_LIGHT_QUEUE_LEVEL_BITS) - 1;
+const PACKED_LIGHT_QUEUE_DIRECTION_MASK: u8 = (1 << PACKED_LIGHT_QUEUE_DIRECTION_BITS) - 1;
+const PACKED_LIGHT_QUEUE_LEVEL_SHIFT: u64 = PACKED_LIGHT_QUEUE_POSITION_BITS;
+const PACKED_LIGHT_QUEUE_DIRECTIONS_SHIFT: u64 =
+    PACKED_LIGHT_QUEUE_LEVEL_SHIFT + PACKED_LIGHT_QUEUE_LEVEL_BITS;
+const PACKED_LIGHT_QUEUE_POSITION_MASK: u64 = (1_u64 << PACKED_LIGHT_QUEUE_POSITION_BITS) - 1;
+const PACKED_LIGHT_QUEUE_FLAGS_MASK: u64 = (1_u64 << 61) | (1_u64 << 62) | (1_u64 << 63);
 pub(crate) const REMOVE_TOP_SKY_SOURCE_ENTRY: LightQueueEntry =
     LightQueueEntry::decrease_all_directions(MAX_LIGHT_LEVEL);
 pub(crate) const REMOVE_SKY_SOURCE_ENTRY: LightQueueEntry =
     LightQueueEntry::decrease_skip_one_direction(MAX_LIGHT_LEVEL, Direction::Up);
 pub(crate) const ADD_SKY_SOURCE_ENTRY: LightQueueEntry =
     LightQueueEntry::increase_skip_one_direction(MAX_LIGHT_LEVEL, false, Direction::Up);
+
+/// ScalableLux axis direction order used by packed light propagation queues.
+///
+/// This intentionally differs from vanilla's `Direction.ordinal()` order.
+/// ScalableLux stores direction bitsets as +X, -X, +Z, -Z, +Y, -Y and relies on
+/// positive directions being even so `index ^ 1` gives the opposite direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightAxisDirection {
+    /// Positive X / east.
+    PositiveX,
+    /// Negative X / west.
+    NegativeX,
+    /// Positive Z / south.
+    PositiveZ,
+    /// Negative Z / north.
+    NegativeZ,
+    /// Positive Y / up.
+    PositiveY,
+    /// Negative Y / down.
+    NegativeY,
+}
+
+impl LightAxisDirection {
+    /// All directions in ScalableLux propagation order.
+    pub const ALL: [Self; 6] = [
+        Self::PositiveX,
+        Self::NegativeX,
+        Self::PositiveZ,
+        Self::NegativeZ,
+        Self::PositiveY,
+        Self::NegativeY,
+    ];
+
+    /// Horizontal directions in ScalableLux propagation order.
+    pub const HORIZONTAL: [Self; 4] = [
+        Self::PositiveX,
+        Self::NegativeX,
+        Self::PositiveZ,
+        Self::NegativeZ,
+    ];
+
+    /// Converts a vanilla direction into ScalableLux's axis-direction order.
+    #[must_use]
+    pub const fn from_direction(direction: Direction) -> Self {
+        match direction {
+            Direction::East => Self::PositiveX,
+            Direction::West => Self::NegativeX,
+            Direction::South => Self::PositiveZ,
+            Direction::North => Self::NegativeZ,
+            Direction::Up => Self::PositiveY,
+            Direction::Down => Self::NegativeY,
+        }
+    }
+
+    /// Returns the vanilla direction represented by this axis direction.
+    #[must_use]
+    pub const fn direction(self) -> Direction {
+        match self {
+            Self::PositiveX => Direction::East,
+            Self::NegativeX => Direction::West,
+            Self::PositiveZ => Direction::South,
+            Self::NegativeZ => Direction::North,
+            Self::PositiveY => Direction::Up,
+            Self::NegativeY => Direction::Down,
+        }
+    }
+
+    /// Returns the block-coordinate offset for this axis direction.
+    #[must_use]
+    pub const fn offset(self) -> (i32, i32, i32) {
+        match self {
+            Self::PositiveX => (1, 0, 0),
+            Self::NegativeX => (-1, 0, 0),
+            Self::PositiveZ => (0, 0, 1),
+            Self::NegativeZ => (0, 0, -1),
+            Self::PositiveY => (0, 1, 0),
+            Self::NegativeY => (0, -1, 0),
+        }
+    }
+
+    /// Returns the opposite ScalableLux axis direction.
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::PositiveX => Self::NegativeX,
+            Self::NegativeX => Self::PositiveX,
+            Self::PositiveZ => Self::NegativeZ,
+            Self::NegativeZ => Self::PositiveZ,
+            Self::PositiveY => Self::NegativeY,
+            Self::NegativeY => Self::PositiveY,
+        }
+    }
+
+    /// Returns this direction's ScalableLux bit index.
+    #[must_use]
+    pub const fn bit_index(self) -> u8 {
+        match self {
+            Self::PositiveX => 0,
+            Self::NegativeX => 1,
+            Self::PositiveZ => 2,
+            Self::NegativeZ => 3,
+            Self::PositiveY => 4,
+            Self::NegativeY => 5,
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        1 << self.bit_index()
+    }
+}
+
+/// ScalableLux propagation direction bitset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LightDirectionSet(u8);
+
+impl LightDirectionSet {
+    /// Creates an empty direction set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Creates a direction set containing all six axis directions.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self(PACKED_LIGHT_QUEUE_DIRECTION_MASK)
+    }
+
+    /// Creates a direction set from raw ScalableLux direction bits.
+    #[must_use]
+    pub const fn from_raw(raw: u8) -> Self {
+        Self(raw & PACKED_LIGHT_QUEUE_DIRECTION_MASK)
+    }
+
+    /// Creates a direction set containing exactly one axis direction.
+    #[must_use]
+    pub const fn only(direction: LightAxisDirection) -> Self {
+        Self(direction.bit())
+    }
+
+    /// Creates a direction set containing all directions except one.
+    #[must_use]
+    pub const fn all_except(direction: LightAxisDirection) -> Self {
+        Self(PACKED_LIGHT_QUEUE_DIRECTION_MASK & !direction.bit())
+    }
+
+    /// Creates a direction set containing all directions except the opposite of one direction.
+    #[must_use]
+    pub const fn all_except_opposite(direction: LightAxisDirection) -> Self {
+        Self::all_except(direction.opposite())
+    }
+
+    /// Returns the raw ScalableLux direction bits.
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// Returns true when this set contains the selected axis direction.
+    #[must_use]
+    pub const fn contains(self, direction: LightAxisDirection) -> bool {
+        self.0 & direction.bit() != 0
+    }
+}
+
+/// ScalableLux state flags stored in the top three queue-entry bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LightQueueFlags(u64);
+
+impl LightQueueFlags {
+    /// No queue state flags.
+    pub const EMPTY: Self = Self(0);
+    /// The increase pass should write the entry's level before propagating.
+    pub const WRITE_LEVEL: Self = Self(1_u64 << 61);
+    /// The increase pass should confirm the current level still matches.
+    pub const RECHECK_LEVEL: Self = Self(1_u64 << 62);
+    /// Propagation must account for sided transparent block shapes.
+    pub const HAS_SIDED_TRANSPARENT_BLOCKS: Self = Self(1_u64 << 63);
+
+    /// Creates flags from raw queue bits.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw & PACKED_LIGHT_QUEUE_FLAGS_MASK)
+    }
+
+    /// Returns the raw queue flag bits.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Returns a set with `flag` included.
+    #[must_use]
+    pub const fn with(self, flag: Self) -> Self {
+        Self(self.0 | flag.0)
+    }
+
+    /// Returns true when all bits in `flag` are present.
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 == flag.0
+    }
+}
+
+/// ScalableLux packed light-propagation queue entry.
+///
+/// The lower 28 bits store `PackedLightBlockPos`, followed by a 4-bit light
+/// level and a 6-bit `LightDirectionSet`. Bits 61, 62, and 63 carry
+/// `LightQueueFlags`; the middle 24 bits are intentionally unused to preserve
+/// ScalableLux's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedLightQueueEntry(u64);
+
+impl PackedLightQueueEntry {
+    /// Creates a packed queue entry from typed ScalableLux parts.
+    #[must_use]
+    pub const fn from_parts(
+        block_pos: PackedLightBlockPos,
+        level: u8,
+        directions: LightDirectionSet,
+        flags: LightQueueFlags,
+    ) -> Self {
+        Self(
+            block_pos.raw() as u64
+                | ((level as u64 & PACKED_LIGHT_QUEUE_LEVEL_MASK)
+                    << PACKED_LIGHT_QUEUE_LEVEL_SHIFT)
+                | ((directions.raw() as u64) << PACKED_LIGHT_QUEUE_DIRECTIONS_SHIFT)
+                | flags.raw(),
+        )
+    }
+
+    /// Creates a packed queue entry from raw ScalableLux queue bits.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw ScalableLux queue entry.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Returns the packed block position stored in this queue entry.
+    #[must_use]
+    pub const fn block_pos(self) -> PackedLightBlockPos {
+        PackedLightBlockPos::from_raw((self.0 & PACKED_LIGHT_QUEUE_POSITION_MASK) as u32)
+    }
+
+    /// Returns the propagated light level.
+    #[must_use]
+    pub const fn level(self) -> u8 {
+        ((self.0 >> PACKED_LIGHT_QUEUE_LEVEL_SHIFT) & PACKED_LIGHT_QUEUE_LEVEL_MASK) as u8
+    }
+
+    /// Returns the propagation direction set.
+    #[must_use]
+    pub const fn directions(self) -> LightDirectionSet {
+        LightDirectionSet::from_raw(
+            ((self.0 >> PACKED_LIGHT_QUEUE_DIRECTIONS_SHIFT)
+                & PACKED_LIGHT_QUEUE_DIRECTION_MASK as u64) as u8,
+        )
+    }
+
+    /// Returns the top-bit state flags.
+    #[must_use]
+    pub const fn flags(self) -> LightQueueFlags {
+        LightQueueFlags::from_raw(self.0)
+    }
+
+    /// Returns true when the increase pass should write this entry's level.
+    #[must_use]
+    pub const fn should_write_level(self) -> bool {
+        self.flags().contains(LightQueueFlags::WRITE_LEVEL)
+    }
+
+    /// Returns true when the increase pass should confirm the current level.
+    #[must_use]
+    pub const fn should_recheck_level(self) -> bool {
+        self.flags().contains(LightQueueFlags::RECHECK_LEVEL)
+    }
+
+    /// Returns true when propagation must account for sided transparent shapes.
+    #[must_use]
+    pub const fn has_sided_transparent_blocks(self) -> bool {
+        self.flags()
+            .contains(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS)
+    }
+}
 
 /// Vanilla's packed light-propagation queue entry.
 ///
@@ -296,5 +595,180 @@ impl LightPropagationQueues {
     pub fn clear(&mut self) {
         self.increase.clear();
         self.decrease.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn light_axis_direction_matches_scalable_lux_order() {
+        assert_eq!(
+            LightAxisDirection::ALL,
+            [
+                LightAxisDirection::PositiveX,
+                LightAxisDirection::NegativeX,
+                LightAxisDirection::PositiveZ,
+                LightAxisDirection::NegativeZ,
+                LightAxisDirection::PositiveY,
+                LightAxisDirection::NegativeY,
+            ]
+        );
+        assert_eq!(
+            LightAxisDirection::HORIZONTAL,
+            [
+                LightAxisDirection::PositiveX,
+                LightAxisDirection::NegativeX,
+                LightAxisDirection::PositiveZ,
+                LightAxisDirection::NegativeZ,
+            ]
+        );
+
+        assert_eq!(LightAxisDirection::PositiveX.bit_index(), 0);
+        assert_eq!(LightAxisDirection::NegativeX.bit_index(), 1);
+        assert_eq!(LightAxisDirection::PositiveZ.bit_index(), 2);
+        assert_eq!(LightAxisDirection::NegativeZ.bit_index(), 3);
+        assert_eq!(LightAxisDirection::PositiveY.bit_index(), 4);
+        assert_eq!(LightAxisDirection::NegativeY.bit_index(), 5);
+    }
+
+    #[test]
+    fn light_axis_direction_maps_to_steel_direction() {
+        assert_eq!(
+            LightAxisDirection::from_direction(Direction::East),
+            LightAxisDirection::PositiveX
+        );
+        assert_eq!(
+            LightAxisDirection::from_direction(Direction::West),
+            LightAxisDirection::NegativeX
+        );
+        assert_eq!(
+            LightAxisDirection::from_direction(Direction::South),
+            LightAxisDirection::PositiveZ
+        );
+        assert_eq!(
+            LightAxisDirection::from_direction(Direction::North),
+            LightAxisDirection::NegativeZ
+        );
+        assert_eq!(
+            LightAxisDirection::from_direction(Direction::Up),
+            LightAxisDirection::PositiveY
+        );
+        assert_eq!(
+            LightAxisDirection::from_direction(Direction::Down),
+            LightAxisDirection::NegativeY
+        );
+
+        assert_eq!(LightAxisDirection::PositiveX.direction(), Direction::East);
+        assert_eq!(LightAxisDirection::NegativeX.direction(), Direction::West);
+        assert_eq!(LightAxisDirection::PositiveZ.direction(), Direction::South);
+        assert_eq!(LightAxisDirection::NegativeZ.direction(), Direction::North);
+        assert_eq!(LightAxisDirection::PositiveY.direction(), Direction::Up);
+        assert_eq!(LightAxisDirection::NegativeY.direction(), Direction::Down);
+
+        assert_eq!(LightAxisDirection::PositiveX.offset(), (1, 0, 0));
+        assert_eq!(LightAxisDirection::NegativeX.offset(), (-1, 0, 0));
+        assert_eq!(LightAxisDirection::PositiveZ.offset(), (0, 0, 1));
+        assert_eq!(LightAxisDirection::NegativeZ.offset(), (0, 0, -1));
+        assert_eq!(LightAxisDirection::PositiveY.offset(), (0, 1, 0));
+        assert_eq!(LightAxisDirection::NegativeY.offset(), (0, -1, 0));
+    }
+
+    #[test]
+    fn light_axis_direction_opposites_flip_low_bit() {
+        for direction in LightAxisDirection::ALL {
+            assert_eq!(direction.opposite().bit_index(), direction.bit_index() ^ 1);
+            assert_eq!(direction.opposite().opposite(), direction);
+        }
+    }
+
+    #[test]
+    fn light_direction_set_matches_scalable_lux_masks() {
+        assert_eq!(LightDirectionSet::empty().raw(), 0);
+        assert_eq!(LightDirectionSet::all().raw(), 0b11_1111);
+        assert_eq!(LightDirectionSet::from_raw(u8::MAX).raw(), 0b11_1111);
+        assert_eq!(
+            LightDirectionSet::only(LightAxisDirection::PositiveZ).raw(),
+            0b000100
+        );
+        assert_eq!(
+            LightDirectionSet::all_except(LightAxisDirection::PositiveZ).raw(),
+            0b11_1011
+        );
+        assert_eq!(
+            LightDirectionSet::all_except_opposite(LightAxisDirection::PositiveZ).raw(),
+            0b11_0111
+        );
+
+        let set = LightDirectionSet::from_raw(0b10_0101);
+        assert!(set.contains(LightAxisDirection::PositiveX));
+        assert!(set.contains(LightAxisDirection::PositiveZ));
+        assert!(set.contains(LightAxisDirection::NegativeY));
+        assert!(!set.contains(LightAxisDirection::NegativeX));
+        assert!(!set.contains(LightAxisDirection::NegativeZ));
+        assert!(!set.contains(LightAxisDirection::PositiveY));
+    }
+
+    #[test]
+    fn light_queue_flags_match_scalable_lux_top_bits() {
+        assert_eq!(LightQueueFlags::WRITE_LEVEL.raw(), 1_u64 << 61);
+        assert_eq!(LightQueueFlags::RECHECK_LEVEL.raw(), 1_u64 << 62);
+        assert_eq!(
+            LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS.raw(),
+            1_u64 << 63
+        );
+
+        let flags = LightQueueFlags::EMPTY
+            .with(LightQueueFlags::WRITE_LEVEL)
+            .with(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS);
+        assert!(flags.contains(LightQueueFlags::WRITE_LEVEL));
+        assert!(!flags.contains(LightQueueFlags::RECHECK_LEVEL));
+        assert!(flags.contains(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS));
+        assert_eq!(
+            LightQueueFlags::from_raw(u64::MAX).raw(),
+            LightQueueFlags::WRITE_LEVEL
+                .with(LightQueueFlags::RECHECK_LEVEL)
+                .with(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS)
+                .raw()
+        );
+    }
+
+    #[test]
+    fn packed_light_queue_entry_matches_scalable_lux_bit_layout() {
+        let position = PackedLightBlockPos::from_raw(0x0abc_def0);
+        let directions = LightDirectionSet::from_raw(0b10_1011);
+        let flags = LightQueueFlags::EMPTY
+            .with(LightQueueFlags::WRITE_LEVEL)
+            .with(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS);
+        let entry = PackedLightQueueEntry::from_parts(position, 31, directions, flags);
+
+        assert_eq!(entry.block_pos(), position);
+        assert_eq!(entry.level(), 15);
+        assert_eq!(entry.directions(), directions);
+        assert_eq!(entry.flags(), flags);
+        assert!(entry.should_write_level());
+        assert!(!entry.should_recheck_level());
+        assert!(entry.has_sided_transparent_blocks());
+        assert_eq!(entry.raw() & ((1_u64 << 28) - 1), u64::from(position.raw()));
+        assert_eq!((entry.raw() >> 28) & 0x0f, 15);
+        assert_eq!((entry.raw() >> 32) & 0x3f, u64::from(directions.raw()));
+        assert_eq!(entry.raw() & (1_u64 << 61), 1_u64 << 61);
+        assert_eq!(entry.raw() & (1_u64 << 62), 0);
+        assert_eq!(entry.raw() & (1_u64 << 63), 1_u64 << 63);
+    }
+
+    #[test]
+    fn packed_light_queue_entry_reads_raw_scalable_lux_values() {
+        let raw = u64::MAX;
+        let entry = PackedLightQueueEntry::from_raw(raw);
+
+        assert_eq!(entry.raw(), raw);
+        assert_eq!(entry.block_pos().raw(), (1 << 28) - 1);
+        assert_eq!(entry.level(), 15);
+        assert_eq!(entry.directions(), LightDirectionSet::all());
+        assert!(entry.should_write_level());
+        assert!(entry.should_recheck_level());
+        assert!(entry.has_sided_transparent_blocks());
     }
 }
