@@ -46,6 +46,15 @@ impl<V: Hash + Eq + Copy, const DIM: usize> HeterogeneousPalette<V, DIM> {
         self.cube[y][z][x]
     }
 
+    fn get_at_index(&self, index: usize) -> V {
+        debug_assert!(index < DIM * DIM * DIM);
+
+        let y = index / (DIM * DIM);
+        let z = (index / DIM) % DIM;
+        let x = index % DIM;
+        self.cube[y][z][x]
+    }
+
     /// Returns an iterator over all values in the cube in y, z, x order.
     pub fn iter_values(&self) -> impl Iterator<Item = &V> {
         self.cube.iter().flatten().flatten()
@@ -129,6 +138,20 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
         match self {
             Self::Homogeneous(value) => *value,
             Self::Heterogeneous(data) => data.get(x, y, z),
+        }
+    }
+
+    /// Gets the value at a y,z,x linear index.
+    ///
+    /// The index layout is `x + z * DIM + y * DIM * DIM`, matching the flat
+    /// order used when serializing palette data and the local block index used
+    /// by ScalableLux light propagation.
+    pub fn get_at_index(&self, index: usize) -> V {
+        debug_assert!(index < Self::VOLUME);
+
+        match self {
+            Self::Homogeneous(value) => *value,
+            Self::Heterogeneous(data) => data.get_at_index(index),
         }
     }
 
@@ -313,5 +336,50 @@ impl BlockPalette {
             //TODO: Use a nonEmpty counter?
             Self::Heterogeneous(_data) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use steel_utils::BlockStateId;
+
+    use super::{BiomePalette, BlockPalette};
+
+    #[test]
+    fn get_at_index_reads_homogeneous_palette_values() {
+        let blocks = BlockPalette::Homogeneous(BlockStateId(7));
+        let biomes = BiomePalette::Homogeneous(12);
+
+        assert_eq!(
+            blocks.get_at_index(15 | (15 << 4) | (15 << 8)),
+            BlockStateId(7)
+        );
+        assert_eq!(biomes.get_at_index(3 | (3 << 2) | (3 << 4)), 12);
+    }
+
+    #[test]
+    fn get_at_index_uses_y_z_x_linear_order_for_blocks() {
+        let mut blocks = BlockPalette::Homogeneous(BlockStateId(0));
+        blocks.set(3, 4, 5, BlockStateId(42));
+        blocks.set(15, 15, 15, BlockStateId(99));
+
+        assert_eq!(
+            blocks.get_at_index(3 | (5 << 4) | (4 << 8)),
+            BlockStateId(42)
+        );
+        assert_eq!(
+            blocks.get_at_index(15 | (15 << 4) | (15 << 8)),
+            BlockStateId(99)
+        );
+        assert_eq!(blocks.get_at_index(0), BlockStateId(0));
+    }
+
+    #[test]
+    fn get_at_index_uses_y_z_x_linear_order_for_biomes() {
+        let mut biomes = BiomePalette::Homogeneous(0);
+        biomes.set(2, 3, 1, 11);
+
+        assert_eq!(biomes.get_at_index(2 | (1 << 2) | (3 << 4)), 11);
+        assert_eq!(biomes.get_at_index(0), 0);
     }
 }
