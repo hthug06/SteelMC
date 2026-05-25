@@ -6,7 +6,9 @@ use steel_registry::{
     blocks::{block_state_ext::BlockStateExt, shapes::VoxelShape},
     vanilla_blocks,
 };
-use steel_utils::{BlockStateId, ChunkPos, Direction, PackedSectionPos, SectionPos, codec::BitSet};
+use steel_utils::{
+    BlockPos, BlockStateId, ChunkPos, Direction, PackedSectionPos, SectionPos, codec::BitSet,
+};
 
 use crate::{
     chunk::section::Sections,
@@ -278,6 +280,13 @@ impl LightQueueEntry {
 pub struct LightSectionStateError {
     /// Requested neighbor count.
     pub neighbor_count: i32,
+}
+
+/// Error returned when a block light value is written without section light data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingLightDataLayerError {
+    /// Section that does not currently store a light data layer.
+    pub section_pos: SectionPos,
 }
 
 /// Vanilla's packed light-section state byte.
@@ -614,6 +623,37 @@ impl LayerLightSectionStorage {
         self.updating_section_data.get_layer(section_pos)
     }
 
+    /// Returns the updating light value stored for a block.
+    ///
+    /// Vanilla assumes the caller already checked `storingLightForSection`;
+    /// Steel returns `None` for sections without light data.
+    #[must_use]
+    pub fn get_stored_level(&self, block_pos: BlockPos) -> Option<u8> {
+        let section_pos = SectionPos::from_block_pos(block_pos);
+        self.updating_section_data
+            .get_layer(section_pos)
+            .map(|layer| Self::get_data_layer_block_value(layer, block_pos))
+    }
+
+    /// Writes an updating light value for a block.
+    ///
+    /// Vanilla assumes the caller already checked `storingLightForSection`;
+    /// Steel returns an error instead of panicking on missing section data.
+    pub fn set_stored_level(
+        &mut self,
+        block_pos: BlockPos,
+        level: u8,
+    ) -> Result<(), MissingLightDataLayerError> {
+        let section_pos = SectionPos::from_block_pos(block_pos);
+        let Some(layer) = self.get_data_layer_to_write(section_pos) else {
+            return Err(MissingLightDataLayerError { section_pos });
+        };
+
+        Self::set_data_layer_block_value(layer, block_pos, level);
+        self.mark_sections_around_block_as_affected(block_pos);
+        Ok(())
+    }
+
     /// Returns a mutable copy-on-write updating layer for this section.
     pub fn get_data_layer_to_write(&mut self, section_pos: SectionPos) -> Option<&mut DataLayer> {
         if !self.updating_section_data.has_layer(section_pos) {
@@ -869,6 +909,32 @@ impl LayerLightSectionStorage {
                 }
             }
         }
+    }
+
+    fn mark_sections_around_block_as_affected(&mut self, block_pos: BlockPos) {
+        SectionPos::around_and_at_block_pos(block_pos, |section_pos| {
+            self.sections_affected_by_light_updates
+                .insert(Self::key(section_pos));
+        });
+    }
+
+    fn get_data_layer_block_value(layer: &DataLayer, block_pos: BlockPos) -> u8 {
+        let local_pos = SectionPos::section_relative_pos(block_pos);
+        layer.get(
+            local_pos.x() as usize,
+            local_pos.y() as usize,
+            local_pos.z() as usize,
+        )
+    }
+
+    fn set_data_layer_block_value(layer: &mut DataLayer, block_pos: BlockPos, level: u8) {
+        let local_pos = SectionPos::section_relative_pos(block_pos);
+        layer.set(
+            local_pos.x() as usize,
+            local_pos.y() as usize,
+            local_pos.z() as usize,
+            level,
+        );
     }
 
     fn create_data_layer(&mut self, section_pos: SectionPos) -> DataLayer {
@@ -1576,7 +1642,7 @@ mod tests {
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
     use steel_utils::BlockStateId;
     use steel_utils::Direction::{Down, East, North, South, Up, West};
-    use steel_utils::{ChunkPos, PackedSectionPos, SectionPos};
+    use steel_utils::{BlockPos, ChunkPos, PackedSectionPos, SectionPos};
 
     use crate::{
         behavior::init_behaviors,
@@ -1586,9 +1652,9 @@ mod tests {
     use super::{
         ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
         LayerLightSectionStorage, LightLayer, LightQueueEntry, LightSectionRange,
-        LightSectionState, LightSectionStateError, LightSectionType, build_light_update_packet,
-        get_light_block_into, get_light_opacity, has_different_light_properties,
-        light_face_occludes,
+        LightSectionState, LightSectionStateError, LightSectionType, MissingLightDataLayerError,
+        build_light_update_packet, get_light_block_into, get_light_opacity,
+        has_different_light_properties, light_face_occludes,
     };
 
     fn init_light_tests() {
@@ -1980,6 +2046,69 @@ mod tests {
         assert!(storage.get_data_layer_data(center).is_some());
         assert!(storage.changed_sections.is_empty());
         assert!(storage.sections_affected_by_light_updates.is_empty());
+    }
+
+    #[test]
+    fn layer_storage_reads_and_writes_stored_levels() {
+        let center = SectionPos::new(4, 5, 6);
+        let block = BlockPos::new((4 << 4) + 2, (5 << 4) + 3, (6 << 4) + 4);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        assert_eq!(storage.update_section_status(center, false), Ok(()));
+        drop(storage.swap_section_map());
+
+        assert_eq!(storage.get_stored_level(block), Some(0));
+        assert_eq!(storage.set_stored_level(block, 12), Ok(()));
+        assert_eq!(storage.get_stored_level(block), Some(12));
+
+        let Some(visible_before_swap) = storage.get_data_layer_data(center) else {
+            panic!("visible layer missing before stored level swap");
+        };
+        assert_eq!(visible_before_swap.get(2, 3, 4), 0);
+
+        let affected = storage.swap_section_map();
+        assert_eq!(affected.len(), 1);
+        assert!(affected.contains(&center));
+
+        let Some(visible_after_swap) = storage.get_data_layer_data(center) else {
+            panic!("visible layer missing after stored level swap");
+        };
+        assert_eq!(visible_after_swap.get(2, 3, 4), 12);
+    }
+
+    #[test]
+    fn layer_storage_rejects_stored_level_write_without_section_data() {
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        let block = BlockPos::new(1, 2, 3);
+
+        assert_eq!(storage.get_stored_level(block), None);
+        assert_eq!(
+            storage.set_stored_level(block, 4),
+            Err(MissingLightDataLayerError {
+                section_pos: SectionPos::new(0, 0, 0)
+            })
+        );
+    }
+
+    #[test]
+    fn layer_storage_stored_level_write_marks_vanilla_adjacent_block_sections() {
+        let center = SectionPos::new(1, 2, -1);
+        let block = BlockPos::new(16, 32, -1);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        assert_eq!(storage.update_section_status(center, false), Ok(()));
+        drop(storage.swap_section_map());
+
+        assert_eq!(storage.set_stored_level(block, 6), Ok(()));
+
+        let affected = storage.swap_section_map();
+        assert_eq!(affected.len(), 8);
+        assert!(affected.contains(&SectionPos::new(0, 1, -1)));
+        assert!(affected.contains(&SectionPos::new(0, 1, 0)));
+        assert!(affected.contains(&SectionPos::new(0, 2, -1)));
+        assert!(affected.contains(&SectionPos::new(0, 2, 0)));
+        assert!(affected.contains(&SectionPos::new(1, 1, -1)));
+        assert!(affected.contains(&SectionPos::new(1, 1, 0)));
+        assert!(affected.contains(&SectionPos::new(1, 2, -1)));
+        assert!(affected.contains(&SectionPos::new(1, 2, 0)));
     }
 
     #[test]

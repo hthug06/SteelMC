@@ -437,6 +437,33 @@ impl SectionPos {
         )
     }
 
+    /// Calls `section_consumer` for every section touched by the block's
+    /// one-block lighting neighborhood.
+    pub fn around_and_at_block_pos(block_pos: BlockPos, mut section_consumer: impl FnMut(Self)) {
+        let min_section_x = Self::block_to_section_coord(block_pos.x().wrapping_sub(1));
+        let max_section_x = Self::block_to_section_coord(block_pos.x().wrapping_add(1));
+        let min_section_y = Self::block_to_section_coord(block_pos.y().wrapping_sub(1));
+        let max_section_y = Self::block_to_section_coord(block_pos.y().wrapping_add(1));
+        let min_section_z = Self::block_to_section_coord(block_pos.z().wrapping_sub(1));
+        let max_section_z = Self::block_to_section_coord(block_pos.z().wrapping_add(1));
+
+        if min_section_x == max_section_x
+            && min_section_y == max_section_y
+            && min_section_z == max_section_z
+        {
+            section_consumer(Self::new(min_section_x, min_section_y, min_section_z));
+            return;
+        }
+
+        for section_x in min_section_x..=max_section_x {
+            for section_y in min_section_y..=max_section_y {
+                for section_z in min_section_z..=max_section_z {
+                    section_consumer(Self::new(section_x, section_y, section_z));
+                }
+            }
+        }
+    }
+
     /// Creates a `SectionPos` containing the given floating-point world position.
     #[must_use]
     pub fn from_entity_pos(pos: DVec3) -> Self {
@@ -1453,6 +1480,36 @@ mod tests {
             SectionPos::from_entity_pos(pos),
             SectionPos::new(-273, -2, -276)
         );
+    }
+
+    #[test]
+    fn section_pos_around_and_at_block_pos_stays_in_one_section_away_from_edges() {
+        let mut sections = Vec::new();
+
+        SectionPos::around_and_at_block_pos(BlockPos::new(18, 34, 50), |section_pos| {
+            sections.push(section_pos);
+        });
+
+        assert_eq!(sections, vec![SectionPos::new(1, 2, 3)]);
+    }
+
+    #[test]
+    fn section_pos_around_and_at_block_pos_includes_boundary_touching_sections() {
+        let mut sections = Vec::new();
+
+        SectionPos::around_and_at_block_pos(BlockPos::new(16, 32, -1), |section_pos| {
+            sections.push(section_pos);
+        });
+
+        assert_eq!(sections.len(), 8);
+        assert!(sections.contains(&SectionPos::new(0, 1, -1)));
+        assert!(sections.contains(&SectionPos::new(0, 1, 0)));
+        assert!(sections.contains(&SectionPos::new(0, 2, -1)));
+        assert!(sections.contains(&SectionPos::new(0, 2, 0)));
+        assert!(sections.contains(&SectionPos::new(1, 1, -1)));
+        assert!(sections.contains(&SectionPos::new(1, 1, 0)));
+        assert!(sections.contains(&SectionPos::new(1, 2, -1)));
+        assert!(sections.contains(&SectionPos::new(1, 2, 0)));
     }
 
     #[test]
