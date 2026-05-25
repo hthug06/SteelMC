@@ -109,8 +109,9 @@ mod section_storage;
 mod sky_sources;
 
 pub use cache::{
-    CachedLightBlock, LIGHT_CACHE_CHUNK_SLOTS, LIGHT_CACHE_DIAMETER, LIGHT_CACHE_RADIUS,
-    LightCacheLayout, LightUpdateNotificationCache, PackedLightBlockPos,
+    CachedLightBlock, CachedLightChunk, CachedLightSection, LIGHT_CACHE_CHUNK_SLOTS,
+    LIGHT_CACHE_DIAMETER, LIGHT_CACHE_RADIUS, LIGHT_CACHE_SECTION_RADIUS, LightCacheChunkScope,
+    LightCacheLayout, LightChunkSectionSlots, LightUpdateNotificationCache, PackedLightBlockPos,
 };
 pub use data_layer::{DataLayer, DataLayerLengthError, DataLayerStorageMap};
 pub use nibble::{

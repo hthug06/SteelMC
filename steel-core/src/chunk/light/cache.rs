@@ -1,9 +1,13 @@
+use std::iter::FusedIterator;
+
 use steel_utils::{BlockPos, ChunkPos, Direction, SectionPos};
 
 use super::LightSectionRange;
 
 /// Horizontal cache radius used by ScalableLux light propagation.
 pub const LIGHT_CACHE_RADIUS: i32 = 2;
+/// Horizontal radius where ScalableLux populates section and nibble cache data.
+pub const LIGHT_CACHE_SECTION_RADIUS: i32 = 1;
 /// Horizontal cache width and depth used by ScalableLux light propagation.
 pub const LIGHT_CACHE_DIAMETER: usize = LIGHT_CACHE_RADIUS as usize * 2 + 1;
 /// Number of chunk columns in one light-engine cache window.
@@ -11,6 +15,7 @@ pub const LIGHT_CACHE_CHUNK_SLOTS: usize = LIGHT_CACHE_DIAMETER * LIGHT_CACHE_DI
 
 const LIGHT_CACHE_DIAMETER_I64: i64 = LIGHT_CACHE_DIAMETER as i64;
 const LIGHT_CACHE_CHUNK_SLOTS_I64: i64 = LIGHT_CACHE_CHUNK_SLOTS as i64;
+const LIGHT_CACHE_SECTION_RADIUS_I64: i64 = LIGHT_CACHE_SECTION_RADIUS as i64;
 const LIGHT_LOCAL_BLOCK_MASK: usize = 15;
 const LIGHT_LOCAL_BLOCK_Z_SHIFT: usize = 4;
 const LIGHT_LOCAL_BLOCK_Y_SHIFT: usize = 8;
@@ -63,6 +68,39 @@ impl PackedLightBlockPos {
     }
 }
 
+/// ScalableLux cache role for a cached chunk column.
+///
+/// During two-radius setup ScalableLux may cache chunk and emptiness-map data
+/// for the full 5x5 window, but section and nibble arrays are normally
+/// populated only for the inner 3x3 chunk window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightCacheChunkScope {
+    /// Chunk is within the inner 3x3 window and may populate sections/nibbles.
+    Inner,
+    /// Chunk is in the outer ring and is cached for chunk/emptiness lookups only.
+    Outer,
+}
+
+/// Cached chunk slot plus its ScalableLux cache role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedLightChunk {
+    /// World chunk position for this cached chunk.
+    pub chunk_pos: ChunkPos,
+    /// Slot into ScalableLux's 5x5 chunk cache arrays.
+    pub chunk_slot: usize,
+    /// Whether this chunk is in the inner section/nibble radius or outer ring.
+    pub scope: LightCacheChunkScope,
+}
+
+/// Cached section slot for one section position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedLightSection {
+    /// World section position for this cached section.
+    pub section_pos: SectionPos,
+    /// Slot into ScalableLux's section/nibble cache arrays.
+    pub section_slot: usize,
+}
+
 /// Cached section slot and local nibble index for one block.
 ///
 /// ScalableLux propagation uses `sectionIndex` plus local index
@@ -77,6 +115,46 @@ pub struct CachedLightBlock {
     /// Local block index inside the 16x16x16 light section.
     pub local_index: usize,
 }
+
+/// Iterator over one inner cached chunk's vanilla light-section slots.
+#[derive(Debug, Clone)]
+pub struct LightChunkSectionSlots {
+    layout: LightCacheLayout,
+    chunk_pos: ChunkPos,
+    next_section_y: i32,
+    end_section_y: i32,
+}
+
+impl Iterator for LightChunkSectionSlots {
+    type Item = CachedLightSection;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_section_y >= self.end_section_y {
+            return None;
+        }
+
+        let section_y = self.next_section_y;
+        self.next_section_y += 1;
+        let section = self.layout.cached_section(SectionPos::new(
+            self.chunk_pos.0.x,
+            section_y,
+            self.chunk_pos.0.y,
+        ));
+        if section.is_none() {
+            self.next_section_y = self.end_section_y;
+        }
+        section
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.end_section_y - self.next_section_y).max(0) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for LightChunkSectionSlots {}
+
+impl FusedIterator for LightChunkSectionSlots {}
 
 /// Section-slot notification flags used while publishing visible light updates.
 ///
@@ -279,6 +357,35 @@ impl LightCacheLayout {
         LIGHT_CACHE_CHUNK_SLOTS * self.cached_section_count
     }
 
+    /// Returns cached chunk slot data for a chunk column.
+    #[must_use]
+    pub fn cached_chunk(self, chunk_pos: ChunkPos) -> Option<CachedLightChunk> {
+        self.cached_chunk_by_coords(chunk_pos.0.x, chunk_pos.0.y)
+    }
+
+    /// Returns cached chunk slot data for chunk coordinates.
+    #[must_use]
+    pub fn cached_chunk_by_coords(self, chunk_x: i32, chunk_z: i32) -> Option<CachedLightChunk> {
+        let dx = i64::from(chunk_x) - i64::from(self.center_chunk.0.x);
+        let dz = i64::from(chunk_z) - i64::from(self.center_chunk.0.y);
+        let distance = dx.abs().max(dz.abs());
+        if distance > i64::from(LIGHT_CACHE_RADIUS) {
+            return None;
+        }
+
+        let scope = if distance <= LIGHT_CACHE_SECTION_RADIUS_I64 {
+            LightCacheChunkScope::Inner
+        } else {
+            LightCacheChunkScope::Outer
+        };
+
+        Some(CachedLightChunk {
+            chunk_pos: ChunkPos::new(chunk_x, chunk_z),
+            chunk_slot: self.chunk_slot_by_coords(chunk_x, chunk_z)?,
+            scope,
+        })
+    }
+
     /// Returns the slot for a cached chunk column.
     #[must_use]
     pub fn chunk_slot(self, chunk_pos: ChunkPos) -> Option<usize> {
@@ -298,10 +405,32 @@ impl LightCacheLayout {
         usize::try_from(slot).ok()
     }
 
+    /// Converts a chunk slot back to its cached chunk position.
+    #[must_use]
+    pub fn chunk_pos_for_slot(self, chunk_slot: usize) -> Option<ChunkPos> {
+        if chunk_slot >= LIGHT_CACHE_CHUNK_SLOTS {
+            return None;
+        }
+
+        Some(ChunkPos::new(
+            self.center_chunk.0.x - LIGHT_CACHE_RADIUS + (chunk_slot % LIGHT_CACHE_DIAMETER) as i32,
+            self.center_chunk.0.y - LIGHT_CACHE_RADIUS + (chunk_slot / LIGHT_CACHE_DIAMETER) as i32,
+        ))
+    }
+
     /// Returns the section/nibble slot for a section position.
     #[must_use]
     pub fn section_slot(self, section_pos: SectionPos) -> Option<usize> {
         self.section_slot_by_coords(section_pos.x(), section_pos.y(), section_pos.z())
+    }
+
+    /// Returns cached section slot data for a section position.
+    #[must_use]
+    pub fn cached_section(self, section_pos: SectionPos) -> Option<CachedLightSection> {
+        Some(CachedLightSection {
+            section_pos,
+            section_slot: self.section_slot(section_pos)?,
+        })
     }
 
     /// Returns the section/nibble slot for the section containing a block.
@@ -324,6 +453,28 @@ impl LightCacheLayout {
         let section_y = self.cached_min_section_y + (section_slot / LIGHT_CACHE_CHUNK_SLOTS) as i32;
 
         Some(SectionPos::new(section_x, section_y, section_z))
+    }
+
+    /// Iterates the vanilla light-section slots for an inner cached chunk.
+    ///
+    /// Returns `None` for the outer radius-2 ring because ScalableLux keeps
+    /// those chunks available for chunk/emptiness lookups but does not
+    /// populate section or nibble cache data for them during normal setup.
+    #[must_use]
+    pub fn inner_light_section_slots_for_chunk(
+        self,
+        chunk_pos: ChunkPos,
+    ) -> Option<LightChunkSectionSlots> {
+        if self.cached_chunk(chunk_pos)?.scope != LightCacheChunkScope::Inner {
+            return None;
+        }
+
+        Some(LightChunkSectionSlots {
+            layout: self,
+            chunk_pos,
+            next_section_y: self.range.min_section_y(),
+            end_section_y: self.range.max_section_y_exclusive(),
+        })
     }
 
     /// Returns cache slot data for a block position.
@@ -505,6 +656,20 @@ impl LightCacheLayout {
         dx.abs().max(dz.abs()) <= i64::from(LIGHT_CACHE_RADIUS)
     }
 
+    /// Returns true if a chunk coordinate is inside the inner section/nibble cache radius.
+    #[must_use]
+    pub fn contains_inner_chunk_coords(self, chunk_x: i32, chunk_z: i32) -> bool {
+        let dx = i64::from(chunk_x) - i64::from(self.center_chunk.0.x);
+        let dz = i64::from(chunk_z) - i64::from(self.center_chunk.0.y);
+        dx.abs().max(dz.abs()) <= LIGHT_CACHE_SECTION_RADIUS_I64
+    }
+
+    /// Returns true if a section Y is inside vanilla's padded light-section range.
+    #[must_use]
+    pub fn contains_light_section_y(self, section_y: i32) -> bool {
+        self.range.section_index(section_y).is_some()
+    }
+
     /// Returns true if a section Y coordinate is inside the cached vertical range.
     #[must_use]
     pub fn contains_section_y(self, section_y: i32) -> bool {
@@ -535,6 +700,67 @@ mod tests {
         assert_eq!(layout.chunk_slot(ChunkPos::new(9, -20)), Some(11));
         assert_eq!(layout.chunk_slot(ChunkPos::new(13, -20)), None);
         assert_eq!(layout.chunk_slot(ChunkPos::new(10, -23)), None);
+    }
+
+    #[test]
+    fn cache_layout_classifies_inner_and_outer_cached_chunks() {
+        let layout = LightCacheLayout::new(ChunkPos::new(10, -20), range(0, 16));
+
+        assert_eq!(
+            layout.cached_chunk(ChunkPos::new(10, -20)),
+            Some(CachedLightChunk {
+                chunk_pos: ChunkPos::new(10, -20),
+                chunk_slot: 12,
+                scope: LightCacheChunkScope::Inner,
+            })
+        );
+        assert_eq!(
+            layout.cached_chunk(ChunkPos::new(9, -21)),
+            Some(CachedLightChunk {
+                chunk_pos: ChunkPos::new(9, -21),
+                chunk_slot: 6,
+                scope: LightCacheChunkScope::Inner,
+            })
+        );
+        assert_eq!(
+            layout.cached_chunk(ChunkPos::new(8, -22)),
+            Some(CachedLightChunk {
+                chunk_pos: ChunkPos::new(8, -22),
+                chunk_slot: 0,
+                scope: LightCacheChunkScope::Outer,
+            })
+        );
+        assert_eq!(layout.cached_chunk(ChunkPos::new(13, -20)), None);
+
+        assert!(layout.contains_inner_chunk_coords(11, -19));
+        assert!(!layout.contains_inner_chunk_coords(12, -20));
+        assert!(layout.contains_chunk_coords(12, -20));
+    }
+
+    #[test]
+    fn cache_layout_decodes_chunk_slots() {
+        let layout = LightCacheLayout::new(ChunkPos::new(10, -20), range(0, 16));
+
+        assert_eq!(layout.chunk_pos_for_slot(0), Some(ChunkPos::new(8, -22)));
+        assert_eq!(layout.chunk_pos_for_slot(12), Some(ChunkPos::new(10, -20)));
+        assert_eq!(layout.chunk_pos_for_slot(24), Some(ChunkPos::new(12, -18)));
+        assert_eq!(layout.chunk_pos_for_slot(25), None);
+    }
+
+    #[test]
+    fn cache_layout_chunk_slot_round_trips_every_cached_chunk() {
+        let layout = LightCacheLayout::new(ChunkPos::new(-4, 6), range(-64, 384));
+
+        for chunk_slot in 0..LIGHT_CACHE_CHUNK_SLOTS {
+            let Some(chunk_pos) = layout.chunk_pos_for_slot(chunk_slot) else {
+                panic!("valid chunk slot did not decode");
+            };
+            assert_eq!(layout.chunk_slot(chunk_pos), Some(chunk_slot));
+            assert_eq!(
+                layout.cached_chunk(chunk_pos).map(|chunk| chunk.chunk_slot),
+                Some(chunk_slot)
+            );
+        }
     }
 
     #[test]
@@ -588,6 +814,54 @@ mod tests {
             Some(SectionPos::new(10, 2, -20))
         );
         assert_eq!(layout.section_pos_for_slot(125), None);
+    }
+
+    #[test]
+    fn cache_layout_iterates_inner_chunk_light_section_slots() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+
+        let Some(slots) = layout.inner_light_section_slots_for_chunk(ChunkPos::new(1, 0)) else {
+            panic!("inner chunk should have light section slots");
+        };
+        assert_eq!(slots.len(), 3);
+        assert_eq!(
+            slots.collect::<Vec<_>>(),
+            vec![
+                CachedLightSection {
+                    section_pos: SectionPos::new(1, -1, 0),
+                    section_slot: 38,
+                },
+                CachedLightSection {
+                    section_pos: SectionPos::new(1, 0, 0),
+                    section_slot: 63,
+                },
+                CachedLightSection {
+                    section_pos: SectionPos::new(1, 1, 0),
+                    section_slot: 88,
+                },
+            ]
+        );
+
+        assert!(layout.contains_light_section_y(-1));
+        assert!(layout.contains_light_section_y(1));
+        assert!(!layout.contains_light_section_y(-2));
+        assert!(!layout.contains_light_section_y(2));
+    }
+
+    #[test]
+    fn cache_layout_rejects_outer_chunk_light_section_slots() {
+        let layout = LightCacheLayout::new(ChunkPos::new(0, 0), range(0, 16));
+
+        assert!(
+            layout
+                .inner_light_section_slots_for_chunk(ChunkPos::new(2, 0))
+                .is_none()
+        );
+        assert!(
+            layout
+                .inner_light_section_slots_for_chunk(ChunkPos::new(3, 0))
+                .is_none()
+        );
     }
 
     #[test]
