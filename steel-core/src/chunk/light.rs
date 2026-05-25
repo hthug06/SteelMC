@@ -872,6 +872,109 @@ impl LayerLightSectionStorage {
         Some(())
     }
 
+    /// Fills skylight source cells and queues their propagation edges.
+    ///
+    /// This mirrors vanilla `SkyLightEngine.propagateLightSources`; callers
+    /// supply the center chunk's `ChunkSkyLightSources` and its four horizontal
+    /// neighbors.
+    pub fn propagate_sky_light_sources(
+        &mut self,
+        section_zero_pos: SectionPos,
+        sources: &ChunkSkyLightSources,
+        north_sources: &ChunkSkyLightSources,
+        south_sources: &ChunkSkyLightSources,
+        west_sources: &ChunkSkyLightSources,
+        east_sources: &ChunkSkyLightSources,
+        queues: &mut LightPropagationQueues,
+    ) -> Option<()> {
+        self.sky_data.as_ref()?;
+
+        self.set_light_enabled(section_zero_pos, true);
+
+        let top_section_y = self.get_top_section_y(section_zero_pos)?;
+        let bottom_section_y = self.get_bottom_section_y()?;
+        let section_min_x = section_zero_pos.x() << 4;
+        let section_min_z = section_zero_pos.z() << 4;
+
+        for section_y in (bottom_section_y..top_section_y).rev() {
+            let section_pos =
+                SectionPos::new(section_zero_pos.x(), section_y, section_zero_pos.z());
+            let Some(data_layer) = self.get_data_layer_to_write(section_pos) else {
+                continue;
+            };
+
+            let section_min_y = section_y << 4;
+            let section_max_y = section_min_y + 15;
+            let mut sources_below = false;
+
+            for z in 0..CHUNK_EDGE {
+                for x in 0..CHUNK_EDGE {
+                    let lowest_source_y = sources.get_lowest_source_y(x, z);
+                    if lowest_source_y > section_max_y {
+                        continue;
+                    }
+
+                    let north_lowest_source_y = if z == 0 {
+                        north_sources.get_lowest_source_y(x, CHUNK_EDGE - 1)
+                    } else {
+                        sources.get_lowest_source_y(x, z - 1)
+                    };
+                    let south_lowest_source_y = if z == CHUNK_EDGE - 1 {
+                        south_sources.get_lowest_source_y(x, 0)
+                    } else {
+                        sources.get_lowest_source_y(x, z + 1)
+                    };
+                    let west_lowest_source_y = if x == 0 {
+                        west_sources.get_lowest_source_y(CHUNK_EDGE - 1, z)
+                    } else {
+                        sources.get_lowest_source_y(x - 1, z)
+                    };
+                    let east_lowest_source_y = if x == CHUNK_EDGE - 1 {
+                        east_sources.get_lowest_source_y(0, z)
+                    } else {
+                        sources.get_lowest_source_y(x + 1, z)
+                    };
+                    let neighbor_lowest_source_y = north_lowest_source_y
+                        .max(south_lowest_source_y)
+                        .max(west_lowest_source_y)
+                        .max(east_lowest_source_y);
+                    let min_source_y = section_min_y.max(lowest_source_y);
+
+                    for y in (min_source_y..=section_max_y).rev() {
+                        data_layer.set(x, Self::section_relative_coord(y), z, MAX_LIGHT_LEVEL);
+
+                        if y == lowest_source_y || y < neighbor_lowest_source_y {
+                            queues.enqueue_increase(
+                                BlockPos::new(
+                                    section_min_x + x as i32,
+                                    y,
+                                    section_min_z + z as i32,
+                                ),
+                                LightQueueEntry::increase_sky_source_in_directions(
+                                    y == lowest_source_y,
+                                    y < north_lowest_source_y,
+                                    y < south_lowest_source_y,
+                                    y < west_lowest_source_y,
+                                    y < east_lowest_source_y,
+                                ),
+                            );
+                        }
+                    }
+
+                    if lowest_source_y < section_min_y {
+                        sources_below = true;
+                    }
+                }
+            }
+
+            if !sources_below {
+                break;
+            }
+        }
+
+        Some(())
+    }
+
     /// Returns true when this section's column has light sources enabled.
     #[must_use]
     pub fn light_on_in_section(&self, section_pos: SectionPos) -> bool {
@@ -1152,6 +1255,10 @@ impl LayerLightSectionStorage {
     fn get_data_layer_column_bottom_value(layer: &DataLayer, block_pos: BlockPos) -> u8 {
         let local_pos = SectionPos::section_relative_pos(block_pos);
         layer.get(local_pos.x() as usize, 0, local_pos.z() as usize)
+    }
+
+    fn section_relative_coord(block_coord: i32) -> usize {
+        (block_coord & 15) as usize
     }
 
     fn create_data_layer(&mut self, section_pos: SectionPos) -> DataLayer {
@@ -1906,6 +2013,17 @@ mod tests {
         sources
     }
 
+    fn sky_sources_with_column(
+        default_source_y: i32,
+        x: usize,
+        z: usize,
+        source_y: i32,
+    ) -> ChunkSkyLightSources {
+        let mut sources = sky_sources_with_highest_lowest_source_y(default_source_y);
+        sources.heightmap[x + z * super::CHUNK_EDGE] = source_y;
+        sources
+    }
+
     #[test]
     fn light_opacity_uses_vanilla_minimum_opacity() {
         init_light_tests();
@@ -2561,6 +2679,76 @@ mod tests {
             storage.enable_sky_light_sources(SectionPos::new(0, 0, 0), &sources),
             None
         );
+        assert!(!storage.light_on_in_column(SectionPos::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn sky_storage_propagates_sky_sources_and_queues_edge_updates() {
+        let zero = SectionPos::new(0, 0, 0);
+        let section = SectionPos::new(0, 4, 0);
+        let source_section = SectionPos::new(0, 5, 0);
+        let sources = sky_sources_with_column(1000, 0, 0, 95);
+        let north_sources = sky_sources_with_highest_lowest_source_y(90);
+        let south_sources = sky_sources_with_highest_lowest_source_y(1000);
+        let west_sources = sky_sources_with_highest_lowest_source_y(1000);
+        let east_sources = sky_sources_with_highest_lowest_source_y(1000);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        let mut queues = LightPropagationQueues::new();
+
+        assert_eq!(storage.update_section_status(section, false), Ok(()));
+        assert_eq!(
+            storage.propagate_sky_light_sources(
+                zero,
+                &sources,
+                &north_sources,
+                &south_sources,
+                &west_sources,
+                &east_sources,
+                &mut queues,
+            ),
+            Some(())
+        );
+
+        assert!(storage.light_on_in_column(zero));
+        let Some(layer) = storage.get_updating_data_layer(source_section) else {
+            panic!("source section light layer missing");
+        };
+        assert_eq!(layer.get(0, 15, 0), super::MAX_LIGHT_LEVEL);
+        assert_eq!(layer.get(0, 14, 0), 0);
+
+        let Some(update) = queues.dequeue_increase() else {
+            panic!("skylight source edge was not queued");
+        };
+        assert_eq!(update.block_pos, BlockPos::new(0, 95, 0));
+        assert_eq!(update.entry.from_level(), super::MAX_LIGHT_LEVEL);
+        assert!(update.entry.should_propagate_in_direction(Down));
+        assert!(!update.entry.should_propagate_in_direction(Up));
+        assert!(!update.entry.should_propagate_in_direction(North));
+        assert!(update.entry.should_propagate_in_direction(South));
+        assert!(update.entry.should_propagate_in_direction(West));
+        assert!(update.entry.should_propagate_in_direction(East));
+        assert_eq!(queues.dequeue_increase(), None);
+    }
+
+    #[test]
+    fn block_storage_rejects_sky_source_propagation() {
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Block);
+        let sources = sky_sources_with_highest_lowest_source_y(95);
+        let mut queues = LightPropagationQueues::new();
+
+        assert_eq!(
+            storage.propagate_sky_light_sources(
+                SectionPos::new(0, 0, 0),
+                &sources,
+                &sources,
+                &sources,
+                &sources,
+                &sources,
+                &mut queues,
+            ),
+            None
+        );
+        assert!(!queues.has_work());
         assert!(!storage.light_on_in_column(SectionPos::new(0, 0, 0)));
     }
 
