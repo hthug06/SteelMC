@@ -18,9 +18,11 @@ pub const DATA_LAYER_EDGE: usize = 16;
 pub const DATA_LAYER_BLOCK_COUNT: usize = DATA_LAYER_EDGE * DATA_LAYER_EDGE * DATA_LAYER_EDGE;
 /// Number of packed bytes in a light section.
 pub const DATA_LAYER_SIZE: usize = DATA_LAYER_BLOCK_COUNT / 2;
+const DATA_LAYER_Y_STRIDE: usize = DATA_LAYER_EDGE * DATA_LAYER_EDGE / 2;
 const CHUNK_EDGE: usize = 16;
 const CHUNK_COLUMN_COUNT: usize = CHUNK_EDGE * CHUNK_EDGE;
 const NEGATIVE_INFINITY: i32 = i32::MIN;
+const POSITIVE_INFINITY: i32 = i32::MAX;
 const SECTION_HAS_DATA_BIT: u8 = 0b0010_0000;
 const SECTION_NEIGHBOR_COUNT_BITS: u8 = 0b0001_1111;
 const MAX_SECTION_NEIGHBORS: i32 = 26;
@@ -311,8 +313,7 @@ impl DataLayerStorageMap {
 /// Common light-section storage state shared by vanilla block and sky lighting.
 ///
 /// This mirrors vanilla `LayerLightSectionStorage` for section states, queued
-/// data, pending removals, and visible/updating data maps. Sky lighting will
-/// add its top-section bookkeeping on top of this storage.
+/// data, pending removals, and visible/updating data maps.
 #[derive(Debug)]
 pub struct LayerLightSectionStorage {
     layer: LightLayer,
@@ -326,6 +327,7 @@ pub struct LayerLightSectionStorage {
     columns_to_retain_queued_data_for: FxHashSet<PackedSectionPos>,
     to_remove: FxHashSet<PackedSectionPos>,
     has_inconsistencies: bool,
+    sky_data: Option<SkyLightSectionData>,
 }
 
 impl LayerLightSectionStorage {
@@ -346,6 +348,7 @@ impl LayerLightSectionStorage {
             columns_to_retain_queued_data_for: FxHashSet::default(),
             to_remove: FxHashSet::default(),
             has_inconsistencies: false,
+            sky_data: SkyLightSectionData::for_layer(layer),
         }
     }
 
@@ -505,6 +508,7 @@ impl LayerLightSectionStorage {
         }
 
         for key in to_remove {
+            self.on_node_removed(key.to_section_pos());
             self.changed_sections.insert(key);
         }
 
@@ -524,6 +528,9 @@ impl LayerLightSectionStorage {
     pub fn swap_section_map(&mut self) -> Vec<SectionPos> {
         if !self.changed_sections.is_empty() {
             self.visible_section_data = self.updating_section_data.copy_map();
+            if let Some(sky_data) = self.sky_data.as_mut() {
+                sky_data.visible = sky_data.updating.copy_map();
+            }
             self.changed_sections.clear();
         }
 
@@ -538,6 +545,49 @@ impl LayerLightSectionStorage {
     #[must_use]
     pub fn get_debug_section_type(&self, section_pos: SectionPos) -> LightSectionType {
         self.section_state(section_pos).section_type()
+    }
+
+    /// Returns whether sky storage has light data at or below `section_y`.
+    ///
+    /// This is a sky-light-only query. Block-light storage returns `None`.
+    #[must_use]
+    pub fn has_light_data_at_or_below(&self, section_y: i32) -> Option<bool> {
+        self.sky_data
+            .as_ref()
+            .map(|sky_data| section_y >= sky_data.updating.current_lowest_y)
+    }
+
+    /// Returns whether a sky section is above all stored sky data in its column.
+    ///
+    /// This is a sky-light-only query. Block-light storage returns `None`.
+    #[must_use]
+    pub fn is_above_data(&self, section_pos: SectionPos) -> Option<bool> {
+        let sky_data = self.sky_data.as_ref()?;
+        let zero_key = Self::zero_key(section_pos);
+        let top_section = sky_data.updating.top_section(zero_key);
+        Some(top_section == sky_data.updating.current_lowest_y || section_pos.y() >= top_section)
+    }
+
+    /// Returns the sky top-section Y for a zero-section column.
+    ///
+    /// This is a sky-light-only query. Block-light storage returns `None`.
+    #[must_use]
+    pub fn get_top_section_y(&self, section_zero_pos: SectionPos) -> Option<i32> {
+        self.sky_data.as_ref().map(|sky_data| {
+            sky_data
+                .updating
+                .top_section(Self::zero_key(section_zero_pos))
+        })
+    }
+
+    /// Returns the lowest section Y ever observed by sky storage.
+    ///
+    /// This is a sky-light-only query. Block-light storage returns `None`.
+    #[must_use]
+    pub fn get_bottom_section_y(&self) -> Option<i32> {
+        self.sky_data
+            .as_ref()
+            .map(|sky_data| sky_data.updating.current_lowest_y)
     }
 
     fn section_state(&self, section_pos: SectionPos) -> LightSectionState {
@@ -564,14 +614,11 @@ impl LayerLightSectionStorage {
             return;
         }
 
-        let data_layer = if let Some(layer) = self.queued_sections.remove(&key) {
-            layer
-        } else {
-            DataLayer::new()
-        };
+        let data_layer = self.create_data_layer(section_pos);
         self.updating_section_data
             .set_layer(section_pos, data_layer);
         self.changed_sections.insert(key);
+        self.on_node_added(section_pos);
         self.mark_section_and_neighbors_as_affected(section_pos);
         self.has_inconsistencies = true;
     }
@@ -597,6 +644,109 @@ impl LayerLightSectionStorage {
         }
     }
 
+    fn create_data_layer(&mut self, section_pos: SectionPos) -> DataLayer {
+        let key = Self::key(section_pos);
+        if let Some(layer) = self.queued_sections.remove(&key) {
+            return layer;
+        }
+
+        let Some(sky_data) = self.sky_data.as_ref() else {
+            return DataLayer::new();
+        };
+
+        let zero_key = Self::zero_key(section_pos);
+        let top_section = sky_data.updating.top_section(zero_key);
+        if top_section != sky_data.updating.current_lowest_y && section_pos.y() < top_section {
+            let above_data = self.first_data_layer_above(section_pos, top_section);
+            return Self::repeat_first_layer(above_data);
+        }
+
+        if self.light_on_in_section(section_pos) {
+            DataLayer::filled(MAX_LIGHT_LEVEL)
+        } else {
+            DataLayer::new()
+        }
+    }
+
+    fn first_data_layer_above(&self, section_pos: SectionPos, top_section: i32) -> &DataLayer {
+        let mut above_section = Self::offset(section_pos, 0, 1, 0);
+        while above_section.y() < top_section {
+            if let Some(layer) = self.get_updating_data_layer(above_section) {
+                return layer;
+            }
+
+            above_section = Self::offset(above_section, 0, 1, 0);
+        }
+
+        panic!(
+            "skylight top section invariant broken for section {:?} below top {}",
+            section_pos, top_section
+        );
+    }
+
+    fn repeat_first_layer(data: &DataLayer) -> DataLayer {
+        if data.is_homogeneous() {
+            return data.copy();
+        }
+
+        let input = data.to_bytes();
+        let mut output = Box::new([0; DATA_LAYER_SIZE]);
+        for y in 0..DATA_LAYER_EDGE {
+            let start = y * DATA_LAYER_Y_STRIDE;
+            output[start..start + DATA_LAYER_Y_STRIDE]
+                .copy_from_slice(&input[0..DATA_LAYER_Y_STRIDE]);
+        }
+
+        DataLayer::from_packed_data(output)
+    }
+
+    fn on_node_added(&mut self, section_pos: SectionPos) {
+        let Some(sky_data) = self.sky_data.as_mut() else {
+            return;
+        };
+
+        let section_y = section_pos.y();
+        if sky_data.updating.current_lowest_y > section_y {
+            sky_data.updating.current_lowest_y = section_y;
+        }
+
+        let zero_key = Self::zero_key(section_pos);
+        if sky_data.updating.top_section(zero_key) < section_y + 1 {
+            sky_data.updating.set_top_section(zero_key, section_y + 1);
+        }
+    }
+
+    fn on_node_removed(&mut self, section_pos: SectionPos) {
+        let Some(sky_data) = self.sky_data.as_ref() else {
+            return;
+        };
+
+        let zero_key = Self::zero_key(section_pos);
+        let current_lowest_y = sky_data.updating.current_lowest_y;
+        let section_y = section_pos.y();
+        if sky_data.updating.top_section(zero_key) != section_y + 1 {
+            return;
+        }
+
+        let mut new_top_section = section_pos;
+        let mut new_top_y = section_y;
+        while !self.storing_light_for_section(new_top_section) && new_top_y >= current_lowest_y {
+            new_top_y -= 1;
+            new_top_section = Self::offset(new_top_section, 0, -1, 0);
+        }
+
+        let stores_light = self.storing_light_for_section(new_top_section);
+        let Some(sky_data) = self.sky_data.as_mut() else {
+            return;
+        };
+
+        if stores_light {
+            sky_data.updating.set_top_section(zero_key, new_top_y + 1);
+        } else {
+            sky_data.updating.remove_top_section(zero_key);
+        }
+    }
+
     fn key(section_pos: SectionPos) -> PackedSectionPos {
         PackedSectionPos::from(section_pos)
     }
@@ -611,6 +761,72 @@ impl LayerLightSectionStorage {
             section_pos.y() + y,
             section_pos.z() + z,
         )
+    }
+}
+
+/// Sky-light metadata that vanilla stores in `SkyDataLayerStorageMap`.
+///
+/// Steel keeps the light data itself in `DataLayerStorageMap` and stores the
+/// sky-only column metadata alongside the common storage. The visible/updating
+/// split still matches vanilla's map-copy behavior.
+#[derive(Debug)]
+struct SkyLightSectionData {
+    visible: SkyDataLayerStorageMap,
+    updating: SkyDataLayerStorageMap,
+}
+
+impl SkyLightSectionData {
+    fn for_layer(layer: LightLayer) -> Option<Self> {
+        if layer != LightLayer::Sky {
+            return None;
+        }
+
+        let updating = SkyDataLayerStorageMap::new();
+        let visible = updating.copy_map();
+        Some(Self { visible, updating })
+    }
+}
+
+#[derive(Debug)]
+struct SkyDataLayerStorageMap {
+    current_lowest_y: i32,
+    top_sections: FxHashMap<PackedSectionPos, i32>,
+}
+
+impl SkyDataLayerStorageMap {
+    fn new() -> Self {
+        Self {
+            current_lowest_y: POSITIVE_INFINITY,
+            top_sections: FxHashMap::default(),
+        }
+    }
+
+    fn copy_map(&self) -> Self {
+        let mut top_sections = FxHashMap::default();
+        top_sections.reserve(self.top_sections.len());
+        for (&section_pos, &top_section_y) in &self.top_sections {
+            top_sections.insert(section_pos, top_section_y);
+        }
+
+        Self {
+            current_lowest_y: self.current_lowest_y,
+            top_sections,
+        }
+    }
+
+    fn top_section(&self, zero_key: PackedSectionPos) -> i32 {
+        match self.top_sections.get(&zero_key) {
+            Some(top_section_y) => *top_section_y,
+            None => self.current_lowest_y,
+        }
+    }
+
+    fn set_top_section(&mut self, zero_key: PackedSectionPos, top_section_y: i32) {
+        self.top_sections.insert(zero_key, top_section_y);
+    }
+
+    fn remove_top_section(&mut self, zero_key: PackedSectionPos) {
+        self.top_sections.remove(&zero_key);
     }
 }
 
@@ -1022,10 +1238,7 @@ impl DataLayer {
             return Err(DataLayerLengthError { actual });
         };
 
-        Ok(Self {
-            data: Some(data),
-            default_value: 0,
-        })
+        Ok(Self::from_packed_data(data))
     }
 
     /// Returns the light value at local section coordinates.
@@ -1087,6 +1300,13 @@ impl DataLayer {
             Box::new(**data)
         } else {
             Box::new([Self::pack_filled(self.default_value); DATA_LAYER_SIZE])
+        }
+    }
+
+    fn from_packed_data(data: Box<[u8; DATA_LAYER_SIZE]>) -> Self {
+        Self {
+            data: Some(data),
+            default_value: 0,
         }
     }
 
@@ -1430,6 +1650,102 @@ mod tests {
         assert!(storage.get_data_layer_data(center).is_some());
         assert!(storage.changed_sections.is_empty());
         assert!(storage.sections_affected_by_light_updates.is_empty());
+    }
+
+    #[test]
+    fn sky_storage_tracks_top_and_bottom_sections() {
+        let center = SectionPos::new(4, 5, 6);
+        let zero = SectionPos::new(4, 0, 6);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+
+        assert_eq!(storage.update_section_status(center, false), Ok(()));
+
+        assert_eq!(storage.get_bottom_section_y(), Some(4));
+        assert_eq!(storage.get_top_section_y(zero), Some(7));
+        assert_eq!(storage.has_light_data_at_or_below(3), Some(false));
+        assert_eq!(storage.has_light_data_at_or_below(4), Some(true));
+        assert_eq!(storage.is_above_data(SectionPos::new(4, 6, 6)), Some(false));
+        assert_eq!(storage.is_above_data(SectionPos::new(4, 7, 6)), Some(true));
+    }
+
+    #[test]
+    fn sky_storage_creates_full_bright_layers_when_sources_enabled() {
+        let section = SectionPos::new(0, 0, 0);
+        let below = SectionPos::new(0, -1, 0);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        storage.set_light_enabled(SectionPos::new(0, 0, 0), true);
+
+        assert_eq!(storage.update_section_status(section, false), Ok(()));
+
+        let Some(section_layer) = storage.get_updating_data_layer(section) else {
+            panic!("section layer missing");
+        };
+        assert!(section_layer.is_filled_with(super::MAX_LIGHT_LEVEL));
+
+        let Some(below_layer) = storage.get_updating_data_layer(below) else {
+            panic!("below layer missing");
+        };
+        assert!(below_layer.is_filled_with(super::MAX_LIGHT_LEVEL));
+    }
+
+    #[test]
+    fn sky_storage_repeats_first_layer_below_top_data() {
+        let upper = SectionPos::new(0, 5, 0);
+        let copied = SectionPos::new(0, 3, 0);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        storage.set_light_enabled(SectionPos::new(0, 0, 0), true);
+        assert_eq!(storage.update_section_status(upper, false), Ok(()));
+
+        let Some(source_layer) = storage.get_data_layer_to_write(SectionPos::new(0, 4, 0)) else {
+            panic!("source layer missing");
+        };
+        source_layer.set(0, 0, 0, 3);
+        source_layer.set(0, 1, 0, 12);
+
+        assert_eq!(
+            storage.update_section_status(SectionPos::new(0, 2, 0), false),
+            Ok(())
+        );
+
+        let Some(copied_layer) = storage.get_updating_data_layer(copied) else {
+            panic!("copied layer missing");
+        };
+        assert_eq!(copied_layer.get(0, 0, 0), 3);
+        assert_eq!(copied_layer.get(0, 1, 0), 3);
+    }
+
+    #[test]
+    fn sky_storage_moves_top_down_after_highest_section_removal() {
+        let upper = SectionPos::new(0, 5, 0);
+        let lower = SectionPos::new(0, 2, 0);
+        let zero = SectionPos::new(0, 0, 0);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        assert_eq!(storage.update_section_status(upper, false), Ok(()));
+        assert_eq!(storage.update_section_status(lower, false), Ok(()));
+        assert_eq!(storage.get_top_section_y(zero), Some(7));
+
+        assert_eq!(storage.update_section_status(upper, true), Ok(()));
+        storage.mark_new_inconsistencies();
+
+        assert_eq!(storage.get_top_section_y(zero), Some(4));
+        assert!(storage.storing_light_for_section(SectionPos::new(0, 3, 0)));
+        assert!(!storage.storing_light_for_section(SectionPos::new(0, 6, 0)));
+    }
+
+    #[test]
+    fn sky_storage_uses_queued_data_when_section_is_created() {
+        let section = SectionPos::new(0, 0, 0);
+        let mut queued = DataLayer::new();
+        queued.set(1, 2, 3, 6);
+        let mut storage = LayerLightSectionStorage::new(LightLayer::Sky);
+        storage.queue_section_data(section, Some(queued));
+
+        assert_eq!(storage.update_section_status(section, false), Ok(()));
+
+        let Some(layer) = storage.get_updating_data_layer(section) else {
+            panic!("queued layer missing");
+        };
+        assert_eq!(layer.get(1, 2, 3), 6);
     }
 
     #[test]
