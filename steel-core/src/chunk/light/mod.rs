@@ -110,9 +110,9 @@ mod sky_sources;
 pub use data_layer::{DataLayer, DataLayerLengthError, DataLayerStorageMap};
 pub use nibble::{
     ChunkLightData, ChunkLightEmptinessMapLengthError, ChunkLightLayerStorage, LightNibbleArray,
-    LightNibbleExtrudeNullSourceError, LightNibbleState,
+    LightNibbleExtrudeNullSourceError, LightNibbleSaveState, LightNibbleState,
 };
-pub use packet::build_light_update_packet;
+pub use packet::{build_chunk_light_update_packet, build_light_update_packet};
 pub(crate) use queue::{
     ADD_SKY_SOURCE_ENTRY, REMOVE_SKY_SOURCE_ENTRY, REMOVE_TOP_SKY_SOURCE_ENTRY,
 };
@@ -140,13 +140,13 @@ mod tests {
     };
 
     use super::{
-        ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
-        LayerLightSectionStorage, LightLayer, LightNibbleArray, LightNibbleState,
-        LightPropagationQueue, LightPropagationQueues, LightQueueEntry, LightSectionRange,
-        LightSectionState, LightSectionStateError, LightSectionType, MissingLightDataLayerError,
-        QueuedLightUpdate, SkyLightSourceNeighborhood, build_light_update_packet,
-        get_light_block_into, get_light_opacity, has_different_light_properties,
-        light_face_occludes,
+        ChunkLightData, ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
+        LayerLightSectionStorage, LightLayer, LightNibbleArray, LightNibbleSaveState,
+        LightNibbleState, LightPropagationQueue, LightPropagationQueues, LightQueueEntry,
+        LightSectionRange, LightSectionState, LightSectionStateError, LightSectionType,
+        MissingLightDataLayerError, QueuedLightUpdate, SkyLightSourceNeighborhood,
+        build_chunk_light_update_packet, build_light_update_packet, get_light_block_into,
+        get_light_opacity, has_different_light_properties, light_face_occludes,
     };
 
     fn init_light_tests() {
@@ -436,6 +436,47 @@ mod tests {
     }
 
     #[test]
+    fn light_nibble_save_state_matches_scalable_lux_canonicalization() {
+        let null = LightNibbleArray::null();
+        let uninitialized = LightNibbleArray::uninitialized();
+        let zero_initialized = LightNibbleArray::filled(0);
+
+        assert_eq!(null.to_save_state(), None);
+        assert_eq!(
+            uninitialized.to_save_state(),
+            Some(LightNibbleSaveState {
+                state: LightNibbleState::Uninitialized,
+                data: None,
+            })
+        );
+        assert_eq!(
+            zero_initialized.to_save_state(),
+            Some(LightNibbleSaveState {
+                state: LightNibbleState::Uninitialized,
+                data: None,
+            })
+        );
+
+        let mut zero_hidden = LightNibbleArray::filled(0);
+        zero_hidden.set_hidden();
+        assert!(zero_hidden.update_visible());
+        assert_eq!(zero_hidden.to_save_state(), None);
+
+        let mut hidden = LightNibbleArray::filled(3);
+        hidden.set_hidden();
+        assert!(hidden.update_visible());
+
+        let Some(save_state) = hidden.to_save_state() else {
+            panic!("non-zero hidden nibble should produce save state");
+        };
+        assert_eq!(save_state.state, LightNibbleState::Hidden);
+        let Some(data) = save_state.data else {
+            panic!("non-zero hidden nibble should save packed bytes");
+        };
+        assert!(data.iter().all(|byte| *byte == 0x33));
+    }
+
+    #[test]
     fn light_nibble_array_extrudes_lower_row_from_updating_source() {
         let mut source = LightNibbleArray::null();
         for z in 0..super::DATA_LAYER_EDGE {
@@ -457,7 +498,7 @@ mod tests {
 
     #[test]
     fn chunk_light_data_uses_vanilla_padded_light_section_count() {
-        let Ok(light) = super::ChunkLightData::new(-64, 384) else {
+        let Ok(light) = ChunkLightData::new(-64, 384) else {
             panic!("valid overworld height rejected");
         };
 
@@ -469,6 +510,48 @@ mod tests {
             Some(LightNibbleState::Null)
         );
         assert!(light.sky.nibble(21).is_none());
+    }
+
+    #[test]
+    fn chunk_light_update_packet_converts_chunk_owned_nibbles() {
+        let Ok(mut light) = ChunkLightData::new(0, 16) else {
+            panic!("valid single-section height rejected");
+        };
+
+        let Some(sky_nibble) = light.sky.nibble_mut(0) else {
+            panic!("single-section light range should contain section 0");
+        };
+        sky_nibble.set_non_null();
+        assert!(sky_nibble.update_visible());
+
+        let Some(block_nibble) = light.block.nibble_mut(0) else {
+            panic!("single-section light range should contain section 0");
+        };
+        block_nibble.set(0, 0, 0, 7);
+        assert!(block_nibble.update_visible());
+
+        let Some(hidden_nibble) = light.sky.nibble_mut(1) else {
+            panic!("single-section light range should contain padded section 1");
+        };
+        hidden_nibble.set(0, 0, 0, 12);
+        hidden_nibble.set_hidden();
+        assert!(hidden_nibble.update_visible());
+
+        let packet = build_chunk_light_update_packet(&light);
+
+        assert_eq!(packet.sky_y_mask.0[0], 0);
+        assert_eq!(packet.empty_sky_y_mask.0[0], 0b010);
+        assert_eq!(packet.block_y_mask.0[0], 0b010);
+        assert_eq!(packet.empty_block_y_mask.0[0], 0);
+        assert!(packet.sky_updates.is_empty());
+        assert_eq!(
+            packet.block_updates,
+            vec![{
+                let mut bytes = vec![0; DATA_LAYER_SIZE];
+                bytes[0] = 0x07;
+                bytes
+            }]
+        );
     }
 
     #[test]

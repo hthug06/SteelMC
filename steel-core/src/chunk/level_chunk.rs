@@ -17,8 +17,8 @@ use steel_registry::{
     REGISTRY, RegistryEntry, blocks::block_state_ext::BlockStateExt, vanilla_blocks,
 };
 use steel_utils::{
-    BlockPos, BlockStateId, ChunkPos, Direction, PackedChunkLocalXZ, SectionPos, codec::BitSet,
-    locks::SyncRwLock, types::UpdateFlags,
+    BlockPos, BlockStateId, ChunkPos, Direction, PackedChunkLocalXZ, SectionPos, locks::SyncRwLock,
+    types::UpdateFlags,
 };
 
 use steel_utils::locks::SyncMutex;
@@ -27,7 +27,10 @@ use crate::behavior::{BLOCK_BEHAVIORS, BlockStateBehaviorExt, FLUID_BEHAVIORS};
 use crate::block_entity::{BlockEntityStorage, SharedBlockEntity};
 use crate::chunk::{
     heightmap::{ChunkHeightmaps, HeightmapType},
-    light::{ChunkLightData, ChunkSkyLightSources, has_different_light_properties},
+    light::{
+        ChunkLightData, ChunkSkyLightSources, build_chunk_light_update_packet,
+        has_different_light_properties,
+    },
     proto_chunk::ProtoChunk,
     section::Sections,
 };
@@ -840,32 +843,7 @@ impl LevelChunk {
     /// Extracts the light data for sending to the client.
     #[must_use]
     pub fn extract_light_data(&self) -> LightUpdatePacketData {
-        // TODO: Read from LevelLightEngine storage once Steel owns live light data.
-        // Vanilla's light section count is sectionsCount + 2 (one below and one above the world)
-        let light_section_count = self.sections.sections.len() + 2;
-        let mut sky_y_mask = BitSet(vec![0; light_section_count.div_ceil(64)].into_boxed_slice());
-        let mut block_y_mask = BitSet(vec![0; light_section_count.div_ceil(64)].into_boxed_slice());
-        let empty_sky_y_mask = BitSet(vec![0; light_section_count.div_ceil(64)].into_boxed_slice());
-        let empty_block_y_mask =
-            BitSet(vec![0; light_section_count.div_ceil(64)].into_boxed_slice());
-
-        let mut sky_updates = Vec::new();
-        let mut block_updates = Vec::new();
-
-        for i in 0..light_section_count {
-            sky_y_mask.set(i, true);
-            block_y_mask.set(i, true);
-            sky_updates.push(vec![0xFF; 2048]);
-            block_updates.push(vec![0xFF; 2048]);
-        }
-
-        LightUpdatePacketData {
-            sky_y_mask,
-            block_y_mask,
-            empty_sky_y_mask,
-            empty_block_y_mask,
-            sky_updates,
-            block_updates,
-        }
+        let light = self.light.read();
+        build_chunk_light_update_packet(&light)
     }
 }

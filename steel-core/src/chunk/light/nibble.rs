@@ -39,6 +39,15 @@ pub struct LightNibbleArray {
     updating_dirty: bool,
 }
 
+/// Vanilla-save representation of one visible light nibble section.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LightNibbleSaveState {
+    /// State to persist for this light section.
+    pub state: LightNibbleState,
+    /// Packed nibble bytes when the section has non-zero initialized data.
+    pub data: Option<Box<[u8; DATA_LAYER_SIZE]>>,
+}
+
 impl LightNibbleArray {
     /// Creates a null nibble section.
     #[must_use]
@@ -261,6 +270,42 @@ impl LightNibbleArray {
         }
     }
 
+    /// Converts the visible view into ScalableLux-style save state.
+    ///
+    /// All-zero initialized sections are persisted as uninitialized, and all-zero
+    /// hidden sections are omitted, matching ScalableLux's canonical save state.
+    #[must_use]
+    pub fn to_save_state(&self) -> Option<LightNibbleSaveState> {
+        match self.visible_state {
+            LightNibbleState::Null => None,
+            LightNibbleState::Uninitialized => Some(LightNibbleSaveState {
+                state: LightNibbleState::Uninitialized,
+                data: None,
+            }),
+            LightNibbleState::Initialized | LightNibbleState::Hidden => {
+                let Some(data) = self.visible_data.as_ref() else {
+                    panic!("initialized visible light nibble is missing data");
+                };
+
+                if Self::is_all_zero(data) {
+                    if self.visible_state == LightNibbleState::Hidden {
+                        return None;
+                    }
+
+                    return Some(LightNibbleSaveState {
+                        state: LightNibbleState::Uninitialized,
+                        data: None,
+                    });
+                }
+
+                Some(LightNibbleSaveState {
+                    state: self.visible_state,
+                    data: Some(Box::new(**data)),
+                })
+            }
+        }
+    }
+
     fn from_packed_data(data: Box<[u8; DATA_LAYER_SIZE]>) -> Self {
         let data = Arc::new(*data);
         Self {
@@ -307,6 +352,10 @@ impl LightNibbleArray {
     const fn pack_filled(value: u8) -> u8 {
         let value = value & MAX_LIGHT_LEVEL;
         value | value << 4
+    }
+
+    fn is_all_zero(data: &[u8; DATA_LAYER_SIZE]) -> bool {
+        data.iter().all(|value| *value == 0)
     }
 }
 

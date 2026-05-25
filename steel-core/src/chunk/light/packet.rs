@@ -1,7 +1,7 @@
 use steel_protocol::packets::game::LightUpdatePacketData;
 use steel_utils::{ChunkPos, SectionPos, codec::BitSet};
 
-use super::{DataLayerStorageMap, LightSectionRange};
+use super::{ChunkLightData, ChunkLightLayerStorage, DataLayerStorageMap, LightSectionRange};
 
 /// Builds protocol light-update data for one chunk column.
 ///
@@ -61,6 +61,44 @@ pub fn build_light_update_packet(
     }
 }
 
+/// Builds protocol light-update data from chunk-owned ScalableLux-style nibbles.
+#[must_use]
+pub fn build_chunk_light_update_packet(light: &ChunkLightData) -> LightUpdatePacketData {
+    let range = light.sky.range();
+    let mut sky_y_mask = range.empty_bit_set();
+    let mut block_y_mask = range.empty_bit_set();
+    let mut empty_sky_y_mask = range.empty_bit_set();
+    let mut empty_block_y_mask = range.empty_bit_set();
+    let mut sky_updates = Vec::new();
+    let mut block_updates = Vec::new();
+
+    for section_index in 0..range.section_count() {
+        prepare_nibble_section_data(
+            &light.sky,
+            section_index,
+            &mut sky_y_mask,
+            &mut empty_sky_y_mask,
+            &mut sky_updates,
+        );
+        prepare_nibble_section_data(
+            &light.block,
+            section_index,
+            &mut block_y_mask,
+            &mut empty_block_y_mask,
+            &mut block_updates,
+        );
+    }
+
+    LightUpdatePacketData {
+        sky_y_mask,
+        block_y_mask,
+        empty_sky_y_mask,
+        empty_block_y_mask,
+        sky_updates,
+        block_updates,
+    }
+}
+
 fn prepare_section_data(
     layers: &DataLayerStorageMap,
     section_pos: SectionPos,
@@ -70,6 +108,29 @@ fn prepare_section_data(
     updates: &mut Vec<Vec<u8>>,
 ) {
     let Some(layer) = layers.get_layer(section_pos) else {
+        return;
+    };
+
+    if layer.is_empty() {
+        empty_mask.set(section_index, true);
+    } else {
+        mask.set(section_index, true);
+        let bytes = layer.to_bytes();
+        updates.push(bytes.as_ref().to_vec());
+    }
+}
+
+fn prepare_nibble_section_data(
+    layers: &ChunkLightLayerStorage,
+    section_index: usize,
+    mask: &mut BitSet,
+    empty_mask: &mut BitSet,
+    updates: &mut Vec<Vec<u8>>,
+) {
+    let Some(nibble) = layers.nibbles().get(section_index) else {
+        return;
+    };
+    let Some(layer) = nibble.to_data_layer() else {
         return;
     };
 
