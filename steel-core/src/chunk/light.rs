@@ -26,6 +26,10 @@ const POSITIVE_INFINITY: i32 = i32::MAX;
 const SECTION_HAS_DATA_BIT: u8 = 0b0010_0000;
 const SECTION_NEIGHBOR_COUNT_BITS: u8 = 0b0001_1111;
 const MAX_SECTION_NEIGHBORS: i32 = 26;
+const QUEUE_ENTRY_LEVEL_MASK: u64 = 0b1111;
+const QUEUE_ENTRY_DIRECTIONS_MASK: u64 = 0b11_1111_0000;
+const QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE: u64 = 1 << 10;
+const QUEUE_ENTRY_FLAG_INCREASE_FROM_EMISSION: u64 = 1 << 11;
 
 /// Vanilla light layer kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,6 +48,167 @@ pub fn has_different_light_properties(old_state: BlockStateId, new_state: BlockS
             || old_state.get_light_emission() != new_state.get_light_emission()
             || old_state.use_shape_for_light_occlusion()
             || new_state.use_shape_for_light_occlusion())
+}
+
+/// Vanilla's packed light-propagation queue entry.
+///
+/// `LightEngine.QueueEntry` stores the source level in bits 0..3, one
+/// propagation bit per vanilla `Direction.ordinal()` in bits 4..9, and two
+/// increase flags in bits 10 and 11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightQueueEntry(u64);
+
+impl LightQueueEntry {
+    /// Creates a decrease entry that propagates to all directions except one.
+    #[must_use]
+    pub const fn decrease_skip_one_direction(
+        old_from_level: u8,
+        skip_direction: Direction,
+    ) -> Self {
+        Self::with_level(
+            Self::without_direction(QUEUE_ENTRY_DIRECTIONS_MASK, skip_direction),
+            old_from_level,
+        )
+    }
+
+    /// Creates a decrease entry that propagates to all directions.
+    #[must_use]
+    pub const fn decrease_all_directions(old_from_level: u8) -> Self {
+        Self::with_level(QUEUE_ENTRY_DIRECTIONS_MASK, old_from_level)
+    }
+
+    /// Creates an increase entry sourced from a block's light emission.
+    #[must_use]
+    pub const fn increase_light_from_emission(new_from_level: u8, from_empty_shape: bool) -> Self {
+        let mut entry = QUEUE_ENTRY_DIRECTIONS_MASK | QUEUE_ENTRY_FLAG_INCREASE_FROM_EMISSION;
+        if from_empty_shape {
+            entry |= QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE;
+        }
+
+        Self::with_level(entry, new_from_level)
+    }
+
+    /// Creates an increase entry that propagates to all directions except one.
+    #[must_use]
+    pub const fn increase_skip_one_direction(
+        new_from_level: u8,
+        from_empty_shape: bool,
+        skip_direction: Direction,
+    ) -> Self {
+        let mut entry = Self::without_direction(QUEUE_ENTRY_DIRECTIONS_MASK, skip_direction);
+        if from_empty_shape {
+            entry |= QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE;
+        }
+
+        Self::with_level(entry, new_from_level)
+    }
+
+    /// Creates an increase entry that propagates to exactly one direction.
+    #[must_use]
+    pub const fn increase_only_one_direction(
+        new_from_level: u8,
+        from_empty_shape: bool,
+        direction: Direction,
+    ) -> Self {
+        let mut entry = 0;
+        if from_empty_shape {
+            entry |= QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE;
+        }
+
+        Self::with_level(Self::with_direction(entry, direction), new_from_level)
+    }
+
+    /// Creates a sky-source increase entry for selected directions.
+    #[must_use]
+    pub const fn increase_sky_source_in_directions(
+        down: bool,
+        north: bool,
+        south: bool,
+        west: bool,
+        east: bool,
+    ) -> Self {
+        let mut entry = MAX_LIGHT_LEVEL as u64;
+        if down {
+            entry = Self::with_direction(entry, Direction::Down);
+        }
+        if north {
+            entry = Self::with_direction(entry, Direction::North);
+        }
+        if south {
+            entry = Self::with_direction(entry, Direction::South);
+        }
+        if west {
+            entry = Self::with_direction(entry, Direction::West);
+        }
+        if east {
+            entry = Self::with_direction(entry, Direction::East);
+        }
+
+        Self(entry)
+    }
+
+    /// Creates a queue entry from vanilla's packed representation.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns vanilla's packed representation.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Returns the source light level stored in this entry.
+    #[must_use]
+    pub const fn from_level(self) -> u8 {
+        (self.0 & QUEUE_ENTRY_LEVEL_MASK) as u8
+    }
+
+    /// Returns true if propagation starts from an empty occlusion shape.
+    #[must_use]
+    pub const fn is_from_empty_shape(self) -> bool {
+        self.0 & QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE != 0
+    }
+
+    /// Returns true if this increase came from block light emission.
+    #[must_use]
+    pub const fn is_increase_from_emission(self) -> bool {
+        self.0 & QUEUE_ENTRY_FLAG_INCREASE_FROM_EMISSION != 0
+    }
+
+    /// Returns true if this entry propagates in `direction`.
+    #[must_use]
+    pub const fn should_propagate_in_direction(self, direction: Direction) -> bool {
+        self.0 & Self::direction_bit(direction) != 0
+    }
+
+    const fn with_level(entry: u64, level: u8) -> Self {
+        Self(entry & !QUEUE_ENTRY_LEVEL_MASK | (level as u64 & QUEUE_ENTRY_LEVEL_MASK))
+    }
+
+    const fn with_direction(entry: u64, direction: Direction) -> u64 {
+        entry | Self::direction_bit(direction)
+    }
+
+    const fn without_direction(entry: u64, direction: Direction) -> u64 {
+        entry & !Self::direction_bit(direction)
+    }
+
+    const fn direction_bit(direction: Direction) -> u64 {
+        1 << (Self::vanilla_direction_index(direction) + 4)
+    }
+
+    const fn vanilla_direction_index(direction: Direction) -> u64 {
+        match direction {
+            Direction::Down => 0,
+            Direction::Up => 1,
+            Direction::North => 2,
+            Direction::South => 3,
+            Direction::West => 4,
+            Direction::East => 5,
+        }
+    }
 }
 
 /// Error returned when a light section state would hold an invalid neighbor count.
@@ -1359,6 +1524,7 @@ mod tests {
     use steel_registry::blocks::block_state_ext::BlockStateExt;
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
     use steel_utils::BlockStateId;
+    use steel_utils::Direction::{Down, East, North, South, Up, West};
     use steel_utils::{ChunkPos, PackedSectionPos, SectionPos};
 
     use crate::{
@@ -1368,8 +1534,8 @@ mod tests {
 
     use super::{
         ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
-        LayerLightSectionStorage, LightLayer, LightSectionRange, LightSectionState,
-        LightSectionStateError, LightSectionType, build_light_update_packet,
+        LayerLightSectionStorage, LightLayer, LightQueueEntry, LightSectionRange,
+        LightSectionState, LightSectionStateError, LightSectionType, build_light_update_packet,
         has_different_light_properties,
     };
 
@@ -1396,6 +1562,69 @@ mod tests {
             panic!("valid single-section height rejected");
         };
         sources
+    }
+
+    #[test]
+    fn light_queue_entry_decrease_entries_match_vanilla_bits() {
+        let all = LightQueueEntry::decrease_all_directions(7);
+
+        assert_eq!(all.raw(), 1008 | 7);
+        assert_eq!(all.from_level(), 7);
+        for direction in [Down, Up, North, South, West, East] {
+            assert!(all.should_propagate_in_direction(direction));
+        }
+        assert!(!all.is_from_empty_shape());
+        assert!(!all.is_increase_from_emission());
+
+        let skip_north = LightQueueEntry::decrease_skip_one_direction(7, North);
+        assert_eq!(skip_north.raw(), 951);
+        assert!(!skip_north.should_propagate_in_direction(North));
+        assert!(skip_north.should_propagate_in_direction(South));
+    }
+
+    #[test]
+    fn light_queue_entry_increase_entries_match_vanilla_bits() {
+        let emission = LightQueueEntry::increase_light_from_emission(15, true);
+        assert_eq!(emission.raw(), 4095);
+        assert_eq!(emission.from_level(), 15);
+        assert!(emission.is_from_empty_shape());
+        assert!(emission.is_increase_from_emission());
+
+        let skip_up = LightQueueEntry::increase_skip_one_direction(10, false, Up);
+        assert_eq!(skip_up.raw(), 986);
+        assert!(!skip_up.is_from_empty_shape());
+        assert!(!skip_up.is_increase_from_emission());
+        assert!(!skip_up.should_propagate_in_direction(Up));
+        assert!(skip_up.should_propagate_in_direction(Down));
+
+        let east_only = LightQueueEntry::increase_only_one_direction(4, true, East);
+        assert_eq!(east_only.raw(), 1540);
+        assert!(east_only.is_from_empty_shape());
+        assert!(east_only.should_propagate_in_direction(East));
+        assert!(!east_only.should_propagate_in_direction(West));
+    }
+
+    #[test]
+    fn light_queue_entry_sky_source_entry_selects_horizontal_and_down_directions() {
+        let entry =
+            LightQueueEntry::increase_sky_source_in_directions(true, true, false, true, false);
+
+        assert_eq!(entry.raw(), 351);
+        assert_eq!(entry.from_level(), 15);
+        assert!(entry.should_propagate_in_direction(Down));
+        assert!(!entry.should_propagate_in_direction(Up));
+        assert!(entry.should_propagate_in_direction(North));
+        assert!(!entry.should_propagate_in_direction(South));
+        assert!(entry.should_propagate_in_direction(West));
+        assert!(!entry.should_propagate_in_direction(East));
+    }
+
+    #[test]
+    fn light_queue_entry_masks_levels_like_vanilla() {
+        let entry = LightQueueEntry::increase_light_from_emission(31, false);
+
+        assert_eq!(entry.from_level(), 15);
+        assert_eq!(entry.raw(), 1008 | 2048 | 15);
     }
 
     #[test]
