@@ -42,6 +42,7 @@ const QUEUE_ENTRY_LEVEL_MASK: u64 = 0b1111;
 const QUEUE_ENTRY_DIRECTIONS_MASK: u64 = 0b11_1111_0000;
 const QUEUE_ENTRY_FLAG_FROM_EMPTY_SHAPE: u64 = 1 << 10;
 const QUEUE_ENTRY_FLAG_INCREASE_FROM_EMISSION: u64 = 1 << 11;
+const LIGHT_QUEUE_MIN_CAPACITY: usize = 512;
 
 /// Vanilla light layer kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,6 +273,130 @@ impl LightQueueEntry {
             Direction::West => 4,
             Direction::East => 5,
         }
+    }
+}
+
+/// One typed light propagation queue item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedLightUpdate {
+    /// Block position whose light should propagate.
+    pub block_pos: BlockPos,
+    /// Packed vanilla propagation metadata.
+    pub entry: LightQueueEntry,
+}
+
+/// Array-backed FIFO used for vanilla light propagation work.
+///
+/// Vanilla stores alternating packed block positions and `QueueEntry` longs in
+/// `LongArrayFIFOQueue`. Steel keeps typed records instead, while preserving
+/// the FIFO ordering and packed queue-entry semantics that propagation depends
+/// on.
+#[derive(Debug)]
+pub struct LightPropagationQueue {
+    entries: Vec<QueuedLightUpdate>,
+    read_index: usize,
+}
+
+impl LightPropagationQueue {
+    /// Creates an empty propagation queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(LIGHT_QUEUE_MIN_CAPACITY),
+            read_index: 0,
+        }
+    }
+
+    /// Returns true when no queued work remains.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.read_index >= self.entries.len()
+    }
+
+    /// Returns the number of queued items that have not been dequeued yet.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len() - self.read_index
+    }
+
+    /// Adds propagation work to the back of the queue.
+    pub fn enqueue(&mut self, block_pos: BlockPos, entry: LightQueueEntry) {
+        self.entries.push(QueuedLightUpdate { block_pos, entry });
+    }
+
+    /// Removes propagation work from the front of the queue.
+    pub fn dequeue(&mut self) -> Option<QueuedLightUpdate> {
+        if self.is_empty() {
+            self.clear();
+            return None;
+        }
+
+        let update = self.entries[self.read_index];
+        self.read_index += 1;
+        if self.is_empty() {
+            self.clear();
+        }
+
+        Some(update)
+    }
+
+    /// Removes all queued work while keeping allocated storage for reuse.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.read_index = 0;
+    }
+}
+
+impl Default for LightPropagationQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Vanilla's separate increase and decrease propagation queues.
+#[derive(Debug, Default)]
+pub struct LightPropagationQueues {
+    increase: LightPropagationQueue,
+    decrease: LightPropagationQueue,
+}
+
+impl LightPropagationQueues {
+    /// Creates empty increase and decrease queues.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true when either propagation queue contains work.
+    #[must_use]
+    pub fn has_work(&self) -> bool {
+        !self.increase.is_empty() || !self.decrease.is_empty()
+    }
+
+    /// Enqueues decrease propagation work.
+    pub fn enqueue_decrease(&mut self, block_pos: BlockPos, entry: LightQueueEntry) {
+        self.decrease.enqueue(block_pos, entry);
+    }
+
+    /// Enqueues increase propagation work.
+    pub fn enqueue_increase(&mut self, block_pos: BlockPos, entry: LightQueueEntry) {
+        self.increase.enqueue(block_pos, entry);
+    }
+
+    /// Dequeues decrease propagation work.
+    pub fn dequeue_decrease(&mut self) -> Option<QueuedLightUpdate> {
+        self.decrease.dequeue()
+    }
+
+    /// Dequeues increase propagation work.
+    pub fn dequeue_increase(&mut self) -> Option<QueuedLightUpdate> {
+        self.increase.dequeue()
+    }
+
+    /// Removes all increase and decrease work.
+    pub fn clear(&mut self) {
+        self.increase.clear();
+        self.decrease.clear();
     }
 }
 
@@ -1743,10 +1868,11 @@ mod tests {
 
     use super::{
         ChunkSkyLightSources, DATA_LAYER_SIZE, DataLayer, DataLayerStorageMap,
-        LayerLightSectionStorage, LightLayer, LightQueueEntry, LightSectionRange,
-        LightSectionState, LightSectionStateError, LightSectionType, MissingLightDataLayerError,
-        build_light_update_packet, get_light_block_into, get_light_opacity,
-        has_different_light_properties, light_face_occludes,
+        LayerLightSectionStorage, LightLayer, LightPropagationQueue, LightPropagationQueues,
+        LightQueueEntry, LightSectionRange, LightSectionState, LightSectionStateError,
+        LightSectionType, MissingLightDataLayerError, QueuedLightUpdate, build_light_update_packet,
+        get_light_block_into, get_light_opacity, has_different_light_properties,
+        light_face_occludes,
     };
 
     fn init_light_tests() {
@@ -1890,6 +2016,98 @@ mod tests {
 
         assert_eq!(entry.from_level(), 15);
         assert_eq!(entry.raw(), 1008 | 2048 | 15);
+    }
+
+    #[test]
+    fn light_propagation_queue_preserves_fifo_order() {
+        let first_pos = BlockPos::new(1, 2, 3);
+        let second_pos = BlockPos::new(4, 5, 6);
+        let first_entry = LightQueueEntry::decrease_all_directions(3);
+        let second_entry = LightQueueEntry::increase_skip_one_direction(12, false, North);
+        let mut queue = LightPropagationQueue::new();
+
+        queue.enqueue(first_pos, first_entry);
+        queue.enqueue(second_pos, second_entry);
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue.dequeue(),
+            Some(QueuedLightUpdate {
+                block_pos: first_pos,
+                entry: first_entry,
+            })
+        );
+        assert_eq!(
+            queue.dequeue(),
+            Some(QueuedLightUpdate {
+                block_pos: second_pos,
+                entry: second_entry,
+            })
+        );
+        assert_eq!(queue.dequeue(), None);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn light_propagation_queue_processes_entries_enqueued_while_draining() {
+        let first_pos = BlockPos::new(1, 2, 3);
+        let second_pos = BlockPos::new(4, 5, 6);
+        let first_entry = LightQueueEntry::decrease_all_directions(3);
+        let second_entry = LightQueueEntry::decrease_skip_one_direction(2, South);
+        let mut queue = LightPropagationQueue::new();
+
+        queue.enqueue(first_pos, first_entry);
+
+        assert_eq!(
+            queue.dequeue(),
+            Some(QueuedLightUpdate {
+                block_pos: first_pos,
+                entry: first_entry,
+            })
+        );
+
+        queue.enqueue(second_pos, second_entry);
+
+        assert_eq!(
+            queue.dequeue(),
+            Some(QueuedLightUpdate {
+                block_pos: second_pos,
+                entry: second_entry,
+            })
+        );
+        assert_eq!(queue.dequeue(), None);
+    }
+
+    #[test]
+    fn light_propagation_queues_keep_increase_and_decrease_work_separate() {
+        let decrease_pos = BlockPos::new(1, 2, 3);
+        let increase_pos = BlockPos::new(4, 5, 6);
+        let decrease_entry = LightQueueEntry::decrease_all_directions(4);
+        let increase_entry = LightQueueEntry::increase_only_one_direction(9, true, East);
+        let mut queues = LightPropagationQueues::new();
+
+        assert!(!queues.has_work());
+
+        queues.enqueue_decrease(decrease_pos, decrease_entry);
+        queues.enqueue_increase(increase_pos, increase_entry);
+
+        assert!(queues.has_work());
+        assert_eq!(
+            queues.dequeue_increase(),
+            Some(QueuedLightUpdate {
+                block_pos: increase_pos,
+                entry: increase_entry,
+            })
+        );
+        assert!(queues.has_work());
+        assert_eq!(
+            queues.dequeue_decrease(),
+            Some(QueuedLightUpdate {
+                block_pos: decrease_pos,
+                entry: decrease_entry,
+            })
+        );
+        assert!(!queues.has_work());
     }
 
     #[test]
