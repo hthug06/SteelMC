@@ -100,6 +100,7 @@ pub fn light_face_occludes(
     face_shape_occludes(from_shape, direction, to_shape, direction.opposite())
 }
 
+mod cache;
 mod data_layer;
 mod nibble;
 mod packet;
@@ -107,6 +108,9 @@ mod queue;
 mod section_storage;
 mod sky_sources;
 
+pub use cache::{
+    LIGHT_CACHE_CHUNK_SLOTS, LIGHT_CACHE_DIAMETER, LIGHT_CACHE_RADIUS, LightCacheLayout,
+};
 pub use data_layer::{DataLayer, DataLayerLengthError, DataLayerStorageMap};
 pub use nibble::{
     ChunkLightData, ChunkLightEmptinessMapLengthError, ChunkLightLayerStorage, LightNibbleArray,
