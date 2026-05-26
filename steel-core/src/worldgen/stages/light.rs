@@ -47,12 +47,17 @@ fn run_light_stage(cache: &StaticCache2D<Arc<ChunkHolder>>, holder: &ChunkHolder
     let layout = LightCacheLayout::new(center, range);
     let Ok(workset) = LightWorkset::setup(
         layout,
-        LightCacheSetupRadius::Inner,
-        false,
+        LightCacheSetupRadius::Full,
+        true,
         |pos| {
-            let holder = cache.get(pos.0.x, pos.0.y);
+            let holder = cache.try_get(pos.0.x, pos.0.y)?;
+            let required_status = if pos == center {
+                ChunkStatus::InitializeLight
+            } else {
+                ChunkStatus::Light
+            };
             holder
-                .try_chunk(ChunkStatus::InitializeLight)
+                .try_chunk(required_status)
                 .is_some()
                 .then(|| Arc::clone(holder))
         },

@@ -1,6 +1,7 @@
 use steel_protocol::packets::game::LightUpdatePacketData;
 use steel_utils::{ChunkPos, SectionPos, codec::BitSet};
 
+use super::LightLayer;
 use super::{ChunkLightData, ChunkLightLayerStorage, DataLayerStorageMap, LightSectionRange};
 
 /// Builds protocol light-update data for one chunk column.
@@ -187,6 +188,9 @@ fn prepare_nibble_section_data(
         return;
     };
     let Some(layer) = nibble.to_data_layer() else {
+        if should_send_empty_nibble_section(layers, section_index) {
+            empty_mask.set(section_index, true);
+        }
         return;
     };
 
@@ -197,4 +201,34 @@ fn prepare_nibble_section_data(
         let bytes = layer.to_bytes();
         updates.push(bytes.as_ref().to_vec());
     }
+}
+
+fn should_send_empty_nibble_section(layers: &ChunkLightLayerStorage, section_index: usize) -> bool {
+    let Some(section_y) = layers.range().section_y(section_index) else {
+        return false;
+    };
+
+    if layers.layer() == LightLayer::Sky
+        && highest_non_empty_section_y(layers).is_some_and(|highest| section_y > highest)
+    {
+        return false;
+    }
+
+    for neighbor_y in (section_y - 1)..=(section_y + 1) {
+        if layers.section_empty(neighbor_y).is_some_and(|empty| !empty) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn highest_non_empty_section_y(layers: &ChunkLightLayerStorage) -> Option<i32> {
+    let emptiness_map = layers.emptiness_map()?;
+    for (index, empty) in emptiness_map.iter().copied().enumerate().rev() {
+        if !empty {
+            return layers.range().chunk_section_y(index);
+        }
+    }
+    None
 }

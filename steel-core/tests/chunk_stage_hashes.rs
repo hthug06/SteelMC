@@ -23,7 +23,7 @@ use steel_core::chunk::chunk_generation_task::StaticCache2D;
 use steel_core::chunk::chunk_holder::ChunkHolder;
 use steel_core::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use steel_core::chunk::chunk_request::{ChunkRequest, ChunkRequestState, ChunkTicketKind};
-use steel_core::chunk::light::{ChunkLightData, ChunkLightLayerStorage, LightLayer};
+use steel_core::chunk::light::{ChunkLightData, LightLayer, build_chunk_light_update_packet};
 use steel_core::chunk::proto_chunk::ProtoChunk;
 use steel_core::chunk::section::{ChunkSection, Sections};
 use steel_core::level_data::WorldGenerationSettings;
@@ -91,6 +91,7 @@ const DEBUG_CLUSTER_ENV: &str = "STEEL_HASH_DEBUG_CLUSTER";
 const DEBUG_CHUNK_ENV: &str = "STEEL_HASH_DEBUG_CHUNK";
 const DEBUG_DIMENSION_ENV: &str = "STEEL_HASH_DEBUG_DIMENSION";
 const DEBUG_STAGE_ENV: &str = "STEEL_HASH_DEBUG_STAGE";
+const DEBUG_LIGHT_SUMMARY_ENV: &str = "STEEL_HASH_DEBUG_LIGHT_SUMMARY";
 const DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV: &str = "STEEL_HASH_STOP_AFTER_FIRST_MISMATCH";
 
 const FEATURE_STAGE: &str = "minecraft:features";
@@ -319,20 +320,130 @@ fn consume_i32(ctx: &mut md5::Context, value: i32) {
     ctx.consume([value as u8]);
 }
 
-fn consume_light_layer_hash(ctx: &mut md5::Context, layer: &ChunkLightLayerStorage) {
-    for nibble in layer.nibbles() {
-        let Some(data_layer) = nibble.to_data_layer() else {
-            ctx.consume([0]);
+fn bitset_contains(bitset: &steel_utils::codec::BitSet, index: usize) -> bool {
+    bitset
+        .0
+        .get(index / 64)
+        .is_some_and(|bits| bits & (1 << (index % 64)) != 0)
+}
+
+fn light_layer_markers(
+    section_count: usize,
+    data_mask: &steel_utils::codec::BitSet,
+    empty_mask: &steel_utils::codec::BitSet,
+    updates: &[Vec<u8>],
+) -> Vec<String> {
+    let mut update_index = 0;
+    let mut markers = Vec::with_capacity(section_count);
+    for section_index in 0..section_count {
+        if bitset_contains(empty_mask, section_index) {
+            markers.push("empty".to_owned());
+        } else if bitset_contains(data_mask, section_index) {
+            let update = &updates[update_index];
+            let non_zero = update.iter().filter(|byte| **byte != 0).count();
+            let all_full = update.iter().all(|byte| *byte == 0xff);
+            markers.push(if all_full {
+                "full".to_owned()
+            } else {
+                format!("data({non_zero} nz-bytes)")
+            });
+            update_index += 1;
+        } else {
+            markers.push("null".to_owned());
+        }
+    }
+    markers
+}
+
+fn debug_light_summary(light: &ChunkLightData) -> String {
+    let packet = build_chunk_light_update_packet(light);
+    let range = light.sky.range();
+    let sky = light_layer_markers(
+        range.section_count(),
+        &packet.sky_y_mask,
+        &packet.empty_sky_y_mask,
+        &packet.sky_updates,
+    );
+    let block = light_layer_markers(
+        range.section_count(),
+        &packet.block_y_mask,
+        &packet.empty_block_y_mask,
+        &packet.block_updates,
+    );
+
+    let mut out = String::new();
+    for section_index in 0..range.section_count() {
+        let Some(section_y) = range.section_y(section_index) else {
             continue;
         };
+        let _ = writeln!(
+            out,
+            "    y={section_y:4}: sky={:18} block={}",
+            sky[section_index], block[section_index]
+        );
+    }
+    out
+}
 
-        if data_layer.is_empty() {
-            ctx.consume([1]);
-        } else {
-            ctx.consume([2]);
-            let bytes = data_layer.to_bytes();
-            ctx.consume(bytes.as_ref());
+fn debug_chunk_section_summary(chunk: &ChunkAccess) -> String {
+    let mut out = String::new();
+    for (section_index, section) in chunk.sections().sections.iter().enumerate() {
+        let section_y = chunk.min_y() / 16 + section_index as i32;
+        let section = section.read();
+        let non_air = section.non_empty_block_count();
+        if non_air == 0 {
+            continue;
         }
+
+        let opaque = (0..steel_core::chunk::paletted_container::BlockPalette::VOLUME)
+            .filter(|local_index| {
+                section
+                    .states
+                    .get_at_index(*local_index)
+                    .get_light_dampening()
+                    > 0
+            })
+            .count();
+        let _ = writeln!(
+            out,
+            "    y={section_y:4}: non_air={non_air:4} dampens_light={opaque:4}"
+        );
+    }
+    out
+}
+
+fn consume_light_layer_hash(
+    ctx: &mut md5::Context,
+    section_count: usize,
+    data_mask: &steel_utils::codec::BitSet,
+    empty_mask: &steel_utils::codec::BitSet,
+    updates: &[Vec<u8>],
+) {
+    let mut update_index = 0;
+    for section_index in 0..section_count {
+        if bitset_contains(empty_mask, section_index) {
+            ctx.consume([1]);
+            continue;
+        }
+
+        if !bitset_contains(data_mask, section_index) {
+            ctx.consume([0]);
+            continue;
+        }
+
+        let Some(update) = updates.get(update_index) else {
+            panic!("light packet data mask referenced missing update {update_index}");
+        };
+        ctx.consume([2]);
+        ctx.consume(update);
+        update_index += 1;
+    }
+
+    if update_index != updates.len() {
+        panic!(
+            "light packet carried {} unused updates after consuming {update_index}",
+            updates.len()
+        );
     }
 }
 
@@ -345,14 +456,27 @@ fn compute_light_hash(light: &ChunkLightData) -> String {
 
     consume_i32(&mut ctx, range.min_section_y());
     consume_i32(&mut ctx, section_count);
+    let packet = build_chunk_light_update_packet(light);
     for layer in [LightLayer::Sky, LightLayer::Block] {
         ctx.consume([match layer {
             LightLayer::Sky => 0,
             LightLayer::Block => 1,
         }]);
         match layer {
-            LightLayer::Sky => consume_light_layer_hash(&mut ctx, &light.sky),
-            LightLayer::Block => consume_light_layer_hash(&mut ctx, &light.block),
+            LightLayer::Sky => consume_light_layer_hash(
+                &mut ctx,
+                range.section_count(),
+                &packet.sky_y_mask,
+                &packet.empty_sky_y_mask,
+                &packet.sky_updates,
+            ),
+            LightLayer::Block => consume_light_layer_hash(
+                &mut ctx,
+                range.section_count(),
+                &packet.block_y_mask,
+                &packet.empty_block_y_mask,
+                &packet.block_updates,
+            ),
         }
     }
 
@@ -736,6 +860,7 @@ fn chunk_light_hashes_inner() {
     let debug_dimension = debug_dimension_filter();
     let debug_filter = debug_chunk_filter();
     let stop_after_first_mismatch = env::var_os(DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV).is_some();
+    let emit_light_summary = env::var_os(DEBUG_LIGHT_SUMMARY_ENV).is_some();
     let mut saw_light_hashes = false;
 
     for &dim_key in DIMENSION_ORDER {
@@ -826,12 +951,23 @@ fn chunk_light_hashes_inner() {
 
         let mut actual_by_pos =
             FxHashMap::with_capacity_and_hasher(ready_chunks.holders.len(), FxBuildHasher);
+        let mut summary_by_pos =
+            FxHashMap::with_capacity_and_hasher(ready_chunks.holders.len(), FxBuildHasher);
         for holder in ready_chunks.holders {
             let pos = holder.get_pos();
             let Some(chunk) = holder.try_chunk(ChunkStatus::Light) else {
                 panic!("ready light chunk missing at ({}, {})", pos.0.x, pos.0.y);
             };
             let light = chunk.light();
+            if emit_light_summary {
+                let mut summary = debug_light_summary(&light);
+                let section_summary = debug_chunk_section_summary(&chunk);
+                if !section_summary.is_empty() {
+                    let _ = writeln!(summary, "  generated non-empty sections:");
+                    summary.push_str(&section_summary);
+                }
+                summary_by_pos.insert((pos.0.x, pos.0.y), summary);
+            }
             actual_by_pos.insert((pos.0.x, pos.0.y), compute_light_hash(&light));
         }
 
@@ -851,6 +987,12 @@ fn chunk_light_hashes_inner() {
             }
 
             if !ok {
+                if emit_light_summary && let Some(summary) = summary_by_pos.get(&(chunk_x, chunk_z))
+                {
+                    eprintln!(
+                        "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) actual packet light sections:\n{summary}"
+                    );
+                }
                 mismatches.push((
                     chunk_x,
                     chunk_z,

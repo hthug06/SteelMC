@@ -353,6 +353,31 @@ impl LightLayerWriteCache<'_> {
         self.nibble(section_slot).is_some()
     }
 
+    /// Returns true when the cached chunk column has a known emptiness map for this layer.
+    #[must_use]
+    pub fn has_emptiness_map(&self, chunk_pos: ChunkPos) -> bool {
+        let Some(cached_chunk) = self.layout.cached_chunk(chunk_pos) else {
+            return false;
+        };
+        let Some(light_data) = self.chunks.get_slot(cached_chunk.chunk_slot) else {
+            return false;
+        };
+
+        Self::layer_storage(light_data, self.layer)
+            .emptiness_map()
+            .is_some()
+    }
+
+    /// Returns known real-section emptiness for a cached chunk column.
+    #[must_use]
+    pub fn section_empty(&self, section_pos: SectionPos) -> Option<bool> {
+        let chunk_pos = ChunkPos::new(section_pos.x(), section_pos.z());
+        let cached_chunk = self.layout.cached_chunk(chunk_pos)?;
+        let light_data = self.chunks.get_slot(cached_chunk.chunk_slot)?;
+
+        Self::layer_storage(light_data, self.layer).section_empty(section_pos.y())
+    }
+
     /// Marks a cached light section non-null without allocating light bytes.
     ///
     /// Returns false when the section has no writable cached nibble.
@@ -361,6 +386,55 @@ impl LightLayerWriteCache<'_> {
             return false;
         };
         self.set_section_slot_non_null(section_slot)
+    }
+
+    /// Marks a cached light section null and drops its updating bytes.
+    ///
+    /// Returns false when the section has no writable cached nibble.
+    pub fn set_section_null(&mut self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        let Some(nibble) = self.nibble_mut(section_slot) else {
+            return false;
+        };
+        let was_non_null = !nibble.is_null_updating();
+        nibble.set_null();
+        was_non_null
+    }
+
+    /// Hides a cached block-light section from external packet/save conversion.
+    ///
+    /// Returns false when the section has no writable cached nibble.
+    pub fn set_section_hidden(&mut self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        let Some(nibble) = self.nibble_mut(section_slot) else {
+            return false;
+        };
+        let was_visible = !nibble.is_null_updating();
+        nibble.set_hidden();
+        was_visible
+    }
+
+    /// Replaces one cached chunk column's layer nibbles with fresh null nibbles.
+    ///
+    /// Initial chunk lighting in ScalableLux lights into a new null nibble array
+    /// for the center chunk, then stores it back after propagation. Steel keeps
+    /// the array inside the chunk, so this gives the center chunk the same fresh
+    /// starting point before the propagation context runs.
+    pub fn reset_chunk_nibbles_to_null(&mut self, chunk_pos: ChunkPos) -> bool {
+        let Some(cached_chunk) = self.layout.cached_chunk(chunk_pos) else {
+            return false;
+        };
+        let layer = self.layer;
+        let Some(light_data) = self.chunks.get_mut_slot(cached_chunk.chunk_slot) else {
+            return false;
+        };
+
+        Self::layer_storage_mut(light_data, layer).reset_nibbles_to_null();
+        true
     }
 
     /// Marks a cached section slot non-null without allocating light bytes.

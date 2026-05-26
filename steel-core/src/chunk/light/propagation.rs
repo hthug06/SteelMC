@@ -109,7 +109,12 @@ pub fn propagate_block_light_chunk(
                 let mut queues = PackedLightPropagationQueues::new();
 
                 {
-                    initialize_block_light_nibbles(section_cache, light_cache);
+                    light_cache.reset_chunk_nibbles_to_null(layout.center_chunk());
+                    handle_unlit_block_empty_section_changes(
+                        section_cache,
+                        light_cache,
+                        layout.center_chunk(),
+                    );
                     let mut context =
                         BlockLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
                     context.seed_block_light_sources(sources);
@@ -157,6 +162,61 @@ fn initialize_block_light_nibbles(
     initialized
 }
 
+fn handle_unlit_block_empty_section_changes(
+    sections: &LightSectionReadCache<'_>,
+    light: &mut LightLayerWriteCache<'_>,
+    chunk_pos: ChunkPos,
+) -> usize {
+    let layout = sections.layout();
+    let mut initialized = 0;
+
+    for section_y in
+        (layout.range().min_chunk_section_y()..layout.range().max_chunk_section_y_exclusive()).rev()
+    {
+        let section_pos = SectionPos::new(chunk_pos.0.x, section_y, chunk_pos.0.y);
+        if !section_is_non_empty(sections, light, section_pos) {
+            continue;
+        }
+
+        for offset_z in -1..=1 {
+            for offset_x in -1..=1 {
+                for offset_y in (-1..=1).rev() {
+                    let target = SectionPos::new(
+                        chunk_pos.0.x + offset_x,
+                        section_y + offset_y,
+                        chunk_pos.0.y + offset_z,
+                    );
+                    if light.set_section_non_null(target) {
+                        initialized += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    for offset_z in -1..=1 {
+        for offset_x in -1..=1 {
+            let target_chunk = ChunkPos::new(chunk_pos.0.x + offset_x, chunk_pos.0.y + offset_z);
+            let neighbours_loaded = chunk_neighborhood_has_emptiness_maps(light, target_chunk);
+
+            for section_y in
+                (layout.range().min_section_y()..layout.range().max_section_y_exclusive()).rev()
+            {
+                let section_pos = SectionPos::new(target_chunk.0.x, section_y, target_chunk.0.y);
+                let all_empty =
+                    section_neighborhood_all_empty(sections, light, target_chunk, section_y);
+                if all_empty && neighbours_loaded {
+                    light.set_section_hidden(section_pos);
+                } else if !all_empty && light.set_section_non_null(section_pos) {
+                    initialized += 1;
+                }
+            }
+        }
+    }
+
+    initialized
+}
+
 fn has_non_empty_neighbor_section(
     sections: &LightSectionReadCache<'_>,
     section_pos: SectionPos,
@@ -177,6 +237,65 @@ fn has_non_empty_neighbor_section(
     }
 
     false
+}
+
+fn chunk_neighborhood_has_emptiness_maps(
+    light: &LightLayerWriteCache<'_>,
+    chunk_pos: ChunkPos,
+) -> bool {
+    for offset_z in -1..=1 {
+        for offset_x in -1..=1 {
+            let neighbor = ChunkPos::new(chunk_pos.0.x + offset_x, chunk_pos.0.y + offset_z);
+            if !light.has_emptiness_map(neighbor) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn section_neighborhood_all_empty(
+    sections: &LightSectionReadCache<'_>,
+    light: &LightLayerWriteCache<'_>,
+    chunk_pos: ChunkPos,
+    section_y: i32,
+) -> bool {
+    for offset_y in -1..=1 {
+        let neighbor_y = section_y + offset_y;
+        if neighbor_y < sections.layout().range().min_chunk_section_y()
+            || neighbor_y >= sections.layout().range().max_chunk_section_y_exclusive()
+        {
+            continue;
+        }
+
+        for offset_z in -1..=1 {
+            for offset_x in -1..=1 {
+                let section_pos = SectionPos::new(
+                    chunk_pos.0.x + offset_x,
+                    neighbor_y,
+                    chunk_pos.0.y + offset_z,
+                );
+                if section_is_non_empty(sections, light, section_pos) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn section_is_non_empty(
+    sections: &LightSectionReadCache<'_>,
+    light: &LightLayerWriteCache<'_>,
+    section_pos: SectionPos,
+) -> bool {
+    if let Some(empty) = light.section_empty(section_pos) {
+        return !empty;
+    }
+
+    sections.has_non_empty_section(section_pos)
 }
 
 /// ScalableLux-style block-light propagation over scoped Steel light caches.
@@ -810,7 +929,7 @@ mod tests {
     use crate::chunk::{
         chunk_access::{ChunkAccess, ChunkStatus},
         chunk_holder::ChunkHolder,
-        light::{LightCacheSetupRadius, LightSectionRange, LightWorkset},
+        light::{LightCacheSetupRadius, LightNibbleState, LightSectionRange, LightWorkset},
         proto_chunk::ProtoChunk,
         section::{ChunkSection, Sections},
     };
@@ -833,6 +952,13 @@ mod tests {
         let holder = Arc::new(ChunkHolder::new(pos, 0, 0, 16));
         holder.insert_chunk(ChunkAccess::Proto(proto), ChunkStatus::Light);
         holder
+    }
+
+    fn initialize_holder_light(holder: &ChunkHolder) {
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        chunk.initialize_light_sources();
     }
 
     fn set_block_nibble_non_null(holder: &ChunkHolder, section_y: i32) {
@@ -996,6 +1122,67 @@ mod tests {
     }
 
     #[test]
+    fn block_light_chunk_hides_loaded_empty_neighbor_sections() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let stale_neighbor = ChunkPos::new(1, 0);
+        let mut holders = Vec::new();
+        let mut stale_holder = None;
+        for z in -2..=2 {
+            for x in -2..=2 {
+                let pos = ChunkPos::new(x, z);
+                let holder = holder_with_section(pos, ChunkSection::new_empty());
+                initialize_holder_light(&holder);
+                if pos == stale_neighbor {
+                    stale_holder = Some(Arc::clone(&holder));
+                }
+                holders.push((pos, holder));
+            }
+        }
+        let Some(stale_holder) = stale_holder else {
+            panic!("stale neighbor holder should be created");
+        };
+
+        set_visible_block_light(&stale_holder, 0, 1, 1, 1, 7);
+
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Full,
+            true,
+            |pos| {
+                holders
+                    .iter()
+                    .find(|(holder_pos, _)| *holder_pos == pos)
+                    .map(|(_, holder)| Arc::clone(holder))
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept cached test chunks");
+        };
+
+        let Ok(result) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
+        else {
+            panic!("matching block caches should run block chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(
+            stale_neighbor.0.x,
+            0,
+            stale_neighbor.0.y
+        )));
+        let Some(chunk) = stale_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("stale neighbor chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.block.nibble(0) else {
+            panic!("stale neighbor block nibble should exist");
+        };
+
+        assert_eq!(nibble.visible_state(), LightNibbleState::Hidden);
+    }
+
+    #[test]
     fn block_light_chunk_seeds_center_sources() {
         init_tests();
         let center = ChunkPos::new(0, 0);
@@ -1122,12 +1309,11 @@ mod tests {
             panic!("relaxed setup should accept missing neighbors");
         };
 
-        let Ok(result) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
+        let Ok(_result) =
+            propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
         else {
             panic!("matching block caches should run block chunk lighting");
         };
-
-        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
 
         let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
             panic!("test chunk should be available");
@@ -1176,12 +1362,11 @@ mod tests {
             panic!("relaxed setup should accept missing neighbors");
         };
 
-        let Ok(result) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
+        let Ok(_result) =
+            propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
         else {
             panic!("matching block caches should run block chunk lighting");
         };
-
-        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
 
         let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
             panic!("test chunk should be available");

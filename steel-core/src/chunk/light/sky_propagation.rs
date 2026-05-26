@@ -89,7 +89,8 @@ pub fn propagate_sky_light_chunk(
                 {
                     let mut context =
                         SkyLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
-                    context.initialize_unlit_chunk_nibbles(layout.center_chunk());
+                    context.reset_center_chunk_nibbles();
+                    context.handle_unlit_empty_section_changes(layout.center_chunk());
                     context.light_chunk(layout.center_chunk(), edge_checks);
                 }
 
@@ -185,13 +186,18 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
     }
 
     /// Initializes the sky nibbles required around non-empty center sections.
-    pub fn initialize_unlit_chunk_nibbles(&mut self, chunk_pos: ChunkPos) {
+    pub fn handle_unlit_empty_section_changes(&mut self, chunk_pos: ChunkPos) {
+        self.initialize_unlit_chunk_nibbles(chunk_pos);
+        self.deinit_and_lazy_init_empty_sections(chunk_pos);
+    }
+
+    fn initialize_unlit_chunk_nibbles(&mut self, chunk_pos: ChunkPos) {
         for section_y in (self.layout.range().min_chunk_section_y()
             ..self.layout.range().max_chunk_section_y_exclusive())
             .rev()
         {
             let section_pos = SectionPos::new(chunk_pos.0.x, section_y, chunk_pos.0.y);
-            if !self.sections.has_non_empty_section(section_pos) {
+            if !self.section_is_non_empty(section_pos) {
                 continue;
             }
 
@@ -211,6 +217,79 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                 }
             }
         }
+    }
+
+    fn deinit_and_lazy_init_empty_sections(&mut self, chunk_pos: ChunkPos) {
+        for offset_z in -1..=1 {
+            for offset_x in -1..=1 {
+                let target_chunk =
+                    ChunkPos::new(chunk_pos.0.x + offset_x, chunk_pos.0.y + offset_z);
+                let neighbours_loaded = self.chunk_neighborhood_has_emptiness_maps(target_chunk);
+
+                for section_y in (self.layout.range().min_section_y()
+                    ..self.layout.range().max_section_y_exclusive())
+                    .rev()
+                {
+                    let section_pos =
+                        SectionPos::new(target_chunk.0.x, section_y, target_chunk.0.y);
+                    let all_empty = self.section_neighborhood_all_empty(target_chunk, section_y);
+                    if all_empty && neighbours_loaded {
+                        self.light.set_section_null(section_pos);
+                    } else if !all_empty {
+                        self.init_nibble(section_pos, (offset_x | offset_z) != 0);
+                    }
+                }
+            }
+        }
+    }
+
+    fn chunk_neighborhood_has_emptiness_maps(&self, chunk_pos: ChunkPos) -> bool {
+        for offset_z in -1..=1 {
+            for offset_x in -1..=1 {
+                let neighbor = ChunkPos::new(chunk_pos.0.x + offset_x, chunk_pos.0.y + offset_z);
+                if !self.light.has_emptiness_map(neighbor) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn section_neighborhood_all_empty(&self, chunk_pos: ChunkPos, section_y: i32) -> bool {
+        for offset_y in -1..=1 {
+            let neighbor_y = section_y + offset_y;
+            if neighbor_y < self.layout.range().min_chunk_section_y()
+                || neighbor_y >= self.layout.range().max_chunk_section_y_exclusive()
+            {
+                continue;
+            }
+
+            for offset_z in -1..=1 {
+                for offset_x in -1..=1 {
+                    let section_pos = SectionPos::new(
+                        chunk_pos.0.x + offset_x,
+                        neighbor_y,
+                        chunk_pos.0.y + offset_z,
+                    );
+                    if let Some(empty) = self.light.section_empty(section_pos) {
+                        if !empty {
+                            return false;
+                        }
+                    } else if self.sections.has_non_empty_section(section_pos) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Resets the center chunk to ScalableLux's fresh all-null lighting state.
+    pub fn reset_center_chunk_nibbles(&mut self) {
+        self.light
+            .reset_chunk_nibbles_to_null(self.layout.center_chunk());
     }
 
     /// Runs sky chunk lighting with the selected ScalableLux edge-check mode.
@@ -410,7 +489,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
             .rev()
         {
             let candidate = SectionPos::new(section_pos.x(), section_y, section_pos.z());
-            if self.sections.has_non_empty_section(candidate) {
+            if self.section_is_non_empty(candidate) {
                 highest_non_empty_section = section_y;
                 break;
             }
@@ -425,6 +504,14 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         } else {
             self.light.set_section_non_null(section_pos);
         }
+    }
+
+    fn section_is_non_empty(&self, section_pos: SectionPos) -> bool {
+        if let Some(empty) = self.light.section_empty(section_pos) {
+            return !empty;
+        }
+
+        self.sections.has_non_empty_section(section_pos)
     }
 
     fn check_null_section(
@@ -1217,7 +1304,7 @@ mod tests {
     use crate::chunk::{
         chunk_access::{ChunkAccess, ChunkStatus},
         chunk_holder::ChunkHolder,
-        light::{LightCacheSetupRadius, LightSectionRange, LightWorkset},
+        light::{LightCacheSetupRadius, LightNibbleState, LightSectionRange, LightWorkset},
         proto_chunk::ProtoChunk,
         section::{ChunkSection, Sections},
     };
@@ -1240,6 +1327,13 @@ mod tests {
         let holder = Arc::new(ChunkHolder::new(pos, 0, 0, 16));
         holder.insert_chunk(ChunkAccess::Proto(proto), ChunkStatus::Light);
         holder
+    }
+
+    fn initialize_holder_light(holder: &ChunkHolder) {
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        chunk.initialize_light_sources();
     }
 
     fn holder_with_sections(pos: ChunkPos, sections: Vec<ChunkSection>) -> Arc<ChunkHolder> {
@@ -1400,6 +1494,137 @@ mod tests {
 
         assert_eq!(nibble.get_visible_at_index(under_roof.local_index), 0);
         assert_eq!(nibble.get_visible_at_index(roof.local_index), 0);
+    }
+
+    #[test]
+    fn sky_light_chunk_resets_stale_center_nibbles_before_lighting() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let mut section = ChunkSection::new_empty();
+        for z in 0..16 {
+            for x in 0..16 {
+                section.set_block_state(x, 15, z, vanilla_blocks::STONE.default_state());
+            }
+        }
+        let holder = holder_with_section(center, section);
+        let layout = LightCacheLayout::new(center, range());
+
+        {
+            let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+                panic!("test chunk should be available");
+            };
+            let mut light = chunk.light_mut();
+            let Some(nibble) = light.sky.nibble_mut(0) else {
+                panic!("test sky nibble should exist");
+            };
+            nibble.fill(MAX_LIGHT_LEVEL);
+            assert!(nibble.update_visible());
+        }
+
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required)
+        else {
+            panic!("matching sky caches should run sky chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("test sky nibble should exist");
+        };
+        let Some(under_roof) = layout.cached_block(BlockPos::new(8, 14, 8)) else {
+            panic!("under-roof block should be cached");
+        };
+        let Some(roof) = layout.cached_block(BlockPos::new(8, 15, 8)) else {
+            panic!("roof block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(under_roof.local_index), 0);
+        assert_eq!(nibble.get_visible_at_index(roof.local_index), 0);
+    }
+
+    #[test]
+    fn sky_light_chunk_deinitializes_loaded_empty_neighbor_sections() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let stale_neighbor = ChunkPos::new(1, 0);
+        let mut holders = Vec::new();
+        let mut stale_holder = None;
+        for z in -2..=2 {
+            for x in -2..=2 {
+                let pos = ChunkPos::new(x, z);
+                let holder = holder_with_section(pos, ChunkSection::new_empty());
+                initialize_holder_light(&holder);
+                if pos == stale_neighbor {
+                    stale_holder = Some(Arc::clone(&holder));
+                }
+                holders.push((pos, holder));
+            }
+        }
+        let Some(stale_holder) = stale_holder else {
+            panic!("stale neighbor holder should be created");
+        };
+
+        {
+            let Some(chunk) = stale_holder.try_chunk(ChunkStatus::Empty) else {
+                panic!("stale neighbor chunk should be available");
+            };
+            let mut light = chunk.light_mut();
+            let Some(nibble) = light.sky.nibble_mut(0) else {
+                panic!("stale neighbor sky nibble should exist");
+            };
+            nibble.fill(MAX_LIGHT_LEVEL);
+            assert!(nibble.update_visible());
+        }
+
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Full,
+            true,
+            |pos| {
+                holders
+                    .iter()
+                    .find(|(holder_pos, _)| *holder_pos == pos)
+                    .map(|(_, holder)| Arc::clone(holder))
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept cached test chunks");
+        };
+
+        let Ok(result) = propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required)
+        else {
+            panic!("matching sky caches should run sky chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(
+            stale_neighbor.0.x,
+            0,
+            stale_neighbor.0.y
+        )));
+        let Some(chunk) = stale_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("stale neighbor chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("stale neighbor sky nibble should exist");
+        };
+
+        assert_eq!(nibble.visible_state(), LightNibbleState::Null);
     }
 
     #[test]

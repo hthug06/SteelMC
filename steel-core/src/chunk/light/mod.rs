@@ -641,6 +641,29 @@ mod tests {
     }
 
     #[test]
+    fn chunk_light_update_packet_sends_empty_sky_for_dark_light_only_sections() {
+        let Ok(mut light) = ChunkLightData::new(0, 48) else {
+            panic!("valid three-section height rejected");
+        };
+        let emptiness = vec![true, true, false].into_boxed_slice();
+        light
+            .sky
+            .set_emptiness_map(emptiness)
+            .expect("matching sky emptiness map length should be accepted");
+        light
+            .block
+            .set_emptiness_map(vec![true, true, false].into_boxed_slice())
+            .expect("matching block emptiness map length should be accepted");
+
+        let packet = build_chunk_light_update_packet(&light);
+
+        assert_eq!(packet.empty_sky_y_mask.0[0] & (1 << 2), 1 << 2);
+        assert_eq!(packet.empty_sky_y_mask.0[0] & (1 << 4), 0);
+        assert_eq!(packet.sky_y_mask.0[0], 0);
+        assert!(packet.sky_updates.is_empty());
+    }
+
+    #[test]
     fn new_layer_is_homogeneous_zero() {
         let layer = DataLayer::new();
 

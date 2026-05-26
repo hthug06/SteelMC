@@ -558,6 +558,17 @@ impl ChunkLightLayerStorage {
         &mut self.nibbles
     }
 
+    /// Replaces every light-section nibble with a fresh null nibble.
+    ///
+    /// ScalableLux does this for the center chunk before first lighting it via
+    /// `StarLightEngine.getFilledEmptyLight`, so neighbor-initialized data from
+    /// earlier chunk passes cannot become the center chunk's canonical light.
+    pub fn reset_nibbles_to_null(&mut self) {
+        for nibble in &mut self.nibbles {
+            *nibble = LightNibbleArray::null();
+        }
+    }
+
     /// Returns the visible light value for one block position.
     #[must_use]
     pub fn get_light_value(&self, block_pos: BlockPos) -> u8 {
