@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use steel_registry::{REGISTRY, vanilla_blocks};
-use steel_utils::{BlockStateId, ChunkPos};
+use steel_utils::{BlockStateId, ChunkPos, SectionPos};
 
 use crate::chunk::{
     chunk_access::{ChunkAccess, ChunkStatus},
@@ -13,7 +13,7 @@ use crate::chunk::{
 use super::{
     CachedLightBlock, CachedLightChunk, ChunkLightData, ChunkLightLayerStorage,
     LightCacheChunkScope, LightCacheLayout, LightCacheSetupRadius, LightChunkSlotArray, LightLayer,
-    LightNibbleArray, LightSectionSlotArray,
+    LightNibbleArray, LightSectionSlotArray, LightUpdateNotificationCache,
 };
 
 /// Error returned when a scoped light cache cannot acquire required chunks.
@@ -369,15 +369,28 @@ impl LightLayerWriteCache<'_> {
         true
     }
 
-    /// Publishes every dirty cached nibble and returns the number updated.
-    pub fn update_visible(&mut self) -> usize {
+    /// Publishes dirty or explicitly notified cached nibbles.
+    ///
+    /// Calls `on_update` once for every section whose visible data changed or
+    /// was explicitly marked for update, then returns the number of callbacks.
+    pub fn update_visible(
+        &mut self,
+        notifications: Option<&LightUpdateNotificationCache>,
+        mut on_update: impl FnMut(SectionPos),
+    ) -> usize {
+        debug_assert!(notifications.is_none_or(|cache| cache.layout() == self.layout));
         let mut updated = 0;
 
         for section_slot in 0..self.nibbles.slot_count() {
-            let Some(nibble) = self.nibble_mut(section_slot) else {
-                continue;
-            };
-            if nibble.update_visible() {
+            let marked =
+                notifications.is_some_and(|cache| cache.is_marked_section_slot(section_slot));
+            let dirty = self
+                .nibble_mut(section_slot)
+                .is_some_and(LightNibbleArray::update_visible);
+            if (dirty || marked)
+                && let Some(section_pos) = self.layout.section_pos_for_slot(section_slot)
+            {
+                on_update(section_pos);
                 updated += 1;
             }
         }
@@ -425,7 +438,7 @@ mod tests {
     use std::sync::{Arc, Weak};
 
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
-    use steel_utils::BlockPos;
+    use steel_utils::{BlockPos, SectionPos};
 
     use super::*;
     use crate::behavior::init_behaviors;
@@ -577,8 +590,16 @@ mod tests {
                 assert_eq!(light_cache.get_updating(cached_block), 0);
                 assert!(light_cache.set(cached_block, 12));
                 assert_eq!(light_cache.get_updating(cached_block), 12);
-                assert_eq!(light_cache.update_visible(), 1);
-                assert_eq!(light_cache.update_visible(), 0);
+
+                let mut updated_sections = Vec::new();
+                assert_eq!(
+                    light_cache.update_visible(None, |section_pos| {
+                        updated_sections.push(section_pos);
+                    }),
+                    1
+                );
+                assert_eq!(updated_sections, vec![SectionPos::new(0, 0, 0)]);
+                assert_eq!(light_cache.update_visible(None, |_| {}), 0);
             });
 
             chunk_cache.with_light_write_cache(LightLayer::Sky, |light_cache| {
@@ -608,6 +629,39 @@ mod tests {
             7
         );
         assert_eq!(sky_nibble.get_visible_at_index(cached_block.local_index), 0);
+    }
+
+    #[test]
+    fn light_write_cache_publishes_explicit_notifications() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let holder = holder_with_section(center, ChunkSection::new_empty());
+        set_nibble_non_null(&holder, LightLayer::Block, 0);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+        let mut notifications = LightUpdateNotificationCache::new(layout);
+        assert!(notifications.mark_section(SectionPos::new(0, 0, 0)));
+
+        workset.with_chunk_read_cache(|chunk_cache| {
+            chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
+                let mut updated_sections = Vec::new();
+                assert_eq!(
+                    light_cache.update_visible(Some(&notifications), |section_pos| {
+                        updated_sections.push(section_pos);
+                    }),
+                    1
+                );
+                assert_eq!(updated_sections, vec![SectionPos::new(0, 0, 0)]);
+            });
+        });
     }
 
     #[test]
