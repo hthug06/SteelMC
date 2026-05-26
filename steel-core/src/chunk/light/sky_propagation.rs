@@ -37,6 +37,15 @@ pub struct SkyLightUpdateResult {
     pub updated_sections: Vec<SectionPos>,
 }
 
+/// Whether chunk sky-light generation must validate edge consistency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkyLightChunkEdgeChecks {
+    /// Seed skylight and validate this chunk's horizontal edges against neighbors.
+    Required,
+    /// Trust existing neighboring light and pull initialized edge levels inward.
+    Skipped,
+}
+
 /// Seeds and propagates sky light for the center chunk without edge checks.
 ///
 /// This matches ScalableLux `SkyStarLightEngine.lightChunk` for the
@@ -46,6 +55,19 @@ pub struct SkyLightUpdateResult {
 /// dirty visible nibbles are published.
 pub fn propagate_sky_light_chunk_without_edge_checks(
     workset: &LightWorkset,
+) -> Result<SkyLightUpdateResult, SkyLightPropagationContextError> {
+    propagate_sky_light_chunk(workset, SkyLightChunkEdgeChecks::Skipped)
+}
+
+/// Seeds and propagates sky light for the center chunk of a scoped workset.
+///
+/// This matches ScalableLux `SkyStarLightEngine.lightChunk`: sky nibbles around
+/// non-empty sections are initialized, full skylight is propagated downward,
+/// then the caller chooses between validating edge consistency or pulling
+/// already-initialized neighbor levels inward.
+pub fn propagate_sky_light_chunk(
+    workset: &LightWorkset,
+    edge_checks: SkyLightChunkEdgeChecks,
 ) -> Result<SkyLightUpdateResult, SkyLightPropagationContextError> {
     workset.with_chunk_read_cache(|chunk_cache| {
         let layout = chunk_cache.layout();
@@ -68,7 +90,7 @@ pub fn propagate_sky_light_chunk_without_edge_checks(
                     let mut context =
                         SkyLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
                     context.initialize_unlit_chunk_nibbles(layout.center_chunk());
-                    context.light_chunk_without_edge_checks(layout.center_chunk());
+                    context.light_chunk(layout.center_chunk(), edge_checks);
                 }
 
                 let mut updated_sections = Vec::new();
@@ -151,8 +173,8 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         }
     }
 
-    /// Runs the no-edge-check sky chunk path.
-    pub fn light_chunk_without_edge_checks(&mut self, chunk_pos: ChunkPos) {
+    /// Runs sky chunk lighting with the selected ScalableLux edge-check mode.
+    pub fn light_chunk(&mut self, chunk_pos: ChunkPos, edge_checks: SkyLightChunkEdgeChecks) {
         let min_section = self.layout.range().min_chunk_section_y();
         let mut highest_non_empty_section = self.layout.range().max_chunk_section_y_exclusive() - 1;
 
@@ -188,15 +210,109 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
             }
         }
 
-        for section_y in (self.layout.range().min_section_y()..=highest_non_empty_section).rev() {
-            self.check_null_section(chunk_pos, section_y, false);
+        match edge_checks {
+            SkyLightChunkEdgeChecks::Required => {
+                self.perform_light_increase();
+                for section_y in
+                    (self.layout.range().min_section_y()..=highest_non_empty_section).rev()
+                {
+                    self.check_null_section(chunk_pos, section_y, true);
+                }
+                self.check_chunk_edges(
+                    chunk_pos,
+                    self.layout.range().min_section_y(),
+                    highest_non_empty_section,
+                );
+            }
+            SkyLightChunkEdgeChecks::Skipped => {
+                for section_y in
+                    (self.layout.range().min_section_y()..=highest_non_empty_section).rev()
+                {
+                    self.check_null_section(chunk_pos, section_y, false);
+                }
+                self.propagate_neighbor_levels(
+                    chunk_pos,
+                    self.layout.range().min_section_y(),
+                    highest_non_empty_section,
+                );
+                self.perform_light_increase();
+            }
         }
-        self.propagate_neighbor_levels(
-            chunk_pos,
-            self.layout.range().min_section_y(),
-            highest_non_empty_section,
+    }
+
+    /// Handles one sky-light opacity change, matching ScalableLux `checkBlock`.
+    ///
+    /// Returns false when the changed block is outside this cache window.
+    pub fn check_block(&mut self, block_pos: BlockPos) -> bool {
+        let Some(cached_block) = self.layout.cached_block(block_pos) else {
+            return false;
+        };
+
+        let current_level = self.light.get_updating(cached_block);
+        if current_level == MAX_LIGHT_LEVEL {
+            self.enqueue_increase(
+                block_pos.x(),
+                block_pos.y(),
+                block_pos.z(),
+                current_level,
+                LightDirectionSet::all(),
+                LightQueueFlags::EMPTY.with(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS),
+            );
+        } else {
+            self.light.set(cached_block, 0);
+        }
+
+        self.enqueue_decrease(
+            block_pos,
+            current_level,
+            LightDirectionSet::all(),
+            LightQueueFlags::EMPTY,
         );
-        self.perform_light_increase();
+        true
+    }
+
+    /// Calculates the sky-light value that should exist at `block_pos`.
+    ///
+    /// Returns `None` when the position is outside this cache window.
+    #[must_use]
+    pub fn calculate_light_value(&self, block_pos: BlockPos, expect: u8) -> Option<u8> {
+        if expect == MAX_LIGHT_LEVEL {
+            return Some(expect);
+        }
+
+        let cached_block = self.layout.cached_block(block_pos)?;
+        let center_state = self.sections.get_block_state(cached_block);
+        let opacity = get_light_opacity(center_state);
+        let mut level = 0;
+
+        for axis_direction in LightAxisDirection::ALL {
+            let neighbor_pos = Self::offset(block_pos, axis_direction);
+            let Some(neighbor_block) = self.layout.cached_block(neighbor_pos) else {
+                continue;
+            };
+            let neighbor_level = self.light.get_updating(neighbor_block);
+            if neighbor_level.saturating_sub(1) <= level {
+                continue;
+            }
+
+            let neighbor_state = self.sections.get_block_state(neighbor_block);
+            if get_light_block_into(
+                neighbor_state,
+                center_state,
+                axis_direction.opposite().direction(),
+                opacity,
+            ) == LIGHT_BLOCKED
+            {
+                continue;
+            }
+
+            level = level.max(neighbor_level.saturating_sub(opacity));
+            if level > expect {
+                return Some(level);
+            }
+        }
+
+        Some(level)
     }
 
     fn init_nibble(&mut self, section_pos: SectionPos, extrude: bool) {
@@ -479,6 +595,131 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         }
     }
 
+    fn check_chunk_edges(&mut self, chunk_pos: ChunkPos, from_section: i32, to_section: i32) {
+        for section_y in (from_section..=to_section).rev() {
+            self.check_chunk_edge(chunk_pos, section_y);
+        }
+
+        self.perform_light_decrease();
+    }
+
+    fn check_chunk_edge(&mut self, chunk_pos: ChunkPos, section_y: i32) {
+        let current_section_pos = SectionPos::new(chunk_pos.0.x, section_y, chunk_pos.0.y);
+        if !self.light.has_non_null_section(current_section_pos) {
+            return;
+        }
+
+        for direction in LightAxisDirection::HORIZONTAL {
+            let (neighbor_offset_x, _, neighbor_offset_z) = direction.offset();
+            let neighbor_chunk_pos = ChunkPos::new(
+                chunk_pos.0.x + neighbor_offset_x,
+                chunk_pos.0.y + neighbor_offset_z,
+            );
+            let neighbor_section_pos =
+                SectionPos::new(neighbor_chunk_pos.0.x, section_y, neighbor_chunk_pos.0.y);
+            if !self.light.has_non_null_section(neighbor_section_pos) {
+                continue;
+            }
+            if !self
+                .light
+                .is_section_initialized_updating(current_section_pos)
+                && !self
+                    .light
+                    .is_section_initialized_updating(neighbor_section_pos)
+            {
+                continue;
+            }
+
+            self.check_chunk_edge_direction(chunk_pos, neighbor_chunk_pos, section_y, direction);
+        }
+    }
+
+    fn check_chunk_edge_direction(
+        &mut self,
+        chunk_pos: ChunkPos,
+        neighbor_chunk_pos: ChunkPos,
+        section_y: i32,
+        direction: LightAxisDirection,
+    ) {
+        let (neighbor_offset_x, _, neighbor_offset_z) = direction.offset();
+        let (increment_x, increment_z, start_x, start_z) =
+            Self::current_edge_scan(chunk_pos, direction);
+        let mut center_delayed_checks = [0usize; 16 * 16];
+        let mut neighbor_delayed_checks = [0usize; 16 * 16];
+        let mut center_delayed_check_count = 0;
+        let mut neighbor_delayed_check_count = 0;
+
+        let min_y = section_y << 4;
+        let max_y = min_y | 15;
+        for y in min_y..=max_y {
+            let mut x = start_x;
+            let mut z = start_z;
+            for _ in 0..16 {
+                let current_pos = BlockPos::new(x, y, z);
+                let neighbor_pos = BlockPos::new(x + neighbor_offset_x, y, z + neighbor_offset_z);
+                let Some(current_block) = self.layout.cached_block(current_pos) else {
+                    x += increment_x;
+                    z += increment_z;
+                    continue;
+                };
+                let Some(neighbor_block) = self.layout.cached_block(neighbor_pos) else {
+                    x += increment_x;
+                    z += increment_z;
+                    continue;
+                };
+
+                let current_level = self.light.get_updating(current_block);
+                if self
+                    .calculate_light_value(current_pos, current_level)
+                    .is_some_and(|calculated| calculated != current_level)
+                {
+                    center_delayed_checks[center_delayed_check_count] = current_block.local_index;
+                    center_delayed_check_count += 1;
+                }
+
+                let neighbor_level = self.light.get_updating(neighbor_block);
+                if self
+                    .calculate_light_value(neighbor_pos, neighbor_level)
+                    .is_some_and(|calculated| calculated != neighbor_level)
+                {
+                    neighbor_delayed_checks[neighbor_delayed_check_count] =
+                        neighbor_block.local_index;
+                    neighbor_delayed_check_count += 1;
+                }
+
+                x += increment_x;
+                z += increment_z;
+            }
+        }
+
+        let current_chunk_offset_x = chunk_pos.0.x << 4;
+        let current_chunk_offset_z = chunk_pos.0.y << 4;
+        let neighbor_chunk_offset_x = neighbor_chunk_pos.0.x << 4;
+        let neighbor_chunk_offset_z = neighbor_chunk_pos.0.y << 4;
+        let chunk_offset_y = section_y << 4;
+        let delayed_check_count = center_delayed_check_count.max(neighbor_delayed_check_count);
+        for delayed_check_index in 0..delayed_check_count {
+            if delayed_check_index < center_delayed_check_count {
+                let local_index = center_delayed_checks[delayed_check_index];
+                self.check_block(Self::block_pos_from_local_index(
+                    current_chunk_offset_x,
+                    chunk_offset_y,
+                    current_chunk_offset_z,
+                    local_index,
+                ));
+            }
+            if delayed_check_index < neighbor_delayed_check_count {
+                let local_index = neighbor_delayed_checks[delayed_check_index];
+                self.check_block(Self::block_pos_from_local_index(
+                    neighbor_chunk_offset_x,
+                    chunk_offset_y,
+                    neighbor_chunk_offset_z,
+                    local_index,
+                ));
+            }
+        }
+    }
+
     fn perform_light_increase(&mut self) {
         while let Some(entry) = self.queues.dequeue_increase() {
             let Some(source_block) = self.cached_block_from_entry(entry) else {
@@ -539,6 +780,67 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         }
     }
 
+    fn perform_light_decrease(&mut self) {
+        while let Some(entry) = self.queues.dequeue_decrease() {
+            let Some(source_block) = self.cached_block_from_entry(entry) else {
+                continue;
+            };
+            let source_state = if entry.has_sided_transparent_blocks() {
+                Some(self.sections.get_block_state(source_block))
+            } else {
+                None
+            };
+
+            for axis_direction in entry.directions().directions() {
+                let neighbor_pos = Self::offset(source_block.block_pos, axis_direction);
+                let Some(neighbor_block) = self.layout.cached_block(neighbor_pos) else {
+                    continue;
+                };
+                if !self.light.has_non_null_updating(neighbor_block) {
+                    continue;
+                }
+                let current_level = self.light.get_updating(neighbor_block);
+                if current_level == 0 {
+                    continue;
+                }
+
+                let neighbor_state = self.sections.get_block_state(neighbor_block);
+                let Some((target_level, flags)) = Self::target_level_saturating(
+                    entry.level(),
+                    source_state,
+                    neighbor_state,
+                    axis_direction.direction(),
+                ) else {
+                    continue;
+                };
+
+                if current_level > target_level {
+                    self.enqueue_increase(
+                        neighbor_pos.x(),
+                        neighbor_pos.y(),
+                        neighbor_pos.z(),
+                        current_level,
+                        LightDirectionSet::all(),
+                        flags.with(LightQueueFlags::RECHECK_LEVEL),
+                    );
+                    continue;
+                }
+
+                self.light.set(neighbor_block, 0);
+                if target_level > 0 {
+                    self.enqueue_decrease(
+                        neighbor_pos,
+                        target_level,
+                        LightDirectionSet::all_except_opposite(axis_direction),
+                        flags,
+                    );
+                }
+            }
+        }
+
+        self.perform_light_increase();
+    }
+
     fn target_level(
         propagated_level: u8,
         source_state: Option<steel_utils::BlockStateId>,
@@ -559,8 +861,47 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         Some((propagated_level - opacity, Self::shape_flags(target_state)))
     }
 
+    fn target_level_saturating(
+        propagated_level: u8,
+        source_state: Option<steel_utils::BlockStateId>,
+        target_state: steel_utils::BlockStateId,
+        direction: Direction,
+    ) -> Option<(u8, LightQueueFlags)> {
+        let source_state = source_state.unwrap_or_else(Self::air);
+        let opacity = get_light_block_into(
+            source_state,
+            target_state,
+            direction,
+            get_light_opacity(target_state),
+        );
+        if opacity == LIGHT_BLOCKED {
+            return None;
+        }
+
+        Some((
+            propagated_level.saturating_sub(opacity),
+            Self::shape_flags(target_state),
+        ))
+    }
+
     fn cached_block_from_entry(&self, entry: PackedLightQueueEntry) -> Option<CachedLightBlock> {
         self.layout.cached_block_from_packed(entry.block_pos())
+    }
+
+    fn enqueue_decrease(
+        &mut self,
+        block_pos: BlockPos,
+        level: u8,
+        directions: LightDirectionSet,
+        flags: LightQueueFlags,
+    ) {
+        let Some(packed_pos) = self.layout.encode_block_pos(block_pos) else {
+            return;
+        };
+        self.queues
+            .enqueue_decrease(PackedLightQueueEntry::from_parts(
+                packed_pos, level, directions, flags,
+            ));
     }
 
     fn enqueue_increase(
@@ -632,6 +973,19 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         (1, 0, chunk_pos.0.x << 4, start_z)
     }
 
+    fn block_pos_from_local_index(
+        chunk_offset_x: i32,
+        chunk_offset_y: i32,
+        chunk_offset_z: i32,
+        local_index: usize,
+    ) -> BlockPos {
+        BlockPos::new(
+            chunk_offset_x | (local_index & 15) as i32,
+            chunk_offset_y | (local_index >> 8) as i32,
+            chunk_offset_z | ((local_index >> 4) & 15) as i32,
+        )
+    }
+
     fn shape_flags(block_state: steel_utils::BlockStateId) -> LightQueueFlags {
         if light_occlusion_shape(block_state).is_empty() {
             LightQueueFlags::EMPTY
@@ -684,6 +1038,26 @@ mod tests {
         let holder = Arc::new(ChunkHolder::new(pos, 0, 0, 16));
         holder.insert_chunk(ChunkAccess::Proto(proto), ChunkStatus::Light);
         holder
+    }
+
+    fn set_visible_sky_light(
+        holder: &ChunkHolder,
+        section_y: i32,
+        x: usize,
+        y: usize,
+        z: usize,
+        level: u8,
+    ) {
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let mut light = chunk.light_mut();
+        let Some(nibble) = light.sky.nibble_mut(section_y) else {
+            panic!("test nibble should be inside light range");
+        };
+        nibble.set_non_null();
+        nibble.set(x, y, z, level);
+        assert!(nibble.update_visible());
     }
 
     #[test]
@@ -764,6 +1138,68 @@ mod tests {
         assert_eq!(nibble.get_visible_at_index(top_air.local_index), 15);
         assert_eq!(nibble.get_visible_at_index(lower_air.local_index), 15);
         assert_eq!(nibble.get_visible_at_index(stone.local_index), 0);
+    }
+
+    #[test]
+    fn sky_light_chunk_edge_checks_pull_neighbor_under_ceiling() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let east_chunk = ChunkPos::new(1, 0);
+        let mut center_section = ChunkSection::new_empty();
+        for z in 0..16 {
+            for x in 0..16 {
+                center_section.set_block_state(x, 15, z, vanilla_blocks::STONE.default_state());
+            }
+        }
+        let center_holder = holder_with_section(center, center_section);
+        let east_holder = holder_with_section(east_chunk, ChunkSection::new_empty());
+        set_visible_sky_light(&east_holder, 0, 0, 14, 1, 15);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&center_holder))
+                } else if pos == east_chunk {
+                    Some(Arc::clone(&east_holder))
+                } else {
+                    None
+                }
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required)
+        else {
+            panic!("matching sky caches should run sky chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+
+        let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(edge) = layout.cached_block(BlockPos::new(15, 14, 1)) else {
+            panic!("center edge should be cached");
+        };
+        let Some(inner) = layout.cached_block(BlockPos::new(14, 14, 1)) else {
+            panic!("center inner block should be cached");
+        };
+        let Some(blocked) = layout.cached_block(BlockPos::new(15, 15, 1)) else {
+            panic!("ceiling block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(edge.local_index), 14);
+        assert_eq!(nibble.get_visible_at_index(inner.local_index), 13);
+        assert_eq!(nibble.get_visible_at_index(blocked.local_index), 0);
     }
 
     #[test]

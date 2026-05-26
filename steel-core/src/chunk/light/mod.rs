@@ -143,8 +143,8 @@ pub use section_storage::{
     LightSectionStateError, LightSectionType, MissingLightDataLayerError,
 };
 pub use sky_propagation::{
-    SkyLightPropagationContext, SkyLightPropagationContextError, SkyLightUpdateResult,
-    propagate_sky_light_chunk_without_edge_checks,
+    SkyLightChunkEdgeChecks, SkyLightPropagationContext, SkyLightPropagationContextError,
+    SkyLightUpdateResult, propagate_sky_light_chunk, propagate_sky_light_chunk_without_edge_checks,
 };
 pub use sky_sources::{ChunkSkyLightSources, SkyLightSourceNeighborhood};
 pub use workset::{
