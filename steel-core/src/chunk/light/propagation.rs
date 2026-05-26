@@ -1,11 +1,11 @@
 use steel_registry::{blocks::block_state_ext::BlockStateExt, vanilla_blocks};
-use steel_utils::{BlockPos, Direction};
+use steel_utils::{BlockPos, Direction, SectionPos};
 
 use super::{
     CachedLightBlock, LIGHT_BLOCKED, LightAxisDirection, LightCacheLayout, LightDirectionSet,
-    LightLayer, LightLayerWriteCache, LightQueueFlags, LightSectionReadCache, MAX_LIGHT_LEVEL,
-    PackedLightPropagationQueues, PackedLightQueueEntry, get_light_block_into, get_light_opacity,
-    light_occlusion_shape,
+    LightLayer, LightLayerWriteCache, LightQueueFlags, LightSectionReadCache, LightWorkset,
+    MAX_LIGHT_LEVEL, PackedLightPropagationQueues, PackedLightQueueEntry, get_light_block_into,
+    get_light_opacity, light_occlusion_shape,
 };
 
 /// Error returned when a block-light propagation context is built from mismatched caches.
@@ -23,6 +23,47 @@ pub enum BlockLightPropagationContextError {
         /// Layout used by the light cache.
         light_layout: LightCacheLayout,
     },
+}
+
+/// Sections whose visible block-light data changed during a scoped update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockLightUpdateResult {
+    /// Light sections that should be reported to the world/chunk update layer.
+    pub updated_sections: Vec<SectionPos>,
+}
+
+/// Runs ScalableLux-style block-light propagation for changed blocks in a scoped workset.
+///
+/// This is the block-light equivalent of ScalableLux `propagateBlockChanges`
+/// plus `updateVisible`: it assumes the caller already created a cache window
+/// around the affected chunk and will deliver returned section updates to the
+/// world/chunk notification layer.
+pub fn propagate_block_light_changes(
+    workset: &LightWorkset,
+    positions: impl IntoIterator<Item = BlockPos>,
+) -> Result<BlockLightUpdateResult, BlockLightPropagationContextError> {
+    workset.with_chunk_read_cache(|chunk_cache| {
+        chunk_cache.with_section_read_cache(|section_cache| {
+            chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
+                let mut queues = PackedLightPropagationQueues::new();
+
+                {
+                    let mut context =
+                        BlockLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
+                    for position in positions {
+                        context.check_block(position);
+                    }
+                    context.perform_light_decrease();
+                }
+
+                let mut updated_sections = Vec::new();
+                light_cache.update_visible(None, |section_pos| {
+                    updated_sections.push(section_pos);
+                });
+                Ok(BlockLightUpdateResult { updated_sections })
+            })
+        })
+    })
 }
 
 /// ScalableLux-style block-light propagation over scoped Steel light caches.
@@ -368,7 +409,7 @@ mod tests {
         test_support::init_test_registry,
         vanilla_blocks,
     };
-    use steel_utils::ChunkPos;
+    use steel_utils::{ChunkPos, types::UpdateFlags};
 
     use super::*;
     use crate::behavior::init_behaviors;
@@ -409,6 +450,26 @@ mod tests {
             panic!("test nibble should be inside light range");
         };
         nibble.set_non_null();
+    }
+
+    fn set_visible_block_light(
+        holder: &ChunkHolder,
+        section_y: i32,
+        x: usize,
+        y: usize,
+        z: usize,
+        level: u8,
+    ) {
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let mut light = chunk.light_mut();
+        let Some(nibble) = light.block.nibble_mut(section_y) else {
+            panic!("test nibble should be inside light range");
+        };
+        nibble.set_non_null();
+        nibble.set(x, y, z, level);
+        assert!(nibble.update_visible());
     }
 
     #[test]
@@ -495,6 +556,114 @@ mod tests {
                 });
             });
         });
+    }
+
+    #[test]
+    fn block_light_runner_publishes_visible_updates() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let source_pos = BlockPos::new(1, 1, 1);
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(1, 1, 1, vanilla_blocks::LIGHT.default_state());
+        let holder = holder_with_section(center, section);
+        set_block_nibble_non_null(&holder, 0);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_block_light_changes(&workset, [source_pos]) else {
+            panic!("matching block caches should run block light updates");
+        };
+
+        assert_eq!(result.updated_sections, vec![SectionPos::new(0, 0, 0)]);
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.block.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(source) = layout.cached_block(source_pos) else {
+            panic!("source should be cached");
+        };
+        let Some(east) = layout.cached_block(BlockPos::new(2, 1, 1)) else {
+            panic!("east neighbor should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(source.local_index), 15);
+        assert_eq!(nibble.get_visible_at_index(east.local_index), 14);
+    }
+
+    #[test]
+    fn block_light_runner_repropagates_after_opacity_decrease() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let source_pos = BlockPos::new(0, 1, 1);
+        let opened_pos = BlockPos::new(1, 1, 1);
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(0, 1, 1, vanilla_blocks::LIGHT.default_state());
+        section.set_block_state(1, 1, 1, vanilla_blocks::STONE.default_state());
+        let holder = holder_with_section(center, section);
+        set_visible_block_light(&holder, 0, 0, 1, 1, 15);
+        let layout = LightCacheLayout::new(center, range());
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        assert_eq!(
+            chunk.set_block_state(
+                opened_pos,
+                vanilla_blocks::AIR.default_state(),
+                UpdateFlags::UPDATE_NONE,
+            ),
+            Some(vanilla_blocks::STONE.default_state())
+        );
+        drop(chunk);
+
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_block_light_changes(&workset, [opened_pos]) else {
+            panic!("matching block caches should run block light updates");
+        };
+
+        assert_eq!(result.updated_sections, vec![SectionPos::new(0, 0, 0)]);
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.block.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(source) = layout.cached_block(source_pos) else {
+            panic!("source should be cached");
+        };
+        let Some(opened) = layout.cached_block(opened_pos) else {
+            panic!("opened block should be cached");
+        };
+        let Some(east) = layout.cached_block(BlockPos::new(2, 1, 1)) else {
+            panic!("east neighbor should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(source.local_index), 15);
+        assert_eq!(nibble.get_visible_at_index(opened.local_index), 14);
+        assert_eq!(nibble.get_visible_at_index(east.local_index), 13);
     }
 
     #[test]

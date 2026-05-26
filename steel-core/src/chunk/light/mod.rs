@@ -122,7 +122,10 @@ pub use nibble::{
     LightNibbleExtrudeNullSourceError, LightNibbleSaveState, LightNibbleState,
 };
 pub use packet::{build_chunk_light_update_packet, build_light_update_packet};
-pub use propagation::{BlockLightPropagationContext, BlockLightPropagationContextError};
+pub use propagation::{
+    BlockLightPropagationContext, BlockLightPropagationContextError, BlockLightUpdateResult,
+    propagate_block_light_changes,
+};
 pub(crate) use queue::{
     ADD_SKY_SOURCE_ENTRY, REMOVE_SKY_SOURCE_ENTRY, REMOVE_TOP_SKY_SOURCE_ENTRY,
 };
