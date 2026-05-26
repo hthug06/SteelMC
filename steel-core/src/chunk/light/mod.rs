@@ -135,7 +135,8 @@ pub use section_storage::{
 };
 pub use sky_sources::{ChunkSkyLightSources, SkyLightSourceNeighborhood};
 pub use workset::{
-    LightChunkReadCache, LightSectionReadCache, LightWorkset, LightWorksetSetupError,
+    LightChunkReadCache, LightLayerWriteCache, LightSectionReadCache, LightWorkset,
+    LightWorksetSetupError,
 };
 
 #[cfg(test)]
