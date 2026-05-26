@@ -224,7 +224,14 @@ impl Sections {
             let mut guard = self.sections[section_idx].write();
             while i < blocks.len() && blocks[i].0 / BlockPalette::SIZE == section_idx {
                 let (rel_y, value) = blocks[i];
-                guard.states.set(x, rel_y % BlockPalette::SIZE, z, value);
+                let new_counts = ChunkSection::block_state_section_counts(value);
+                guard.set_block_state_with_known_new_counts(
+                    x,
+                    rel_y % BlockPalette::SIZE,
+                    z,
+                    value,
+                    new_counts,
+                );
                 i += 1;
             }
         }
@@ -240,7 +247,14 @@ impl Sections {
             let mut guard = self.sections[section_idx].write();
             while i < blocks.len() && blocks[i].1 / BlockPalette::SIZE == section_idx {
                 let (x, rel_y, z, value) = blocks[i];
-                guard.states.set(x, rel_y % BlockPalette::SIZE, z, value);
+                let new_counts = ChunkSection::block_state_section_counts(value);
+                guard.set_block_state_with_known_new_counts(
+                    x,
+                    rel_y % BlockPalette::SIZE,
+                    z,
+                    value,
+                    new_counts,
+                );
                 i += 1;
             }
         }
@@ -259,10 +273,12 @@ impl Sections {
 
         let idx = relative_y / BlockPalette::SIZE;
         let relative_y = relative_y % BlockPalette::SIZE;
+        let new_counts = ChunkSection::block_state_section_counts(value);
         self.sections[idx]
             .write()
-            .states
-            .set(relative_x, relative_y, relative_z, value);
+            .set_block_state_with_known_new_counts(
+                relative_x, relative_y, relative_z, value, new_counts,
+            );
     }
 }
 
@@ -548,5 +564,75 @@ impl ChunkSection {
             .write(writer)
             .expect("Failed to write block states");
         self.biomes.write(writer).expect("Failed to write biomes");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use steel_registry::{REGISTRY, test_support::init_test_registry, vanilla_blocks};
+
+    use super::{ChunkSection, Sections};
+    use crate::behavior::init_behaviors;
+
+    fn init() {
+        init_test_registry();
+        init_behaviors();
+    }
+
+    #[test]
+    fn relative_block_writes_update_section_counts() {
+        init();
+        let sections = Sections::from_owned(vec![ChunkSection::new_empty()].into_boxed_slice());
+        let stone = vanilla_blocks::STONE.default_state();
+        let air = vanilla_blocks::AIR.default_state();
+
+        sections.set_relative_block(1, 2, 3, stone);
+        {
+            let section = sections.sections[0].read();
+            assert_eq!(section.non_empty_block_count(), 1);
+            assert!(!section.is_empty());
+        }
+
+        sections.set_relative_block(1, 2, 3, air);
+        let section = sections.sections[0].read();
+        assert_eq!(section.non_empty_block_count(), 0);
+        assert!(section.is_empty());
+    }
+
+    #[test]
+    fn batched_generation_writes_update_section_counts() {
+        init();
+        let sections = Sections::from_owned(
+            vec![ChunkSection::new_empty(), ChunkSection::new_empty()].into_boxed_slice(),
+        );
+        let stone = vanilla_blocks::STONE.default_state();
+        let water = REGISTRY.blocks.get_default_state_id(&vanilla_blocks::WATER);
+        let air = vanilla_blocks::AIR.default_state();
+
+        sections.write_block_batch(&[(1, 0, 1, stone), (2, 16, 2, water)]);
+        {
+            let lower = sections.sections[0].read();
+            assert_eq!(lower.non_empty_block_count(), 1);
+            assert_eq!(lower.fluid_count(), 0);
+            assert!(!lower.is_empty());
+        }
+        {
+            let upper = sections.sections[1].read();
+            assert_eq!(upper.non_empty_block_count(), 1);
+            assert_eq!(upper.fluid_count(), 1);
+            assert!(!upper.is_empty());
+        }
+
+        sections.write_column_blocks(1, 1, &[(0, air), (17, stone)]);
+        {
+            let lower = sections.sections[0].read();
+            assert_eq!(lower.non_empty_block_count(), 0);
+            assert_eq!(lower.fluid_count(), 0);
+            assert!(lower.is_empty());
+        }
+        let upper = sections.sections[1].read();
+        assert_eq!(upper.non_empty_block_count(), 2);
+        assert_eq!(upper.fluid_count(), 1);
+        assert!(!upper.is_empty());
     }
 }

@@ -465,7 +465,11 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                             section_y,
                             chunk_pos.0.y + offset_z,
                         ),
-                        (offset_x | offset_z) == 0 && extrude_initialized,
+                        if (offset_x | offset_z) == 0 {
+                            extrude_initialized
+                        } else {
+                            true
+                        },
                     );
                 }
             }
@@ -1336,6 +1340,52 @@ mod tests {
         assert_eq!(nibble.get_visible_at_index(top_air.local_index), 15);
         assert_eq!(nibble.get_visible_at_index(lower_air.local_index), 15);
         assert_eq!(nibble.get_visible_at_index(stone.local_index), 0);
+    }
+
+    #[test]
+    fn sky_light_chunk_without_edge_checks_keeps_sealed_roof_dark() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let mut section = ChunkSection::new_empty();
+        for z in 0..16 {
+            for x in 0..16 {
+                section.set_block_state(x, 15, z, vanilla_blocks::STONE.default_state());
+            }
+        }
+        let holder = holder_with_section(center, section);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_sky_light_chunk_without_edge_checks(&workset) else {
+            panic!("matching sky caches should run sky chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(under_roof) = layout.cached_block(BlockPos::new(8, 14, 8)) else {
+            panic!("under-roof block should be cached");
+        };
+        let Some(roof) = layout.cached_block(BlockPos::new(8, 15, 8)) else {
+            panic!("roof block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(under_roof.local_index), 0);
+        assert_eq!(nibble.get_visible_at_index(roof.local_index), 0);
     }
 
     #[test]

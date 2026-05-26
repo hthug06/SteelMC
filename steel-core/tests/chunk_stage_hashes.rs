@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{BufReader, Cursor, Read as IoRead};
 use std::mem;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -21,6 +22,8 @@ use steel_core::chunk::chunk_access::{ChunkAccess, ChunkStatus};
 use steel_core::chunk::chunk_generation_task::StaticCache2D;
 use steel_core::chunk::chunk_holder::ChunkHolder;
 use steel_core::chunk::chunk_pyramid::GENERATION_PYRAMID;
+use steel_core::chunk::chunk_request::{ChunkRequest, ChunkRequestState, ChunkTicketKind};
+use steel_core::chunk::light::{ChunkLightData, ChunkLightLayerStorage, LightLayer};
 use steel_core::chunk::proto_chunk::ProtoChunk;
 use steel_core::chunk::section::{ChunkSection, Sections};
 use steel_core::level_data::WorldGenerationSettings;
@@ -56,6 +59,10 @@ struct ChunkStageHashesJson {
     feature_hash_capture: Option<String>,
     #[serde(default)]
     hashset_iteration_order: Option<String>,
+    #[serde(default)]
+    light_hash_capture: Option<String>,
+    #[serde(default)]
+    light_hash_format: Option<String>,
     dimensions: FxHashMap<String, DimensionData>,
 }
 
@@ -87,9 +94,12 @@ const DEBUG_STAGE_ENV: &str = "STEEL_HASH_DEBUG_STAGE";
 const DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV: &str = "STEEL_HASH_STOP_AFTER_FIRST_MISMATCH";
 
 const FEATURE_STAGE: &str = "minecraft:features";
+const LIGHT_STAGE: &str = "minecraft:light";
 const CHUNK_GENERATION_ORDER_X_Z_ASCENDING: &str = "x_z_ascending";
 const FEATURE_HASH_CAPTURE_AFTER_ALL_READY: &str = "after_all_tracked_features_ready";
 const HASHSET_ITERATION_ORDER_INSERTION: &str = "insertion_order";
+const LIGHT_HASH_CAPTURE_AFTER_LIGHT_STATUS_READY: &str = "after_light_status_ready";
+const LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_v1";
 
 fn load_expected_hashes() -> ChunkStageHashesJson {
     let json_str = include_str!("../test_assets/chunk_stage_hashes.json");
@@ -296,6 +306,53 @@ fn compute_block_hash(sections: &Sections) -> String {
                     }
                 }
             }
+        }
+    }
+
+    format!("{:x}", ctx.finalize())
+}
+
+fn consume_i32(ctx: &mut md5::Context, value: i32) {
+    ctx.consume([(value >> 24) as u8]);
+    ctx.consume([(value >> 16) as u8]);
+    ctx.consume([(value >> 8) as u8]);
+    ctx.consume([value as u8]);
+}
+
+fn consume_light_layer_hash(ctx: &mut md5::Context, layer: &ChunkLightLayerStorage) {
+    for nibble in layer.nibbles() {
+        let Some(data_layer) = nibble.to_data_layer() else {
+            ctx.consume([0]);
+            continue;
+        };
+
+        if data_layer.is_empty() {
+            ctx.consume([1]);
+        } else {
+            ctx.consume([2]);
+            let bytes = data_layer.to_bytes();
+            ctx.consume(bytes.as_ref());
+        }
+    }
+}
+
+fn compute_light_hash(light: &ChunkLightData) -> String {
+    let mut ctx = md5::Context::new();
+    let range = light.sky.range();
+    let Ok(section_count) = i32::try_from(range.section_count()) else {
+        panic!("light section count does not fit in i32");
+    };
+
+    consume_i32(&mut ctx, range.min_section_y());
+    consume_i32(&mut ctx, section_count);
+    for layer in [LightLayer::Sky, LightLayer::Block] {
+        ctx.consume([match layer {
+            LightLayer::Sky => 0,
+            LightLayer::Block => 1,
+        }]);
+        match layer {
+            LightLayer::Sky => consume_light_layer_hash(&mut ctx, &light.sky),
+            LightLayer::Block => consume_light_layer_hash(&mut ctx, &light.block),
         }
     }
 
@@ -547,6 +604,23 @@ fn chunk_stage_hashes() {
     }
 }
 
+#[test]
+#[ignore = "This test takes too long to run for normal testing; run with --release"]
+fn chunk_light_hashes() {
+    use std::panic;
+    use std::thread;
+
+    let result = thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(chunk_light_hashes_inner)
+        .expect("Failed to spawn test thread")
+        .join();
+
+    if let Err(payload) = result {
+        panic::resume_unwind(payload);
+    }
+}
+
 /// Dimension order for deterministic test output (`HashMap` iteration is unordered).
 const DIMENSION_ORDER: &[&str] = &[
     "minecraft:overworld",
@@ -609,6 +683,207 @@ fn build_test_beardifier(
 
     let beardifier = Beardifier::for_structures_in_chunk(starts.iter().copied(), chunk_x, chunk_z);
     (!beardifier.is_empty()).then_some(beardifier)
+}
+
+fn drive_chunk_request(
+    world: &Arc<World>,
+    request: &steel_core::chunk::chunk_request::ChunkRequestHandle,
+    label: &str,
+) {
+    let runtime = Arc::clone(&world.chunk_map.chunk_runtime);
+    runtime.block_on(async {
+        for _ in 0..60_000 {
+            world.chunk_map.tick_scheduling();
+            match request.poll() {
+                ChunkRequestState::Ready => return,
+                ChunkRequestState::Cancelled => panic!("{label} chunk request was cancelled"),
+                ChunkRequestState::Pending { .. } => {}
+            }
+            world.chunk_map.tick_scheduling();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        panic!("{label} chunk request did not become ready");
+    });
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "large ignored regression test mirrors chunk_stage_hashes setup"
+)]
+fn chunk_light_hashes_inner() {
+    use steel_core::behavior::init_behaviors;
+    use steel_core::block_entity::init_block_entities;
+    use steel_core::entity::init_entities;
+    use steel_core::worldgen::{
+        BiomeSourceKind, EndGenerator, NetherGenerator, OverworldGenerator,
+    };
+    use steel_registry::{REGISTRY, Registry};
+
+    let mut registry = Registry::new_vanilla();
+    registry.freeze();
+    let _ = REGISTRY.init(registry);
+    init_behaviors();
+    init_block_entities();
+    init_entities();
+
+    let expected = load_expected_hashes();
+    assert_eq!(
+        expected.chunk_generation_order, CHUNK_GENERATION_ORDER_X_Z_ASCENDING,
+        "chunk light hash test only supports x/z ascending generation order"
+    );
+
+    let debug_dimension = debug_dimension_filter();
+    let debug_filter = debug_chunk_filter();
+    let stop_after_first_mismatch = env::var_os(DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV).is_some();
+    let mut saw_light_hashes = false;
+
+    for &dim_key in DIMENSION_ORDER {
+        if debug_dimension
+            .as_deref()
+            .is_some_and(|filter| filter != dim_key)
+        {
+            continue;
+        }
+        let Some(dim_data) = expected.dimensions.get(dim_key) else {
+            continue;
+        };
+
+        let mut stage_entries = dim_data
+            .chunks
+            .iter()
+            .filter(|entry| {
+                debug_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(&(entry.x, entry.z)))
+            })
+            .filter_map(|entry| {
+                entry
+                    .stages
+                    .get(LIGHT_STAGE)
+                    .map(|hash| (entry.x, entry.z, hash.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if stage_entries.is_empty() {
+            continue;
+        }
+        saw_light_hashes = true;
+        stage_entries.sort_unstable_by_key(|entry| (entry.0, entry.1));
+
+        assert_eq!(
+            expected.light_hash_capture.as_deref(),
+            Some(LIGHT_HASH_CAPTURE_AFTER_LIGHT_STATUS_READY),
+            "light hashes must be extracted after LIGHT status is ready; rerun the extractor"
+        );
+        assert_eq!(
+            expected.light_hash_format.as_deref(),
+            Some(LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1),
+            "light hashes must use the packet data-layer format; rerun the extractor"
+        );
+
+        let dim_short = dim_key.strip_prefix("minecraft:").unwrap_or(dim_key);
+        let dim_type = match dim_key {
+            "minecraft:overworld" => &vanilla_dimension_types::OVERWORLD,
+            "minecraft:the_nether" => &vanilla_dimension_types::THE_NETHER,
+            "minecraft:the_end" => &vanilla_dimension_types::THE_END,
+            _ => panic!("Unknown dimension: {dim_key}"),
+        };
+        let seed = expected.seed;
+        let generator: Arc<ChunkGeneratorType> = Arc::new(match dim_key {
+            "minecraft:overworld" => {
+                let source = BiomeSourceKind::overworld(seed);
+                ChunkGeneratorType::Overworld(OverworldGenerator::new(source, seed))
+            }
+            "minecraft:the_nether" => {
+                let source = BiomeSourceKind::nether(seed);
+                ChunkGeneratorType::Nether(NetherGenerator::new(source, seed))
+            }
+            "minecraft:the_end" => {
+                let source = BiomeSourceKind::end(seed);
+                ChunkGeneratorType::End(EndGenerator::new(source, seed))
+            }
+            _ => unreachable!(),
+        });
+        let world = create_test_world(dim_key, dim_type, seed, generator);
+        let positions = stage_entries
+            .iter()
+            .map(|(x, z, _)| ChunkPos::new(*x, *z))
+            .collect::<Vec<_>>();
+        let request = world.chunk_map.request_chunks(ChunkRequest {
+            status: ChunkStatus::Light,
+            positions,
+            ticket_kind: ChunkTicketKind::Command,
+        });
+
+        eprintln!(
+            "[{dim_short}/{LIGHT_STAGE}] requesting {} chunks to LIGHT",
+            stage_entries.len()
+        );
+        drive_chunk_request(&world, &request, dim_short);
+        let Some(ready_chunks) = request.ready_chunks() else {
+            panic!("{dim_short}/{LIGHT_STAGE}: request reported ready without ready chunks");
+        };
+
+        let mut actual_by_pos =
+            FxHashMap::with_capacity_and_hasher(ready_chunks.holders.len(), FxBuildHasher);
+        for holder in ready_chunks.holders {
+            let pos = holder.get_pos();
+            let Some(chunk) = holder.try_chunk(ChunkStatus::Light) else {
+                panic!("ready light chunk missing at ({}, {})", pos.0.x, pos.0.y);
+            };
+            let light = chunk.light();
+            actual_by_pos.insert((pos.0.x, pos.0.y), compute_light_hash(&light));
+        }
+
+        let total = stage_entries.len();
+        let mut mismatches = Vec::new();
+        for (i, (chunk_x, chunk_z, expected_hash)) in stage_entries.iter().copied().enumerate() {
+            let Some(actual_hash) = actual_by_pos.get(&(chunk_x, chunk_z)) else {
+                panic!("{dim_short}/{LIGHT_STAGE}: missing generated chunk ({chunk_x}, {chunk_z})");
+            };
+            let ok = actual_hash == expected_hash;
+            if (i + 1) % 10 == 0 || i + 1 == total || !ok {
+                let status = if ok { "OK" } else { "MISMATCH" };
+                eprintln!(
+                    "[{dim_short}/{LIGHT_STAGE}] ({chunk_x:3},{chunk_z:3}) {status} expected={expected_hash} actual={actual_hash}  [{}/{total}]",
+                    i + 1,
+                );
+            }
+
+            if !ok {
+                mismatches.push((
+                    chunk_x,
+                    chunk_z,
+                    expected_hash.to_owned(),
+                    actual_hash.to_owned(),
+                ));
+                if stop_after_first_mismatch {
+                    break;
+                }
+            }
+        }
+
+        if mismatches.is_empty() {
+            continue;
+        }
+
+        let failed = mismatches.len();
+        let mut msg =
+            format!("{dim_short}/{LIGHT_STAGE}: {failed}/{total} chunks do not match vanilla\n");
+        for (x, z, expected_hash, actual_hash) in &mismatches {
+            let _ = writeln!(
+                msg,
+                "  ({x:3},{z:3}): expected {expected_hash}, got {actual_hash}"
+            );
+        }
+        panic!("{msg}");
+    }
+
+    if !saw_light_hashes {
+        eprintln!(
+            "chunk_stage_hashes.json has no {LIGHT_STAGE} entries; skipping light hash regression"
+        );
+    }
 }
 
 #[expect(
