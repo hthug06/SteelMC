@@ -256,7 +256,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                 for section_y in
                     (self.layout.range().min_section_y()..=highest_non_empty_section).rev()
                 {
-                    self.check_null_section(chunk_pos, section_y, true);
+                    self.check_null_section(chunk_pos, section_y, false);
                 }
                 self.check_chunk_edges(
                     chunk_pos,
@@ -1242,6 +1242,20 @@ mod tests {
         holder
     }
 
+    fn holder_with_sections(pos: ChunkPos, sections: Vec<ChunkSection>) -> Arc<ChunkHolder> {
+        let height = (sections.len() * 16) as i32;
+        let proto = ProtoChunk::new(
+            Sections::from_owned(sections.into_boxed_slice()),
+            pos,
+            0,
+            height,
+            Weak::new(),
+        );
+        let holder = Arc::new(ChunkHolder::new(pos, 0, 0, height));
+        holder.insert_chunk(ChunkAccess::Proto(proto), ChunkStatus::Light);
+        holder
+    }
+
     fn set_visible_sky_light(
         holder: &ChunkHolder,
         section_y: i32,
@@ -1386,6 +1400,98 @@ mod tests {
 
         assert_eq!(nibble.get_visible_at_index(under_roof.local_index), 0);
         assert_eq!(nibble.get_visible_at_index(roof.local_index), 0);
+    }
+
+    #[test]
+    fn sky_light_chunk_edge_checks_do_not_extrude_center_null_sections() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let east = ChunkPos::new(1, 0);
+        let Ok(range) = LightSectionRange::from_world_height(0, 48) else {
+            panic!("test height should create a valid light range");
+        };
+        let layout = LightCacheLayout::new(center, range);
+
+        let lower = ChunkSection::new_empty();
+        let middle = ChunkSection::new_empty();
+        let mut upper = ChunkSection::new_empty();
+        for z in 0..16 {
+            for x in 0..16 {
+                upper.set_block_state(x, 0, z, vanilla_blocks::STONE.default_state());
+            }
+        }
+        let center_holder = holder_with_sections(center, vec![lower, middle, upper]);
+        let east_holder = holder_with_sections(
+            east,
+            vec![
+                ChunkSection::new_empty(),
+                ChunkSection::new_empty(),
+                ChunkSection::new_empty(),
+            ],
+        );
+
+        {
+            let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+                panic!("center test chunk should be available");
+            };
+            let mut light = chunk.light_mut();
+            let Some(nibble) = light.sky.nibble_mut(1) else {
+                panic!("middle sky nibble should exist");
+            };
+            nibble.set_non_null();
+            for z in 0..16 {
+                for x in 0..16 {
+                    nibble.set(x, 0, z, MAX_LIGHT_LEVEL);
+                }
+            }
+            assert!(nibble.update_visible());
+        }
+        {
+            let Some(chunk) = east_holder.try_chunk(ChunkStatus::Empty) else {
+                panic!("east test chunk should be available");
+            };
+            let mut light = chunk.light_mut();
+            let Some(nibble) = light.sky.nibble_mut(0) else {
+                panic!("east lower sky nibble should exist");
+            };
+            nibble.set_non_null();
+            assert!(nibble.update_visible());
+        }
+
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&center_holder))
+                } else if pos == east {
+                    Some(Arc::clone(&east_holder))
+                } else {
+                    None
+                }
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing optional chunks");
+        };
+
+        let Ok(_) = propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required) else {
+            panic!("matching sky caches should run sky chunk lighting");
+        };
+
+        let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("center test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("lower sky nibble should exist");
+        };
+        let Some(lower_air) = layout.cached_block(BlockPos::new(8, 8, 8)) else {
+            panic!("lower air block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(lower_air.local_index), 0);
     }
 
     #[test]
