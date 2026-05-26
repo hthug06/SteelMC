@@ -107,6 +107,7 @@ mod packet;
 mod propagation;
 mod queue;
 mod section_storage;
+mod sky_propagation;
 mod sky_sources;
 mod workset;
 
@@ -140,6 +141,10 @@ pub use queue::{
 pub use section_storage::{
     LayerLightSectionStorage, LightSectionRange, LightSectionRangeError, LightSectionState,
     LightSectionStateError, LightSectionType, MissingLightDataLayerError,
+};
+pub use sky_propagation::{
+    SkyLightPropagationContext, SkyLightPropagationContextError, SkyLightUpdateResult,
+    propagate_sky_light_chunk_without_edge_checks,
 };
 pub use sky_sources::{ChunkSkyLightSources, SkyLightSourceNeighborhood};
 pub use workset::{

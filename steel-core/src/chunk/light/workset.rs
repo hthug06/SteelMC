@@ -395,6 +395,69 @@ impl LightLayerWriteCache<'_> {
             .is_some_and(LightNibbleArray::is_initialized_updating)
     }
 
+    /// Returns true when a cached section has a null updating nibble.
+    #[must_use]
+    pub fn is_section_null_updating(&self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        self.nibble(section_slot)
+            .is_some_and(LightNibbleArray::is_null_updating)
+    }
+
+    /// Fills a cached section with one updating light value.
+    ///
+    /// Returns false when the section has no writable cached nibble.
+    pub fn fill_section(&mut self, section_pos: SectionPos, value: u8) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        let Some(nibble) = self.nibble_mut(section_slot) else {
+            return false;
+        };
+        nibble.fill(value);
+        true
+    }
+
+    /// Extrudes the lower row from the first non-null cached section above.
+    ///
+    /// Returns false when the target section or source section is unavailable.
+    pub fn extrude_lower_from_first_section_above(&mut self, section_pos: SectionPos) -> bool {
+        let Some(target_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+
+        let mut source_slot = None;
+        for source_y in (section_pos.y() + 1)..self.layout.range().max_section_y_exclusive() {
+            let source_pos = SectionPos::new(section_pos.x(), source_y, section_pos.z());
+            let Some(candidate_slot) = self.layout.section_slot(source_pos) else {
+                continue;
+            };
+            let Some(nibble) = self.nibble(candidate_slot) else {
+                continue;
+            };
+            if !nibble.is_null_updating() {
+                source_slot = Some(candidate_slot);
+                break;
+            }
+        }
+
+        let Some(source_slot) = source_slot else {
+            return false;
+        };
+        let Some(source_row) = self
+            .nibble(source_slot)
+            .and_then(|source| source.lower_row_for_extrusion().ok())
+        else {
+            return false;
+        };
+        let Some(target) = self.nibble_mut(target_slot) else {
+            return false;
+        };
+        target.extrude_lower_row(source_row);
+        true
+    }
+
     /// Returns an updating light value for a section slot and local nibble index.
     #[must_use]
     pub fn get_updating_at_section_index(&self, section_slot: usize, local_index: usize) -> u8 {

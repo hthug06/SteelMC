@@ -197,24 +197,40 @@ impl LightNibbleArray {
 
     /// Extrudes the first updating row of `above` into every row of this updating view.
     pub fn extrude_lower(&mut self, above: &Self) -> Result<(), LightNibbleExtrudeNullSourceError> {
-        if above.updating_state == LightNibbleState::Null {
+        let row = above.lower_row_for_extrusion()?;
+        self.extrude_lower_row(row);
+        Ok(())
+    }
+
+    /// Returns the bottom row used when another nibble extrudes from this one.
+    pub fn lower_row_for_extrusion(
+        &self,
+    ) -> Result<Option<[u8; DATA_LAYER_Y_STRIDE]>, LightNibbleExtrudeNullSourceError> {
+        if self.updating_state == LightNibbleState::Null {
             return Err(LightNibbleExtrudeNullSourceError);
         }
 
-        let Some(source) = above.updating_data.as_ref() else {
-            self.set_uninitialized();
-            return Ok(());
+        let Some(source) = self.updating_data.as_ref() else {
+            return Ok(None);
         };
 
         let mut row = [0; DATA_LAYER_Y_STRIDE];
         row.copy_from_slice(&source[..DATA_LAYER_Y_STRIDE]);
+        Ok(Some(row))
+    }
+
+    /// Extrudes one bottom row into every row of this updating view.
+    pub fn extrude_lower_row(&mut self, row: Option<[u8; DATA_LAYER_Y_STRIDE]>) {
+        let Some(row) = row else {
+            self.set_uninitialized();
+            return;
+        };
+
         let data = self.ensure_updating_data();
         for y in 0..DATA_LAYER_EDGE {
             let start = y * DATA_LAYER_Y_STRIDE;
             data[start..start + DATA_LAYER_Y_STRIDE].copy_from_slice(&row);
         }
-
-        Ok(())
     }
 
     /// Returns an updating light value at local section coordinates.
