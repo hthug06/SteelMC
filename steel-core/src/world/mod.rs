@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::chunk::chunk_access::{ChunkAccess, ChunkStatus};
-use crate::chunk::light::has_different_light_properties;
+use crate::chunk::light::{LightLayer, has_different_light_properties};
 use crate::world::game_event_context::GameEventContext;
 use crate::world::game_event_listener::{GameEventListenerStorage, SharedGameEventListener};
 use crate::{chunk::chunk_map::ChunkMapGameTickTimings, world::weather::Weather};
@@ -682,6 +682,30 @@ impl World {
         self.chunk_map
             .with_full_chunk(chunk_pos, |chunk| chunk.get_block_state(pos))
             .unwrap_or_else(|| REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR))
+    }
+
+    fn light_value_at(&self, layer: LightLayer, pos: BlockPos) -> u8 {
+        if layer == LightLayer::Sky && !self.dimension_type.has_skylight {
+            return 0;
+        }
+        if !self.is_in_valid_bounds_horizontal(pos) {
+            return self.default_light_value(layer);
+        }
+
+        let chunk_pos = Self::chunk_pos_for_block(pos);
+        self.chunk_map
+            .with_full_chunk(chunk_pos, |chunk| {
+                let light = chunk.light();
+                light.get_light_value(layer, pos)
+            })
+            .unwrap_or_else(|| self.default_light_value(layer))
+    }
+
+    const fn default_light_value(&self, layer: LightLayer) -> u8 {
+        match layer {
+            LightLayer::Sky if self.dimension_type.has_skylight => 15,
+            LightLayer::Sky | LightLayer::Block => 0,
+        }
     }
 
     /// Gets a block state for generation postprocessing.
@@ -2457,15 +2481,15 @@ impl LevelReader for World {
         Self::get_block_state(self, pos)
     }
 
-    fn raw_brightness(&self, _pos: BlockPos, sky_darkening: u8) -> u8 {
+    fn raw_brightness(&self, pos: BlockPos, sky_darkening: u8) -> u8 {
         let sky_light = if self.dimension_type.has_skylight {
-            15_u8.saturating_sub(sky_darkening)
+            self.light_value_at(LightLayer::Sky, pos)
+                .saturating_sub(sky_darkening)
         } else {
             0
         };
 
-        // TODO: Include block light once Steel has a live light engine.
-        sky_light
+        sky_light.max(self.light_value_at(LightLayer::Block, pos))
     }
 
     fn min_y(&self) -> i32 {
@@ -2508,5 +2532,155 @@ impl ScheduledTickAccess for Arc<World> {
     fn schedule_fluid_tick_default(&self, pos: BlockPos, fluid: FluidRef, delay: i32) -> bool {
         self.as_ref().schedule_fluid_tick_default(pos, fluid, delay);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rayon::ThreadPoolBuilder;
+    use steel_registry::{test_support::init_test_registry, vanilla_dimension_types};
+    use steel_utils::{
+        BlockPos, ChunkPos, Identifier, SectionPos,
+        types::{Difficulty, GameType},
+    };
+    use tokio::runtime::Builder as RuntimeBuilder;
+
+    use super::*;
+    use crate::behavior::init_behaviors;
+    use crate::chunk::{
+        chunk_access::{ChunkAccess, ChunkStatus},
+        chunk_holder::ChunkHolder,
+        level_chunk::LevelChunk,
+        proto_chunk::ProtoChunk,
+        section::{ChunkSection, Sections},
+    };
+    use crate::worldgen::{ChunkGeneratorType, EmptyChunkGenerator};
+
+    fn init_tests() {
+        init_test_registry();
+        init_behaviors();
+    }
+
+    fn empty_test_world() -> Arc<World> {
+        let Ok(runtime) = RuntimeBuilder::new_current_thread().enable_all().build() else {
+            panic!("test runtime should build");
+        };
+        let runtime = Arc::new(runtime);
+        let Ok(generation_pool) = ThreadPoolBuilder::new().num_threads(1).build() else {
+            panic!("test generation pool should build");
+        };
+        let dimension_type = &vanilla_dimension_types::OVERWORLD;
+        let generation_settings = WorldGenerationSettings::from_generator_config(
+            Identifier::new_static("steel", "empty_test"),
+            &toml::Value::Table(toml::map::Map::new()),
+            Identifier::vanilla_static("overworld"),
+            dimension_type.min_y,
+            dimension_type.height,
+        );
+        let config = WorldConfig {
+            storage: WorldStorageConfig::RamOnly,
+            level_data_path: None,
+            generator: Arc::new(ChunkGeneratorType::Empty(EmptyChunkGenerator::new())),
+            generation_settings,
+            view_distance: 10,
+            simulation_distance: 10,
+            compression: None,
+            is_flat: false,
+            sea_level: 63,
+            default_gamemode: GameType::Survival,
+            difficulty: Difficulty::Normal,
+        };
+
+        let world = runtime.block_on(World::new_with_config(
+            Arc::clone(&runtime),
+            Identifier::new_static("steel", "raw_brightness_test"),
+            dimension_type,
+            0,
+            config,
+            Arc::new(generation_pool),
+        ));
+        let Ok(world) = world else {
+            panic!("test world should build");
+        };
+        world
+    }
+
+    fn empty_sections(world: &World) -> Sections {
+        let section_count = (world.get_height() / 16) as usize;
+        let sections = (0..section_count)
+            .map(|_| ChunkSection::new_empty())
+            .collect::<Vec<_>>();
+        Sections::from_owned(sections.into_boxed_slice())
+    }
+
+    fn insert_full_chunk_with_visible_light(
+        world: &Arc<World>,
+        chunk_pos: ChunkPos,
+        pos: BlockPos,
+    ) {
+        let proto = ProtoChunk::new(
+            empty_sections(world.as_ref()),
+            chunk_pos,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(world),
+        );
+        {
+            let mut light = proto.light.write();
+            let section_y = SectionPos::block_to_section_coord(pos.y());
+            let local_x = (pos.x() & 15) as usize;
+            let local_y = (pos.y() & 15) as usize;
+            let local_z = (pos.z() & 15) as usize;
+
+            let Some(block) = light.block.nibble_mut(section_y) else {
+                panic!("test block light section should be inside light range");
+            };
+            block.set_non_null();
+            block.set(local_x, local_y, local_z, 3);
+            assert!(block.update_visible());
+
+            let Some(sky) = light.sky.nibble_mut(section_y) else {
+                panic!("test sky light section should be inside light range");
+            };
+            sky.set_non_null();
+            sky.set(local_x, local_y, local_z, 9);
+            assert!(sky.update_visible());
+        }
+
+        let level_chunk = LevelChunk::from_proto(
+            proto,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(world),
+        );
+        let holder = Arc::new(ChunkHolder::new(
+            chunk_pos,
+            0,
+            world.get_min_y(),
+            world.get_height(),
+        ));
+        holder.insert_chunk(ChunkAccess::Full(level_chunk), ChunkStatus::Full);
+        if world
+            .chunk_map
+            .chunks
+            .insert_sync(chunk_pos, holder)
+            .is_err()
+        {
+            panic!("test chunk should insert into empty chunk map");
+        }
+    }
+
+    #[test]
+    fn raw_brightness_reads_visible_chunk_light() {
+        init_tests();
+        let world = empty_test_world();
+        let chunk_pos = ChunkPos::new(0, 0);
+        let pos = BlockPos::new(1, 2, 3);
+        insert_full_chunk_with_visible_light(&world, chunk_pos, pos);
+
+        assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 0), 9);
+        assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 7), 3);
     }
 }

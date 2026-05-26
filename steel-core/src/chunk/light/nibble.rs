@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use steel_utils::{BlockPos, SectionPos};
+
 use crate::chunk::section::Sections;
 
 use super::{
@@ -445,6 +447,52 @@ mod tests {
         assert_eq!(nibble.get_updating_at_index(0), MAX_LIGHT_LEVEL);
         assert_eq!(nibble.get_updating(0, 0, 0), MAX_LIGHT_LEVEL);
     }
+
+    #[test]
+    fn chunk_light_data_reads_visible_block_light() {
+        let mut light = ChunkLightData::for_valid_world_height(0, 16);
+        let block_pos = BlockPos::new(1, 2, 3);
+
+        assert_eq!(light.get_light_value(LightLayer::Block, block_pos), 0);
+
+        let Some(nibble) = light.block.nibble_mut(0) else {
+            panic!("test section should be inside light range");
+        };
+        nibble.set_non_null();
+        nibble.set(1, 2, 3, 12);
+        assert!(nibble.update_visible());
+
+        assert_eq!(light.get_light_value(LightLayer::Block, block_pos), 12);
+    }
+
+    #[test]
+    fn chunk_light_data_reads_visible_sky_light_with_upward_extrusion() {
+        let mut light = ChunkLightData::for_valid_world_height(0, 16);
+        let block_pos = BlockPos::new(1, 15, 3);
+
+        assert_eq!(
+            light.get_light_value(LightLayer::Sky, block_pos),
+            MAX_LIGHT_LEVEL
+        );
+
+        let Some(upper_nibble) = light.sky.nibble_mut(1) else {
+            panic!("upper test section should be inside light range");
+        };
+        upper_nibble.set_non_null();
+        upper_nibble.set(1, 0, 3, 9);
+        assert!(upper_nibble.update_visible());
+
+        assert_eq!(light.get_light_value(LightLayer::Sky, block_pos), 9);
+
+        let Some(current_nibble) = light.sky.nibble_mut(0) else {
+            panic!("current test section should be inside light range");
+        };
+        current_nibble.set_non_null();
+        current_nibble.set(1, 15, 3, 7);
+        assert!(current_nibble.update_visible());
+
+        assert_eq!(light.get_light_value(LightLayer::Sky, block_pos), 7);
+    }
 }
 
 /// Error returned when trying to extrude from a null light section.
@@ -508,6 +556,15 @@ impl ChunkLightLayerStorage {
     #[must_use]
     pub fn nibbles_mut(&mut self) -> &mut [LightNibbleArray] {
         &mut self.nibbles
+    }
+
+    /// Returns the visible light value for one block position.
+    #[must_use]
+    pub fn get_light_value(&self, block_pos: BlockPos) -> u8 {
+        match self.layer {
+            LightLayer::Sky => self.get_sky_light_value(block_pos),
+            LightLayer::Block => self.get_block_light_value(block_pos),
+        }
     }
 
     /// Returns the number of real chunk sections tracked by the emptiness map.
@@ -579,10 +636,52 @@ impl ChunkLightLayerStorage {
         Some(previous)
     }
 
+    fn get_block_light_value(&self, block_pos: BlockPos) -> u8 {
+        self.visible_nibble_value(block_pos).unwrap_or(0)
+    }
+
+    fn get_sky_light_value(&self, block_pos: BlockPos) -> u8 {
+        if let Some(value) = self.visible_nibble_value(block_pos) {
+            return value;
+        }
+
+        let local_x = section_relative_coord(block_pos.x());
+        let local_z = section_relative_coord(block_pos.z());
+        let mut section_y = SectionPos::block_to_section_coord(block_pos.y()) + 1;
+        while section_y < self.range.max_section_y_exclusive() {
+            if let Some(nibble) = self.nibble(section_y)
+                && !nibble.is_null_visible()
+            {
+                return nibble.get_visible(local_x, 0, local_z);
+            }
+            section_y += 1;
+        }
+
+        MAX_LIGHT_LEVEL
+    }
+
+    fn visible_nibble_value(&self, block_pos: BlockPos) -> Option<u8> {
+        let section_y = SectionPos::block_to_section_coord(block_pos.y());
+        let nibble = self.nibble(section_y)?;
+        if nibble.is_null_visible() {
+            return None;
+        }
+
+        Some(nibble.get_visible(
+            section_relative_coord(block_pos.x()),
+            section_relative_coord(block_pos.y()),
+            section_relative_coord(block_pos.z()),
+        ))
+    }
+
     fn chunk_section_index(&self, section_y: i32) -> Option<usize> {
         let index = self.range.chunk_section_index(section_y)?;
         (index < self.chunk_section_count).then_some(index)
     }
+}
+
+fn section_relative_coord(block_coord: i32) -> usize {
+    (block_coord & 15) as usize
 }
 
 /// Chunk-owned block and sky light storage.
@@ -640,5 +739,14 @@ impl ChunkLightData {
             .set_section_empty(section_y, empty)
             .is_some_and(|previous| previous != empty);
         block_changed || sky_changed
+    }
+
+    /// Returns the visible light value for one layer at a block position.
+    #[must_use]
+    pub fn get_light_value(&self, layer: LightLayer, block_pos: BlockPos) -> u8 {
+        match layer {
+            LightLayer::Sky => self.sky.get_light_value(block_pos),
+            LightLayer::Block => self.block.get_light_value(block_pos),
+        }
     }
 }
