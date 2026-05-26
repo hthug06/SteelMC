@@ -344,6 +344,15 @@ impl LightLayerWriteCache<'_> {
             .is_some_and(|nibble| !nibble.is_null_updating())
     }
 
+    /// Returns true when a cached section has a writable nibble entry.
+    #[must_use]
+    pub fn has_cached_section(&self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        self.nibble(section_slot).is_some()
+    }
+
     /// Marks a cached light section non-null without allocating light bytes.
     ///
     /// Returns false when the section has no writable cached nibble.
@@ -803,6 +812,7 @@ mod tests {
             chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
                 assert!(light_cache.set_section_non_null(section_pos));
                 assert!(!light_cache.set_section_non_null(section_pos));
+                assert!(light_cache.has_cached_section(section_pos));
                 assert!(light_cache.has_non_null_section(section_pos));
                 assert!(!light_cache.is_section_initialized_updating(section_pos));
 

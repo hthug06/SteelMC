@@ -126,8 +126,8 @@ pub use packet::{
     build_light_update_packet,
 };
 pub use propagation::{
-    BlockLightPropagationContext, BlockLightPropagationContextError, BlockLightUpdateResult,
-    propagate_block_light_changes, propagate_block_light_chunk,
+    BlockLightChunkEdgeChecks, BlockLightPropagationContext, BlockLightPropagationContextError,
+    BlockLightUpdateResult, propagate_block_light_changes, propagate_block_light_chunk,
 };
 pub(crate) use queue::{
     ADD_SKY_SOURCE_ENTRY, REMOVE_SKY_SOURCE_ENTRY, REMOVE_TOP_SKY_SOURCE_ENTRY,

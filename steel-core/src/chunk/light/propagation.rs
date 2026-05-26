@@ -37,6 +37,15 @@ pub struct BlockLightUpdateResult {
     pub updated_sections: Vec<SectionPos>,
 }
 
+/// Whether chunk block-light generation must validate edge consistency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockLightChunkEdgeChecks {
+    /// Seed sources and validate this chunk's horizontal edges against neighbors.
+    Required,
+    /// Trust existing neighboring light and pull initialized edge levels inward.
+    Skipped,
+}
+
 /// Runs ScalableLux-style block-light propagation for changed blocks in a scoped workset.
 ///
 /// This is the block-light equivalent of ScalableLux `propagateBlockChanges`
@@ -74,12 +83,12 @@ pub fn propagate_block_light_changes(
 
 /// Seeds and propagates block light for the center chunk of a scoped workset.
 ///
-/// This matches ScalableLux `BlockStarLightEngine.lightChunk` for the
-/// no-edge-check path: source blocks in the center chunk are seeded, horizontal
-/// neighbor levels are pulled into the increase queue, increases are propagated,
-/// and dirty visible nibbles are published.
+/// This matches ScalableLux `BlockStarLightEngine.lightChunk`: source blocks in
+/// the center chunk are seeded, then the caller chooses between validating edge
+/// consistency or pulling already-initialized neighbor levels inward.
 pub fn propagate_block_light_chunk(
     workset: &LightWorkset,
+    edge_checks: BlockLightChunkEdgeChecks,
 ) -> Result<BlockLightUpdateResult, BlockLightPropagationContextError> {
     workset.with_chunk_read_cache(|chunk_cache| {
         let layout = chunk_cache.layout();
@@ -104,8 +113,16 @@ pub fn propagate_block_light_chunk(
                     let mut context =
                         BlockLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
                     context.seed_block_light_sources(sources);
-                    context.propagate_neighbor_levels(layout.center_chunk());
-                    context.perform_light_increase();
+                    match edge_checks {
+                        BlockLightChunkEdgeChecks::Required => {
+                            context.perform_light_increase();
+                            context.check_chunk_edges(layout.center_chunk());
+                        }
+                        BlockLightChunkEdgeChecks::Skipped => {
+                            context.propagate_neighbor_levels(layout.center_chunk());
+                            context.perform_light_increase();
+                        }
+                    }
                 }
 
                 let mut updated_sections = Vec::new();
@@ -255,6 +272,22 @@ impl<'a, 'sections, 'light> BlockLightPropagationContext<'a, 'sections, 'light> 
                 self.propagate_neighbor_level_section(chunk_pos, section_y, direction);
             }
         }
+    }
+
+    /// Validates this chunk's horizontal edges against cached neighbor edges.
+    ///
+    /// This mirrors ScalableLux `checkChunkEdges`: edge values whose calculated
+    /// level differs from the stored value are delayed, converted into regular
+    /// block checks, then resolved through the decrease queue.
+    pub fn check_chunk_edges(&mut self, chunk_pos: ChunkPos) {
+        for section_y in (self.layout.range().min_section_y()
+            ..self.layout.range().max_section_y_exclusive())
+            .rev()
+        {
+            self.check_chunk_edge(chunk_pos, section_y);
+        }
+
+        self.perform_light_decrease();
     }
 
     /// Calculates the block-light value that should exist at `block_pos`.
@@ -457,6 +490,123 @@ impl<'a, 'sections, 'light> BlockLightPropagationContext<'a, 'sections, 'light> 
             ));
     }
 
+    fn check_chunk_edge(&mut self, chunk_pos: ChunkPos, section_y: i32) {
+        let current_section_pos = SectionPos::new(chunk_pos.0.x, section_y, chunk_pos.0.y);
+        if !self.light.has_cached_section(current_section_pos) {
+            return;
+        }
+
+        for direction in LightAxisDirection::HORIZONTAL {
+            let (neighbor_offset_x, _, neighbor_offset_z) = direction.offset();
+            let neighbor_chunk_pos = ChunkPos::new(
+                chunk_pos.0.x + neighbor_offset_x,
+                chunk_pos.0.y + neighbor_offset_z,
+            );
+            let neighbor_section_pos =
+                SectionPos::new(neighbor_chunk_pos.0.x, section_y, neighbor_chunk_pos.0.y);
+            if !self.light.has_cached_section(neighbor_section_pos) {
+                continue;
+            }
+            if !self
+                .light
+                .is_section_initialized_updating(current_section_pos)
+                && !self
+                    .light
+                    .is_section_initialized_updating(neighbor_section_pos)
+            {
+                continue;
+            }
+
+            self.check_chunk_edge_direction(chunk_pos, neighbor_chunk_pos, section_y, direction);
+        }
+    }
+
+    fn check_chunk_edge_direction(
+        &mut self,
+        chunk_pos: ChunkPos,
+        neighbor_chunk_pos: ChunkPos,
+        section_y: i32,
+        direction: LightAxisDirection,
+    ) {
+        let (neighbor_offset_x, _, neighbor_offset_z) = direction.offset();
+        let (increment_x, increment_z, start_x, start_z) =
+            Self::current_edge_scan(chunk_pos, direction);
+        let mut center_delayed_checks = [0usize; 16 * 16];
+        let mut neighbor_delayed_checks = [0usize; 16 * 16];
+        let mut center_delayed_check_count = 0;
+        let mut neighbor_delayed_check_count = 0;
+
+        let min_y = section_y << 4;
+        let max_y = min_y | 15;
+        for y in min_y..=max_y {
+            let mut x = start_x;
+            let mut z = start_z;
+            for _ in 0..16 {
+                let current_pos = BlockPos::new(x, y, z);
+                let neighbor_pos = BlockPos::new(x + neighbor_offset_x, y, z + neighbor_offset_z);
+                let Some(current_block) = self.layout.cached_block(current_pos) else {
+                    x += increment_x;
+                    z += increment_z;
+                    continue;
+                };
+                let Some(neighbor_block) = self.layout.cached_block(neighbor_pos) else {
+                    x += increment_x;
+                    z += increment_z;
+                    continue;
+                };
+
+                let current_level = self.light.get_updating(current_block);
+                if self
+                    .calculate_light_value(current_pos, current_level)
+                    .is_some_and(|calculated| calculated != current_level)
+                {
+                    center_delayed_checks[center_delayed_check_count] = current_block.local_index;
+                    center_delayed_check_count += 1;
+                }
+
+                let neighbor_level = self.light.get_updating(neighbor_block);
+                if self
+                    .calculate_light_value(neighbor_pos, neighbor_level)
+                    .is_some_and(|calculated| calculated != neighbor_level)
+                {
+                    neighbor_delayed_checks[neighbor_delayed_check_count] =
+                        neighbor_block.local_index;
+                    neighbor_delayed_check_count += 1;
+                }
+
+                x += increment_x;
+                z += increment_z;
+            }
+        }
+
+        let current_chunk_offset_x = chunk_pos.0.x << 4;
+        let current_chunk_offset_z = chunk_pos.0.y << 4;
+        let neighbor_chunk_offset_x = neighbor_chunk_pos.0.x << 4;
+        let neighbor_chunk_offset_z = neighbor_chunk_pos.0.y << 4;
+        let chunk_offset_y = section_y << 4;
+        let delayed_check_count = center_delayed_check_count.max(neighbor_delayed_check_count);
+        for delayed_check_index in 0..delayed_check_count {
+            if delayed_check_index < center_delayed_check_count {
+                let local_index = center_delayed_checks[delayed_check_index];
+                self.check_block(Self::block_pos_from_local_index(
+                    current_chunk_offset_x,
+                    chunk_offset_y,
+                    current_chunk_offset_z,
+                    local_index,
+                ));
+            }
+            if delayed_check_index < neighbor_delayed_check_count {
+                let local_index = neighbor_delayed_checks[delayed_check_index];
+                self.check_block(Self::block_pos_from_local_index(
+                    neighbor_chunk_offset_x,
+                    chunk_offset_y,
+                    neighbor_chunk_offset_z,
+                    local_index,
+                ));
+            }
+        }
+    }
+
     fn seed_block_light_source(&mut self, block_pos: BlockPos) -> bool {
         let Some(cached_block) = self.layout.cached_block(block_pos) else {
             return false;
@@ -524,6 +674,28 @@ impl<'a, 'sections, 'light> BlockLightPropagationContext<'a, 'sections, 'light> 
         }
     }
 
+    fn current_edge_scan(
+        chunk_pos: ChunkPos,
+        direction: LightAxisDirection,
+    ) -> (i32, i32, i32, i32) {
+        let (offset_x, _, offset_z) = direction.offset();
+        if offset_x != 0 {
+            let start_x = if offset_x < 0 {
+                chunk_pos.0.x << 4
+            } else {
+                (chunk_pos.0.x << 4) | 15
+            };
+            return (0, 1, start_x, chunk_pos.0.y << 4);
+        }
+
+        let start_z = if offset_z < 0 {
+            chunk_pos.0.y << 4
+        } else {
+            (chunk_pos.0.y << 4) | 15
+        };
+        (1, 0, chunk_pos.0.x << 4, start_z)
+    }
+
     fn neighbor_edge_scan(
         chunk_pos: ChunkPos,
         direction: LightAxisDirection,
@@ -544,6 +716,19 @@ impl<'a, 'sections, 'light> BlockLightPropagationContext<'a, 'sections, 'light> 
             (chunk_pos.0.y << 4) + 16
         };
         (1, 0, chunk_pos.0.x << 4, start_z)
+    }
+
+    fn block_pos_from_local_index(
+        chunk_offset_x: i32,
+        chunk_offset_y: i32,
+        chunk_offset_z: i32,
+        local_index: usize,
+    ) -> BlockPos {
+        BlockPos::new(
+            chunk_offset_x | (local_index & 15) as i32,
+            chunk_offset_y | (local_index >> 8) as i32,
+            chunk_offset_z | ((local_index >> 4) & 15) as i32,
+        )
     }
 
     fn enqueue_increase(
@@ -829,7 +1014,8 @@ mod tests {
             panic!("relaxed setup should accept missing neighbors");
         };
 
-        let Ok(result) = propagate_block_light_chunk(&workset) else {
+        let Ok(result) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Skipped)
+        else {
             panic!("matching block caches should run block chunk lighting");
         };
 
@@ -882,7 +1068,8 @@ mod tests {
             panic!("relaxed setup should accept missing neighbors");
         };
 
-        let Ok(result) = propagate_block_light_chunk(&workset) else {
+        let Ok(result) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Skipped)
+        else {
             panic!("matching block caches should run block chunk lighting");
         };
 
@@ -907,6 +1094,114 @@ mod tests {
     }
 
     #[test]
+    fn block_light_chunk_edge_checks_pull_missing_neighbor_light() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let east_chunk = ChunkPos::new(1, 0);
+        let center_holder = holder_with_section(center, ChunkSection::new_empty());
+        let mut east_section = ChunkSection::new_empty();
+        east_section.set_block_state(0, 1, 1, vanilla_blocks::LIGHT.default_state());
+        let east_holder = holder_with_section(east_chunk, east_section);
+        set_visible_block_light(&east_holder, 0, 0, 1, 1, 15);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&center_holder))
+                } else if pos == east_chunk {
+                    Some(Arc::clone(&east_holder))
+                } else {
+                    None
+                }
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
+        else {
+            panic!("matching block caches should run block chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+
+        let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.block.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(edge) = layout.cached_block(BlockPos::new(15, 1, 1)) else {
+            panic!("center edge should be cached");
+        };
+        let Some(inner) = layout.cached_block(BlockPos::new(14, 1, 1)) else {
+            panic!("center inner block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(edge.local_index), 14);
+        assert_eq!(nibble.get_visible_at_index(inner.local_index), 13);
+    }
+
+    #[test]
+    fn block_light_chunk_edge_checks_remove_stale_center_light() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let east_chunk = ChunkPos::new(1, 0);
+        let center_holder = holder_with_section(center, ChunkSection::new_empty());
+        let east_holder = holder_with_section(east_chunk, ChunkSection::new_empty());
+        set_visible_block_light(&center_holder, 0, 15, 1, 1, 15);
+        set_visible_block_light(&center_holder, 0, 14, 1, 1, 14);
+        set_block_nibble_non_null(&east_holder, 0);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&center_holder))
+                } else if pos == east_chunk {
+                    Some(Arc::clone(&east_holder))
+                } else {
+                    None
+                }
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
+        else {
+            panic!("matching block caches should run block chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+
+        let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.block.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(edge) = layout.cached_block(BlockPos::new(15, 1, 1)) else {
+            panic!("center edge should be cached");
+        };
+        let Some(inner) = layout.cached_block(BlockPos::new(14, 1, 1)) else {
+            panic!("center inner block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(edge.local_index), 0);
+        assert_eq!(nibble.get_visible_at_index(inner.local_index), 0);
+    }
+
+    #[test]
     fn block_light_chunk_requires_center_chunk() {
         init_tests();
         let center = ChunkPos::new(0, 0);
@@ -922,7 +1217,7 @@ mod tests {
         };
 
         assert_eq!(
-            propagate_block_light_chunk(&workset).err(),
+            propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Skipped).err(),
             Some(BlockLightPropagationContextError::MissingCenterChunk { chunk_pos: center })
         );
     }
