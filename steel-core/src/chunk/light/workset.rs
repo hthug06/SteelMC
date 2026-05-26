@@ -35,7 +35,13 @@ pub enum LightWorksetSetupError {
 /// only inside scoped cache closures.
 pub struct LightWorkset {
     layout: LightCacheLayout,
-    chunks: LightChunkSlotArray<Arc<ChunkHolder>>,
+    chunks: LightChunkSlotArray<LightWorksetChunk>,
+}
+
+struct LightWorksetChunk {
+    holder: Arc<ChunkHolder>,
+    section_readable: bool,
+    light_writable: bool,
 }
 
 impl LightWorkset {
@@ -47,10 +53,31 @@ impl LightWorkset {
         mut chunk_for_lighting: impl FnMut(ChunkPos) -> Option<Arc<ChunkHolder>>,
         mut can_use_chunk: impl FnMut(&ChunkAccess) -> bool,
     ) -> Result<Self, LightWorksetSetupError> {
+        Self::setup_with_scopes(
+            layout,
+            radius,
+            relaxed,
+            &mut chunk_for_lighting,
+            |_, _, chunk| {
+                let usable = can_use_chunk(chunk);
+                (usable, usable)
+            },
+        )
+    }
+
+    /// Creates a scoped cache window with separate section-read and light-write admission.
+    pub fn setup_with_scopes(
+        layout: LightCacheLayout,
+        radius: LightCacheSetupRadius,
+        relaxed: bool,
+        mut chunk_for_lighting: impl FnMut(ChunkPos) -> Option<Arc<ChunkHolder>>,
+        mut can_use_chunk: impl FnMut(CachedLightChunk, &ChunkHolder, &ChunkAccess) -> (bool, bool),
+    ) -> Result<Self, LightWorksetSetupError> {
         let mut chunks = LightChunkSlotArray::new();
 
         for cached_chunk in layout.setup_chunks(radius) {
-            let Some(holder) = Self::try_get_chunk(cached_chunk, relaxed, &mut chunk_for_lighting)?
+            let Some(holder) =
+                Self::try_get_holder(cached_chunk, relaxed, &mut chunk_for_lighting)?
             else {
                 continue;
             };
@@ -58,12 +85,20 @@ impl LightWorkset {
             let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
                 continue;
             };
-            if !can_use_chunk(&chunk) {
+            let (use_sections, use_light) = can_use_chunk(cached_chunk, &holder, &chunk);
+            if !use_sections && !use_light {
                 continue;
             }
             drop(chunk);
 
-            chunks.insert(cached_chunk, holder);
+            chunks.insert(
+                cached_chunk,
+                LightWorksetChunk {
+                    holder,
+                    section_readable: use_sections,
+                    light_writable: use_light,
+                },
+            );
         }
 
         Ok(Self { layout, chunks })
@@ -78,7 +113,7 @@ impl LightWorkset {
     /// Returns the holder for a cached chunk slot.
     #[must_use]
     pub fn chunk_holder(&self, cached_chunk: CachedLightChunk) -> Option<&Arc<ChunkHolder>> {
-        self.chunks.get(cached_chunk)
+        self.chunks.get(cached_chunk).map(|chunk| &chunk.holder)
     }
 
     /// Builds a chunk-read cache for the duration of `f`.
@@ -90,23 +125,41 @@ impl LightWorkset {
         let mut chunks = LightChunkSlotArray::new();
 
         for chunk_slot in 0..self.chunks.slot_count() {
-            let Some(holder) = self.chunks.get_slot(chunk_slot) else {
+            let Some(workset_chunk) = self.chunks.get_slot(chunk_slot) else {
                 continue;
             };
-            let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            if !workset_chunk.section_readable {
+                continue;
+            }
+            let Some(chunk) = workset_chunk.holder.try_chunk(ChunkStatus::Empty) else {
                 continue;
             };
             chunks.insert_slot(chunk_slot, chunk);
         }
 
+        let mut light_chunks = LightChunkSlotArray::new();
+        for chunk_slot in 0..self.chunks.slot_count() {
+            let Some(workset_chunk) = self.chunks.get_slot(chunk_slot) else {
+                continue;
+            };
+            if !workset_chunk.light_writable {
+                continue;
+            }
+            let Some(chunk) = workset_chunk.holder.try_chunk(ChunkStatus::Empty) else {
+                continue;
+            };
+            light_chunks.insert_slot(chunk_slot, chunk);
+        }
+
         let cache = LightChunkReadCache {
             layout: self.layout,
             chunks,
+            light_chunks,
         };
         f(&cache)
     }
 
-    fn try_get_chunk(
+    fn try_get_holder(
         cached_chunk: CachedLightChunk,
         relaxed: bool,
         chunk_for_lighting: &mut impl FnMut(ChunkPos) -> Option<Arc<ChunkHolder>>,
@@ -129,6 +182,7 @@ impl LightWorkset {
 pub struct LightChunkReadCache<'a> {
     layout: LightCacheLayout,
     chunks: LightChunkSlotArray<RwLockReadGuard<'a, ChunkAccess>>,
+    light_chunks: LightChunkSlotArray<RwLockReadGuard<'a, ChunkAccess>>,
 }
 
 impl LightChunkReadCache<'_> {
@@ -200,8 +254,8 @@ impl LightChunkReadCache<'_> {
     ) -> R {
         let mut chunks = LightChunkSlotArray::new();
 
-        for chunk_slot in 0..self.chunks.slot_count() {
-            let Some(chunk_guard) = self.chunks.get_slot(chunk_slot) else {
+        for chunk_slot in 0..self.light_chunks.slot_count() {
+            let Some(chunk_guard) = self.light_chunks.get_slot(chunk_slot) else {
                 continue;
             };
             chunks.insert_slot(chunk_slot, chunk_guard.light_mut());
@@ -999,6 +1053,53 @@ mod tests {
             chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
                 assert_eq!(light_cache.get_updating(missing_neighbor_block), 0);
                 assert!(!light_cache.set(missing_neighbor_block, 12));
+            });
+        });
+    }
+
+    #[test]
+    fn workset_can_read_sections_without_writable_light_scope() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let east = ChunkPos::new(1, 0);
+        let center_holder = holder_with_section(center, ChunkSection::new_empty());
+        let mut east_section = ChunkSection::new_empty();
+        east_section.set_block_state(0, 0, 0, vanilla_blocks::STONE.default_state());
+        let east_holder = holder_with_section(east, east_section);
+        set_nibble_non_null(&east_holder, LightLayer::Block, 0);
+        let layout = LightCacheLayout::new(center, range());
+
+        let Ok(workset) = LightWorkset::setup_with_scopes(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&center_holder))
+                } else if pos == east {
+                    Some(Arc::clone(&east_holder))
+                } else {
+                    None
+                }
+            },
+            |cached_chunk, _, _| (true, cached_chunk.chunk_pos == center),
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        assert_eq!(Arc::strong_count(&center_holder), 2);
+        assert_eq!(Arc::strong_count(&east_holder), 2);
+
+        let Some(east_block) = layout.cached_block(BlockPos::new(16, 0, 0)) else {
+            panic!("east block should be inside light cache");
+        };
+        workset.with_chunk_read_cache(|chunk_cache| {
+            chunk_cache.with_section_read_cache(|section_cache| {
+                assert!(section_cache.has_non_empty_section(SectionPos::new(1, 0, 0)));
+            });
+            chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
+                assert_eq!(light_cache.get_updating(east_block), 0);
+                assert!(!light_cache.set(east_block, 9));
             });
         });
     }

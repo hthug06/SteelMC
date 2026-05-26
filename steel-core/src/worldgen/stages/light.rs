@@ -51,36 +51,38 @@ fn run_light_stage(
         panic!("invalid world height for light stage");
     };
     let layout = LightCacheLayout::new(center, range);
-    let Ok(workset) = LightWorkset::setup(
+    let Ok(workset) = LightWorkset::setup_with_scopes(
         layout,
         LightCacheSetupRadius::Full,
         true,
         |pos| {
             let holder = cache.try_get(pos.0.x, pos.0.y)?;
-            let required_status = if pos == center {
-                ChunkStatus::InitializeLight
-            } else {
-                ChunkStatus::Light
-            };
             holder
-                .try_chunk(required_status)
+                .try_chunk(ChunkStatus::InitializeLight)
                 .is_some()
                 .then(|| Arc::clone(holder))
         },
-        |_| true,
+        |cached_chunk, holder, _chunk| {
+            let status = holder.persisted_status();
+            (
+                status.is_some_and(|status| status >= ChunkStatus::InitializeLight),
+                cached_chunk.chunk_pos == center
+                    || status.is_some_and(|status| status >= ChunkStatus::Light),
+            )
+        },
     ) else {
         panic!("required light-stage chunk is missing");
     };
 
-    let Ok(sky_result) = propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required)
-    else {
-        panic!("sky light chunk propagation failed");
+    let sky_result = match propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required) {
+        Ok(result) => result,
+        Err(error) => panic!("sky light chunk propagation failed: {error:?}"),
     };
-    let Ok(block_result) =
-        propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
-    else {
-        panic!("block light chunk propagation failed");
-    };
+    let block_result =
+        match propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required) {
+            Ok(result) => result,
+            Err(error) => panic!("block light chunk propagation failed: {error:?}"),
+        };
 
     (sky_result.updated_sections, block_result.updated_sections)
 }

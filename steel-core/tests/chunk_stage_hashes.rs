@@ -114,6 +114,7 @@ const DEBUG_DIMENSION_ENV: &str = "STEEL_HASH_DEBUG_DIMENSION";
 const DEBUG_STAGE_ENV: &str = "STEEL_HASH_DEBUG_STAGE";
 const DEBUG_LIGHT_SUMMARY_ENV: &str = "STEEL_HASH_DEBUG_LIGHT_SUMMARY";
 const DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV: &str = "STEEL_HASH_STOP_AFTER_FIRST_MISMATCH";
+const DEBUG_FIXTURE_PATH_ENV: &str = "STEEL_HASH_FIXTURE_PATH";
 
 const FEATURE_STAGE: &str = "minecraft:features";
 const LIGHT_STAGE: &str = "minecraft:light";
@@ -125,8 +126,14 @@ const LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_v1";
 const LIGHT_DEBUG_FORMAT_SECTION_MARKERS_V1: &str = "section_markers_v1";
 
 fn load_expected_hashes() -> ChunkStageHashesJson {
-    let json_str = include_str!("../test_assets/chunk_stage_hashes.json");
-    serde_json::from_str(json_str).expect("Failed to parse chunk_stage_hashes.json")
+    let json = if let Ok(path) = env::var(DEBUG_FIXTURE_PATH_ENV) {
+        fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!("Failed to read chunk_stage_hashes fixture from {path}: {err}")
+        })
+    } else {
+        include_str!("../test_assets/chunk_stage_hashes.json").to_owned()
+    };
+    serde_json::from_str(&json).expect("Failed to parse chunk_stage_hashes.json")
 }
 
 fn sorted_positions(positions: &FxHashSet<(i32, i32)>) -> Vec<(i32, i32)> {
