@@ -23,6 +23,7 @@ pub static SLOW_CHUNK_GEN: AtomicBool = AtomicBool::new(false);
 
 use crate::chunk::chunk_generation_task::{NeighborReady, StaticCache2D};
 use crate::chunk::chunk_ticket_manager::generation_status;
+use crate::chunk::light::{LightLayer, LightSectionRange};
 use crate::world::World;
 use crate::{
     ChunkMap,
@@ -64,6 +65,29 @@ impl ChunkGuard {
     }
 }
 
+#[derive(Debug, Default)]
+struct ChangedLightSectionSets {
+    sky: FxHashSet<SectionPos>,
+    block: FxHashSet<SectionPos>,
+}
+
+/// Pending light sections to send to players tracking a chunk.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ChangedLightSections {
+    /// Changed sky-light sections.
+    pub sky: Vec<SectionPos>,
+    /// Changed block-light sections.
+    pub block: Vec<SectionPos>,
+}
+
+impl ChangedLightSections {
+    /// Returns true when no light sections changed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sky.is_empty() && self.block.is_empty()
+    }
+}
+
 /// Holds a chunk in a watch channel, allowing for concurrent access and state tracking.
 ///
 /// NOTICE: It is very important to keep data and `chunk_result` in sync.
@@ -91,9 +115,13 @@ pub struct ChunkHolder {
     height: i32,
     /// Whether any sections have pending block changes.
     has_changed_sections: AtomicBool,
+    /// Whether this holder is already queued for the next broadcast flush.
+    queued_for_broadcast: AtomicBool,
     /// Per-section sets of changed block positions.
     /// Index is `(block_y - min_y) / 16`.
     changed_blocks_per_section: Box<[SyncMutex<FxHashSet<PackedSectionBlockPos>>]>,
+    /// Changed light sections grouped by light layer.
+    changed_light_sections: SyncMutex<ChangedLightSectionSets>,
 }
 
 impl ChunkHolder {
@@ -136,7 +164,9 @@ impl ChunkHolder {
             min_y,
             height,
             has_changed_sections: AtomicBool::new(false),
+            queued_for_broadcast: AtomicBool::new(false),
             changed_blocks_per_section,
+            changed_light_sections: SyncMutex::new(ChangedLightSectionSets::default()),
         }
     }
 
@@ -156,18 +186,54 @@ impl ChunkHolder {
             return false;
         }
 
-        let had_changes = self.has_changed_sections.swap(true, Ordering::AcqRel);
         let packed = SectionPos::section_relative_pos(pos);
         self.changed_blocks_per_section[section_index]
             .lock()
             .insert(packed);
+        self.has_changed_sections.store(true, Ordering::Release);
 
-        !had_changes
+        !self.queued_for_broadcast.swap(true, Ordering::AcqRel)
     }
 
-    /// Returns whether there are pending block changes to broadcast.
+    /// Records a light-section change.
+    ///
+    /// Returns `true` if this is the first pending broadcast change for the
+    /// chunk holder.
+    pub fn light_changed(&self, layer: LightLayer, section_pos: SectionPos) -> bool {
+        if section_pos.x() != self.pos.0.x || section_pos.z() != self.pos.0.y {
+            return false;
+        }
+
+        let Ok(range) = LightSectionRange::from_world_height(self.min_y, self.height) else {
+            return false;
+        };
+        if range.section_index(section_pos.y()).is_none() {
+            return false;
+        }
+
+        let inserted = {
+            let mut guard = self.changed_light_sections.lock();
+            match layer {
+                LightLayer::Sky => guard.sky.insert(section_pos),
+                LightLayer::Block => guard.block.insert(section_pos),
+            }
+        };
+
+        if !inserted {
+            return false;
+        }
+
+        !self.queued_for_broadcast.swap(true, Ordering::AcqRel)
+    }
+
+    /// Returns whether this holder is queued for change broadcasting.
     pub fn has_changes_to_broadcast(&self) -> bool {
-        self.has_changed_sections.load(Ordering::Acquire)
+        self.queued_for_broadcast.load(Ordering::Acquire)
+    }
+
+    /// Allows later changes to enqueue this holder for a future broadcast.
+    pub fn clear_broadcast_queued(&self) {
+        self.queued_for_broadcast.store(false, Ordering::Release);
     }
 
     /// Takes all pending block changes, grouped by section index.
@@ -185,6 +251,15 @@ impl ChunkHolder {
             }
         }
         result
+    }
+
+    /// Takes all pending light-section changes.
+    pub fn take_changed_light_sections(&self) -> ChangedLightSections {
+        let mut guard = self.changed_light_sections.lock();
+        ChangedLightSections {
+            sky: guard.sky.drain().collect(),
+            block: guard.block.drain().collect(),
+        }
     }
 
     /// Returns the number of sections in this chunk.
@@ -553,4 +628,49 @@ where
         sender.send(func()).expect("Failed to send result");
     });
     async move { receiver.await.expect("Failed to receive rayon task result") }
+}
+
+#[cfg(test)]
+mod tests {
+    use steel_utils::{BlockPos, ChunkPos, SectionPos};
+
+    use super::*;
+
+    #[test]
+    fn light_changed_tracks_layer_sections() {
+        let holder = ChunkHolder::new(ChunkPos::new(2, -3), 0, 0, 32);
+        let section = SectionPos::new(2, 0, -3);
+
+        assert!(!holder.has_changes_to_broadcast());
+        assert!(holder.light_changed(LightLayer::Block, section));
+        assert!(holder.has_changes_to_broadcast());
+        assert!(!holder.light_changed(LightLayer::Block, section));
+        assert!(!holder.light_changed(LightLayer::Block, SectionPos::new(3, 0, -3)));
+
+        let changes = holder.take_changed_light_sections();
+        assert!(changes.sky.is_empty());
+        assert_eq!(changes.block, vec![section]);
+        assert!(holder.take_changed_light_sections().is_empty());
+
+        holder.clear_broadcast_queued();
+        assert!(!holder.has_changes_to_broadcast());
+    }
+
+    #[test]
+    fn block_and_light_changes_share_broadcast_queue_state() {
+        let holder = ChunkHolder::new(ChunkPos::new(0, 0), 0, 0, 16);
+
+        assert!(holder.block_changed(BlockPos::new(1, 2, 3)));
+        assert!(!holder.light_changed(LightLayer::Block, SectionPos::new(0, 0, 0)));
+        assert!(holder.has_changes_to_broadcast());
+
+        holder.clear_broadcast_queued();
+        let block_changes = holder.take_changed_blocks();
+        let light_changes = holder.take_changed_light_sections();
+        assert_eq!(block_changes.len(), 1);
+        assert_eq!(light_changes.block, vec![SectionPos::new(0, 0, 0)]);
+        assert!(!holder.has_changes_to_broadcast());
+
+        assert!(holder.light_changed(LightLayer::Sky, SectionPos::new(0, -1, 0)));
+    }
 }

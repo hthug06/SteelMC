@@ -13,7 +13,7 @@ use std::{
 };
 use steel_protocol::packet_traits::EncodedPacket;
 use steel_protocol::packets::game::{
-    BlockChange, CBlockUpdate, CSectionBlocksUpdate, CSetChunkCenter,
+    BlockChange, CBlockUpdate, CLightUpdate, CSectionBlocksUpdate, CSetChunkCenter,
 };
 use steel_protocol::utils::ConnectionProtocol;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
@@ -29,6 +29,10 @@ use crate::behavior::{BLOCK_BEHAVIORS, FLUID_BEHAVIORS};
 use crate::chunk::chunk_holder::ChunkHolder;
 use crate::chunk::chunk_ticket_manager::{
     ChunkTicketManager, LevelChange, MAX_VIEW_DISTANCE, is_full,
+};
+use crate::chunk::light::{
+    LightCacheLayout, LightCacheSetupRadius, LightLayer, LightSectionRange, LightWorkset,
+    build_chunk_light_update_packet_for_sections, propagate_block_light_changes,
 };
 use crate::chunk::player_chunk_view::PlayerChunkView;
 use crate::chunk::{chunk_access::ChunkAccess, chunk_ticket_manager::is_ticked};
@@ -215,7 +219,7 @@ impl ChunkMap {
             SectionPos::block_to_section_coord(pos.0.z),
         );
 
-        if let Some(holder) = self.chunks.read_sync(&chunk_pos, |_, h| h.clone())
+        if let Some(holder) = self.chunks.read_sync(&chunk_pos, |_, h| Arc::clone(h))
             && holder.block_changed(pos)
         {
             // First change for this chunk - add to broadcast list
@@ -223,7 +227,62 @@ impl ChunkMap {
         }
     }
 
-    /// Broadcasts all pending block changes to nearby players.
+    /// Records a light-section change at the given position.
+    pub fn light_changed(&self, layer: LightLayer, section_pos: SectionPos) {
+        let chunk_pos = ChunkPos::new(section_pos.x(), section_pos.z());
+
+        if let Some(holder) = self.chunks.read_sync(&chunk_pos, |_, h| Arc::clone(h))
+            && holder.light_changed(layer, section_pos)
+        {
+            self.chunks_to_broadcast.lock().push(holder);
+        }
+    }
+
+    /// Runs a scoped ScalableLux-style block-light update for one changed block.
+    pub fn propagate_block_light_change(&self, pos: BlockPos) {
+        let center = ChunkPos::new(
+            SectionPos::block_to_section_coord(pos.0.x),
+            SectionPos::block_to_section_coord(pos.0.z),
+        );
+        let Ok(range) = LightSectionRange::from_world_height(
+            self.world_gen_context.min_y(),
+            self.world_gen_context.height(),
+        ) else {
+            log::warn!("Cannot run block-light update for invalid world height");
+            return;
+        };
+
+        let layout = LightCacheLayout::new(center, range);
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |chunk_pos| {
+                let holder = self
+                    .chunks
+                    .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))?;
+                if holder.try_chunk(ChunkStatus::Full).is_none() {
+                    return None;
+                }
+                Some(Arc::clone(&holder))
+            },
+            |_| true,
+        ) else {
+            log::warn!("Failed to set up block-light workset for {pos:?}");
+            return;
+        };
+
+        let Ok(result) = propagate_block_light_changes(&workset, [pos]) else {
+            log::warn!("Failed to propagate block-light change for {pos:?}");
+            return;
+        };
+
+        for section_pos in result.updated_sections {
+            self.light_changed(LightLayer::Block, section_pos);
+        }
+    }
+
+    /// Broadcasts all pending block and light changes to nearby players.
     ///
     /// # Panics
     /// Panics if a section has exactly one change (should never happen).
@@ -242,10 +301,13 @@ impl ChunkMap {
             let chunk_pos = holder.get_pos();
             let min_y = holder.min_y();
 
+            holder.clear_broadcast_queued();
+
+            let light_changes = holder.take_changed_light_sections();
             // Take all pending changes from this chunk holder
             let changes_by_section = holder.take_changed_blocks();
 
-            if changes_by_section.is_empty() {
+            if light_changes.is_empty() && changes_by_section.is_empty() {
                 continue;
             }
 
@@ -253,6 +315,41 @@ impl ChunkMap {
             let tracking_players = world.player_area_map.get_tracking_players(chunk_pos);
             if tracking_players.is_empty() {
                 continue;
+            }
+
+            if !light_changes.is_empty()
+                && let Some(chunk) = holder.try_chunk(ChunkStatus::Full)
+            {
+                let light_data = {
+                    let light = chunk.light();
+                    build_chunk_light_update_packet_for_sections(
+                        chunk_pos,
+                        &light,
+                        &light_changes.sky,
+                        &light_changes.block,
+                    )
+                };
+                let light_packet = CLightUpdate {
+                    x: chunk_pos.0.x,
+                    z: chunk_pos.0.y,
+                    light_data,
+                };
+
+                let encoded = EncodedPacket::from_bare(
+                    light_packet,
+                    world.compression,
+                    ConnectionProtocol::Play,
+                );
+                match encoded {
+                    Ok(encoded) => {
+                        for entity_id in &tracking_players {
+                            if let Some(player) = world.players.get_by_entity_id(*entity_id) {
+                                player.connection.send_encoded(encoded.clone());
+                            }
+                        }
+                    }
+                    Err(_) => log::warn!("Failed to encode light update packet"),
+                }
             }
 
             // For each section with changes, send appropriate packet

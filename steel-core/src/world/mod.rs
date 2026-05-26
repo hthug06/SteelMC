@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::chunk::chunk_access::{ChunkAccess, ChunkStatus};
+use crate::chunk::light::has_different_light_properties;
 use crate::world::game_event_context::GameEventContext;
 use crate::world::game_event_listener::{GameEventListenerStorage, SharedGameEventListener};
 use crate::{chunk::chunk_map::ChunkMapGameTickTimings, world::weather::Weather};
@@ -754,6 +755,9 @@ impl World {
         // Record the block change for broadcasting to clients
         log::debug!("Block changed at {pos:?}: {old_state:?} -> {block_state:?}");
         self.chunk_map.block_changed(pos);
+        if has_different_light_properties(old_state, block_state) {
+            self.chunk_map.propagate_block_light_change(pos);
+        }
 
         // Neighbor updates (when UPDATE_NEIGHBORS is set)
         if flags.contains(UpdateFlags::UPDATE_NEIGHBORS) {

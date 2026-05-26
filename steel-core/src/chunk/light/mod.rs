@@ -121,7 +121,10 @@ pub use nibble::{
     ChunkLightData, ChunkLightEmptinessMapLengthError, ChunkLightLayerStorage, LightNibbleArray,
     LightNibbleExtrudeNullSourceError, LightNibbleSaveState, LightNibbleState,
 };
-pub use packet::{build_chunk_light_update_packet, build_light_update_packet};
+pub use packet::{
+    build_chunk_light_update_packet, build_chunk_light_update_packet_for_sections,
+    build_light_update_packet,
+};
 pub use propagation::{
     BlockLightPropagationContext, BlockLightPropagationContextError, BlockLightUpdateResult,
     propagate_block_light_changes,
@@ -164,8 +167,9 @@ mod tests {
         LightNibbleState, LightPropagationQueue, LightPropagationQueues, LightQueueEntry,
         LightSectionRange, LightSectionState, LightSectionStateError, LightSectionType,
         MissingLightDataLayerError, QueuedLightUpdate, SkyLightSourceNeighborhood,
-        build_chunk_light_update_packet, build_light_update_packet, get_light_block_into,
-        get_light_opacity, has_different_light_properties, light_face_occludes,
+        build_chunk_light_update_packet, build_chunk_light_update_packet_for_sections,
+        build_light_update_packet, get_light_block_into, get_light_opacity,
+        has_different_light_properties, light_face_occludes,
     };
 
     fn init_light_tests() {
@@ -1361,6 +1365,42 @@ mod tests {
         assert_eq!(packet.empty_block_y_mask.0[0], 0);
         assert!(packet.sky_updates.is_empty());
         assert!(packet.block_updates.is_empty());
+    }
+
+    #[test]
+    fn chunk_light_update_packet_filters_sections_in_packet_order() {
+        let Ok(mut light) = ChunkLightData::new(0, 32) else {
+            panic!("valid two-section height rejected");
+        };
+        let chunk_pos = ChunkPos::new(2, -3);
+        let lower = SectionPos::new(2, 0, -3);
+        let upper = SectionPos::new(2, 1, -3);
+
+        {
+            let Some(lower_nibble) = light.block.nibble_mut(0) else {
+                panic!("lower block nibble missing");
+            };
+            lower_nibble.set_non_null();
+            lower_nibble.set(0, 0, 0, 4);
+            assert!(lower_nibble.update_visible());
+
+            let Some(upper_nibble) = light.block.nibble_mut(1) else {
+                panic!("upper block nibble missing");
+            };
+            upper_nibble.set_non_null();
+            upper_nibble.set(0, 0, 0, 9);
+            assert!(upper_nibble.update_visible());
+        }
+
+        let packet =
+            build_chunk_light_update_packet_for_sections(chunk_pos, &light, &[], &[upper, lower]);
+
+        assert_eq!(packet.sky_y_mask.0[0], 0);
+        assert_eq!(packet.block_y_mask.0[0], 0b0110);
+        assert_eq!(packet.empty_block_y_mask.0[0], 0);
+        assert_eq!(packet.block_updates.len(), 2);
+        assert_eq!(packet.block_updates[0][0], 0x04);
+        assert_eq!(packet.block_updates[1][0], 0x09);
     }
 
     #[test]
