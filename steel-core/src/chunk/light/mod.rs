@@ -107,6 +107,7 @@ mod packet;
 mod queue;
 mod section_storage;
 mod sky_sources;
+mod workset;
 
 pub use cache::{
     CachedLightBlock, CachedLightChunk, CachedLightSection, LIGHT_CACHE_CHUNK_SLOTS,
@@ -133,6 +134,9 @@ pub use section_storage::{
     LightSectionStateError, LightSectionType, MissingLightDataLayerError,
 };
 pub use sky_sources::{ChunkSkyLightSources, SkyLightSourceNeighborhood};
+pub use workset::{
+    LightChunkReadCache, LightSectionReadCache, LightWorkset, LightWorksetSetupError,
+};
 
 #[cfg(test)]
 mod tests {
