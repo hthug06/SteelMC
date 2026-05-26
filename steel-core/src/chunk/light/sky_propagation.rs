@@ -103,6 +103,46 @@ pub fn propagate_sky_light_chunk(
     })
 }
 
+/// Runs ScalableLux-style sky-light propagation for changed blocks in a scoped workset.
+pub fn propagate_sky_light_changes(
+    workset: &LightWorkset,
+    positions: impl IntoIterator<Item = BlockPos>,
+) -> Result<SkyLightUpdateResult, SkyLightPropagationContextError> {
+    let positions = positions.into_iter().collect::<Vec<_>>();
+
+    workset.with_chunk_read_cache(|chunk_cache| {
+        let layout = chunk_cache.layout();
+        let Some(center_slot) = layout.cached_chunk(layout.center_chunk()) else {
+            return Err(SkyLightPropagationContextError::MissingCenterChunk {
+                chunk_pos: layout.center_chunk(),
+            });
+        };
+        if chunk_cache.chunk(center_slot).is_none() {
+            return Err(SkyLightPropagationContextError::MissingCenterChunk {
+                chunk_pos: layout.center_chunk(),
+            });
+        }
+
+        chunk_cache.with_section_read_cache(|section_cache| {
+            chunk_cache.with_light_write_cache(LightLayer::Sky, |light_cache| {
+                let mut queues = PackedLightPropagationQueues::new();
+
+                {
+                    let mut context =
+                        SkyLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
+                    context.propagate_block_changes(&positions);
+                }
+
+                let mut updated_sections = Vec::new();
+                light_cache.update_visible(None, |section_pos| {
+                    updated_sections.push(section_pos);
+                });
+                Ok(SkyLightUpdateResult { updated_sections })
+            })
+        })
+    })
+}
+
 /// ScalableLux-style sky-light propagation over scoped Steel light caches.
 pub struct SkyLightPropagationContext<'a, 'sections, 'light> {
     layout: LightCacheLayout,
@@ -251,9 +291,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         let current_level = self.light.get_updating(cached_block);
         if current_level == MAX_LIGHT_LEVEL {
             self.enqueue_increase(
-                block_pos.x(),
-                block_pos.y(),
-                block_pos.z(),
+                block_pos,
                 current_level,
                 LightDirectionSet::all(),
                 LightQueueFlags::EMPTY.with(LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS),
@@ -269,6 +307,47 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
             LightQueueFlags::EMPTY,
         );
         true
+    }
+
+    /// Handles sky-light source and opacity changes for blocks in the center chunk.
+    pub fn propagate_block_changes(&mut self, positions: &[BlockPos]) {
+        let chunk_pos = self.layout.center_chunk();
+        self.initialize_changed_section_nibbles(chunk_pos, positions);
+
+        let mut changed_column_max_y = [i32::MIN; 16 * 16];
+        for position in positions {
+            if SectionPos::block_to_section_coord(position.x()) != chunk_pos.0.x
+                || SectionPos::block_to_section_coord(position.z()) != chunk_pos.0.y
+            {
+                continue;
+            }
+
+            let index = ((position.x() & 15) | ((position.z() & 15) << 4)) as usize;
+            changed_column_max_y[index] = changed_column_max_y[index].max(position.y());
+        }
+
+        let mut delayed_increases = Vec::new();
+        let mut delayed_decreases = Vec::new();
+        for (index, max_y) in changed_column_max_y.into_iter().enumerate() {
+            if max_y == i32::MIN {
+                continue;
+            }
+
+            let x = (chunk_pos.0.x << 4) | (index as i32 & 15);
+            let z = (chunk_pos.0.y << 4) | ((index as i32 >> 4) & 15);
+            let max_propagation_y =
+                self.try_propagate_skylight_delayed(x, max_y, z, true, &mut delayed_increases);
+            self.remove_sky_sources_below(x, max_propagation_y, z, &mut delayed_decreases);
+        }
+
+        self.process_delayed_increases(&delayed_increases);
+        self.process_delayed_decreases(&delayed_decreases);
+
+        for position in positions {
+            self.check_block(*position);
+        }
+
+        self.perform_light_decrease();
     }
 
     /// Calculates the sky-light value that should exist at `block_pos`.
@@ -417,9 +496,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                 let mut z = start_z;
                 for _ in 0..16 {
                     self.enqueue_increase(
-                        x,
-                        y,
-                        z,
+                        BlockPos::new(x, y, z),
                         MAX_LIGHT_LEVEL,
                         directions,
                         LightQueueFlags::EMPTY,
@@ -431,12 +508,28 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         }
     }
 
-    fn try_propagate_skylight(
+    fn try_propagate_skylight(&mut self, x: i32, y: i32, z: i32, extrude_initialized: bool) -> i32 {
+        self.try_propagate_skylight_inner(x, y, z, extrude_initialized, None)
+    }
+
+    fn try_propagate_skylight_delayed(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        extrude_initialized: bool,
+        delayed_increases: &mut Vec<PackedLightQueueEntry>,
+    ) -> i32 {
+        self.try_propagate_skylight_inner(x, y, z, extrude_initialized, Some(delayed_increases))
+    }
+
+    fn try_propagate_skylight_inner(
         &mut self,
         x: i32,
         mut y: i32,
         z: i32,
         extrude_initialized: bool,
+        mut delayed_increases: Option<&mut Vec<PackedLightQueueEntry>>,
     ) -> i32 {
         if self.get_light_level_extruded(BlockPos::new(x, y + 1, z)) != MAX_LIGHT_LEVEL {
             return y;
@@ -482,22 +575,134 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                 let Some(cached_block) = self.layout.cached_block(current_pos) else {
                     break;
                 };
-                self.light.set(cached_block, MAX_LIGHT_LEVEL);
-                self.enqueue_increase(
-                    x,
-                    y,
-                    z,
+                let increase_entry = self.enqueue_increase(
+                    current_pos,
                     MAX_LIGHT_LEVEL,
                     LightDirectionSet::all_except(LightAxisDirection::PositiveY),
                     Self::shape_flags(current_state),
                 );
                 above_state = current_state;
+
+                if let Some(delayed_increases) = delayed_increases.as_deref_mut() {
+                    if let Some(entry) = increase_entry {
+                        delayed_increases.push(entry);
+                    }
+                } else {
+                    self.light.set(cached_block, MAX_LIGHT_LEVEL);
+                }
             }
 
             y -= 1;
         }
 
         y
+    }
+
+    fn initialize_changed_section_nibbles(&mut self, chunk_pos: ChunkPos, positions: &[BlockPos]) {
+        let mut section_ys = Vec::new();
+        for position in positions {
+            if SectionPos::block_to_section_coord(position.x()) != chunk_pos.0.x
+                || SectionPos::block_to_section_coord(position.z()) != chunk_pos.0.y
+            {
+                continue;
+            }
+
+            let section_y = SectionPos::block_to_section_coord(position.y());
+            if !section_ys.contains(&section_y) {
+                section_ys.push(section_y);
+            }
+        }
+
+        for section_y in section_ys {
+            let section_pos = SectionPos::new(chunk_pos.0.x, section_y, chunk_pos.0.y);
+            if !self.sections.has_non_empty_section(section_pos) {
+                continue;
+            }
+
+            for offset_z in -1..=1 {
+                for offset_x in -1..=1 {
+                    for offset_y in (-1..=1).rev() {
+                        self.init_nibble(
+                            SectionPos::new(
+                                chunk_pos.0.x + offset_x,
+                                section_y + offset_y,
+                                chunk_pos.0.y + offset_z,
+                            ),
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_sky_sources_below(
+        &mut self,
+        x: i32,
+        mut y: i32,
+        z: i32,
+        delayed_decreases: &mut Vec<PackedLightQueueEntry>,
+    ) {
+        if self.get_light_level_extruded(BlockPos::new(x, y, z)) != MAX_LIGHT_LEVEL {
+            return;
+        }
+
+        let min_y = self.layout.range().min_section_y() << 4;
+        while y >= min_y {
+            if (y & 15) == 15 {
+                self.check_null_section(
+                    ChunkPos::new(
+                        SectionPos::block_to_section_coord(x),
+                        SectionPos::block_to_section_coord(z),
+                    ),
+                    SectionPos::block_to_section_coord(y),
+                    true,
+                );
+            }
+
+            let current_pos = BlockPos::new(x, y, z);
+            let section_pos = SectionPos::from_block_pos(current_pos);
+            if !self.light.has_non_null_section(section_pos) {
+                y &= !15;
+                y -= 1;
+                continue;
+            }
+
+            let Some(cached_block) = self.layout.cached_block(current_pos) else {
+                break;
+            };
+            if self.light.get_updating(cached_block) != MAX_LIGHT_LEVEL {
+                break;
+            }
+
+            if let Some(entry) = self.enqueue_decrease(
+                current_pos,
+                MAX_LIGHT_LEVEL,
+                LightDirectionSet::all_except(LightAxisDirection::PositiveY),
+                LightQueueFlags::EMPTY,
+            ) {
+                delayed_decreases.push(entry);
+            }
+            y -= 1;
+        }
+    }
+
+    fn process_delayed_increases(&mut self, entries: &[PackedLightQueueEntry]) {
+        for entry in entries {
+            let Some(source_block) = self.cached_block_from_entry(*entry) else {
+                continue;
+            };
+            self.light.set(source_block, entry.level());
+        }
+    }
+
+    fn process_delayed_decreases(&mut self, entries: &[PackedLightQueueEntry]) {
+        for entry in entries {
+            let Some(source_block) = self.cached_block_from_entry(*entry) else {
+                continue;
+            };
+            self.light.set(source_block, 0);
+        }
     }
 
     fn get_light_level_extruded(&self, block_pos: BlockPos) -> u8 {
@@ -587,7 +792,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                 };
                 let level = self.light.get_updating(source_block);
                 if level > 1 {
-                    self.enqueue_increase(x, y, z, level, directions, flags);
+                    self.enqueue_increase(source_pos, level, directions, flags);
                 }
                 x += increment_x;
                 z += increment_z;
@@ -768,9 +973,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                 self.light.set(neighbor_block, target_level);
                 if target_level > 1 {
                     self.enqueue_increase(
-                        neighbor_pos.x(),
-                        neighbor_pos.y(),
-                        neighbor_pos.z(),
+                        neighbor_pos,
                         target_level,
                         LightDirectionSet::all_except_opposite(axis_direction),
                         flags,
@@ -816,9 +1019,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
 
                 if current_level > target_level {
                     self.enqueue_increase(
-                        neighbor_pos.x(),
-                        neighbor_pos.y(),
-                        neighbor_pos.z(),
+                        neighbor_pos,
                         current_level,
                         LightDirectionSet::all(),
                         flags.with(LightQueueFlags::RECHECK_LEVEL),
@@ -894,32 +1095,28 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         level: u8,
         directions: LightDirectionSet,
         flags: LightQueueFlags,
-    ) {
+    ) -> Option<PackedLightQueueEntry> {
         let Some(packed_pos) = self.layout.encode_block_pos(block_pos) else {
-            return;
+            return None;
         };
-        self.queues
-            .enqueue_decrease(PackedLightQueueEntry::from_parts(
-                packed_pos, level, directions, flags,
-            ));
+        let entry = PackedLightQueueEntry::from_parts(packed_pos, level, directions, flags);
+        self.queues.enqueue_decrease(entry);
+        Some(entry)
     }
 
     fn enqueue_increase(
         &mut self,
-        x: i32,
-        y: i32,
-        z: i32,
+        block_pos: BlockPos,
         level: u8,
         directions: LightDirectionSet,
         flags: LightQueueFlags,
-    ) {
-        let Some(packed_pos) = self.layout.encode_block_pos(BlockPos::new(x, y, z)) else {
-            return;
+    ) -> Option<PackedLightQueueEntry> {
+        let Some(packed_pos) = self.layout.encode_block_pos(block_pos) else {
+            return None;
         };
-        self.queues
-            .enqueue_increase(PackedLightQueueEntry::from_parts(
-                packed_pos, level, directions, flags,
-            ));
+        let entry = PackedLightQueueEntry::from_parts(packed_pos, level, directions, flags);
+        self.queues.enqueue_increase(entry);
+        Some(entry)
     }
 
     fn block_state(&self, block_pos: BlockPos) -> steel_utils::BlockStateId {
@@ -1009,6 +1206,7 @@ mod tests {
     use std::sync::{Arc, Weak};
 
     use steel_registry::{test_support::init_test_registry, vanilla_blocks};
+    use steel_utils::types::UpdateFlags;
 
     use super::*;
     use crate::behavior::init_behaviors;
@@ -1138,6 +1336,107 @@ mod tests {
         assert_eq!(nibble.get_visible_at_index(top_air.local_index), 15);
         assert_eq!(nibble.get_visible_at_index(lower_air.local_index), 15);
         assert_eq!(nibble.get_visible_at_index(stone.local_index), 0);
+    }
+
+    #[test]
+    fn sky_light_changes_add_and_remove_air_column_shadow() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let holder = holder_with_section(center, ChunkSection::new_empty());
+        let changed_pos = BlockPos::new(1, 14, 1);
+        let layout = LightCacheLayout::new(center, range());
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        assert!(
+            chunk
+                .set_block_state(
+                    changed_pos,
+                    vanilla_blocks::STONE.default_state(),
+                    UpdateFlags::UPDATE_CLIENTS,
+                )
+                .is_some()
+        );
+        drop(chunk);
+
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_sky_light_changes(&workset, [changed_pos]) else {
+            panic!("matching sky caches should run sky block changes");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(above) = layout.cached_block(BlockPos::new(1, 15, 1)) else {
+            panic!("above block should be cached");
+        };
+        let Some(stone) = layout.cached_block(changed_pos) else {
+            panic!("changed block should be cached");
+        };
+        let Some(below) = layout.cached_block(BlockPos::new(1, 13, 1)) else {
+            panic!("below block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(above.local_index), 15);
+        assert_eq!(nibble.get_visible_at_index(stone.local_index), 0);
+        assert_eq!(nibble.get_visible_at_index(below.local_index), 14);
+        drop(light);
+        drop(chunk);
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        assert!(
+            chunk
+                .set_block_state(
+                    changed_pos,
+                    vanilla_blocks::AIR.default_state(),
+                    UpdateFlags::UPDATE_CLIENTS,
+                )
+                .is_some()
+        );
+        drop(chunk);
+
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+        let Ok(result) = propagate_sky_light_changes(&workset, [changed_pos]) else {
+            panic!("matching sky caches should run sky block changes");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(above.local_index), 15);
+        assert_eq!(nibble.get_visible_at_index(stone.local_index), 15);
+        assert_eq!(nibble.get_visible_at_index(below.local_index), 15);
     }
 
     #[test]

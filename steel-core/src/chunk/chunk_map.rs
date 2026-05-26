@@ -33,6 +33,7 @@ use crate::chunk::chunk_ticket_manager::{
 use crate::chunk::light::{
     LightCacheLayout, LightCacheSetupRadius, LightLayer, LightSectionRange, LightWorkset,
     build_chunk_light_update_packet_for_sections, propagate_block_light_changes,
+    propagate_sky_light_changes,
 };
 use crate::chunk::player_chunk_view::PlayerChunkView;
 use crate::chunk::{chunk_access::ChunkAccess, chunk_ticket_manager::is_ticked};
@@ -238,22 +239,16 @@ impl ChunkMap {
         }
     }
 
-    /// Runs a scoped ScalableLux-style block-light update for one changed block.
-    pub fn propagate_block_light_change(&self, pos: BlockPos) {
-        let center = ChunkPos::new(
-            SectionPos::block_to_section_coord(pos.0.x),
-            SectionPos::block_to_section_coord(pos.0.z),
-        );
+    fn light_workset_for_change(&self, center: ChunkPos) -> Option<LightWorkset> {
         let Ok(range) = LightSectionRange::from_world_height(
             self.world_gen_context.min_y(),
             self.world_gen_context.height(),
         ) else {
-            log::warn!("Cannot run block-light update for invalid world height");
-            return;
+            return None;
         };
 
         let layout = LightCacheLayout::new(center, range);
-        let Ok(workset) = LightWorkset::setup(
+        LightWorkset::setup(
             layout,
             LightCacheSetupRadius::Inner,
             true,
@@ -264,10 +259,41 @@ impl ChunkMap {
                 if holder.try_chunk(ChunkStatus::Full).is_none() {
                     return None;
                 }
-                Some(Arc::clone(&holder))
+                Some(holder)
             },
             |_| true,
-        ) else {
+        )
+        .ok()
+    }
+
+    /// Runs a scoped ScalableLux-style sky-light update for one changed block.
+    pub fn propagate_sky_light_change(&self, pos: BlockPos) {
+        let center = ChunkPos::new(
+            SectionPos::block_to_section_coord(pos.0.x),
+            SectionPos::block_to_section_coord(pos.0.z),
+        );
+        let Some(workset) = self.light_workset_for_change(center) else {
+            log::warn!("Failed to set up sky-light workset for {pos:?}");
+            return;
+        };
+
+        let Ok(result) = propagate_sky_light_changes(&workset, [pos]) else {
+            log::warn!("Failed to propagate sky-light change for {pos:?}");
+            return;
+        };
+
+        for section_pos in result.updated_sections {
+            self.light_changed(LightLayer::Sky, section_pos);
+        }
+    }
+
+    /// Runs a scoped ScalableLux-style block-light update for one changed block.
+    pub fn propagate_block_light_change(&self, pos: BlockPos) {
+        let center = ChunkPos::new(
+            SectionPos::block_to_section_coord(pos.0.x),
+            SectionPos::block_to_section_coord(pos.0.z),
+        );
+        let Some(workset) = self.light_workset_for_change(center) else {
             log::warn!("Failed to set up block-light workset for {pos:?}");
             return;
         };

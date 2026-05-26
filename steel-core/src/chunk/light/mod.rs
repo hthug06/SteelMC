@@ -144,7 +144,8 @@ pub use section_storage::{
 };
 pub use sky_propagation::{
     SkyLightChunkEdgeChecks, SkyLightPropagationContext, SkyLightPropagationContextError,
-    SkyLightUpdateResult, propagate_sky_light_chunk, propagate_sky_light_chunk_without_edge_checks,
+    SkyLightUpdateResult, propagate_sky_light_changes, propagate_sky_light_chunk,
+    propagate_sky_light_chunk_without_edge_checks,
 };
 pub use sky_sources::{ChunkSkyLightSources, SkyLightSourceNeighborhood};
 pub use workset::{

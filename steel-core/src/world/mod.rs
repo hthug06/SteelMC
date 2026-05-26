@@ -756,6 +756,9 @@ impl World {
         log::debug!("Block changed at {pos:?}: {old_state:?} -> {block_state:?}");
         self.chunk_map.block_changed(pos);
         if has_different_light_properties(old_state, block_state) {
+            if self.dimension_type.has_skylight {
+                self.chunk_map.propagate_sky_light_change(pos);
+            }
             self.chunk_map.propagate_block_light_change(pos);
         }
 
