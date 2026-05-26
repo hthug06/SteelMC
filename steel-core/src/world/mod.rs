@@ -2627,6 +2627,25 @@ mod tests {
         Sections::from_owned(sections.into_boxed_slice())
     }
 
+    fn insert_proto_chunk_at_status(world: &Arc<World>, proto: ProtoChunk, status: ChunkStatus) {
+        let chunk_pos = proto.pos;
+        let holder = Arc::new(ChunkHolder::new(
+            chunk_pos,
+            0,
+            world.get_min_y(),
+            world.get_height(),
+        ));
+        holder.insert_chunk(ChunkAccess::Proto(proto), status);
+        if world
+            .chunk_map
+            .chunks
+            .insert_sync(chunk_pos, holder)
+            .is_err()
+        {
+            panic!("test chunk should insert into empty chunk map");
+        }
+    }
+
     fn insert_full_proto_chunk(world: &Arc<World>, proto: ProtoChunk) {
         let chunk_pos = proto.pos;
         let level_chunk = LevelChunk::from_proto(
@@ -2758,5 +2777,65 @@ mod tests {
         assert_eq!(changed, Some(vanilla_blocks::STONE.default_state()));
         assert_eq!(world.light_value_at(LightLayer::Block, opened), 14);
         assert_eq!(world.light_value_at(LightLayer::Block, east), 13);
+    }
+
+    #[test]
+    fn direct_initialized_proto_block_change_updates_light() {
+        init_tests();
+        let world = empty_test_world();
+        let chunk_pos = ChunkPos::new(0, 0);
+        let source = BlockPos::new(0, world.get_min_y() + 1, 1);
+        let opened = BlockPos::new(1, world.get_min_y() + 1, 1);
+        let east = BlockPos::new(2, world.get_min_y() + 1, 1);
+        let local_y = (source.y() & 15) as usize;
+
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(0, local_y, 1, vanilla_blocks::LIGHT.default_state());
+        section.set_block_state(1, local_y, 1, vanilla_blocks::STONE.default_state());
+
+        let mut sections = (0..(world.get_height() / 16) as usize)
+            .map(|_| ChunkSection::new_empty())
+            .collect::<Vec<_>>();
+        sections[0] = section;
+        let proto = ProtoChunk::new(
+            Sections::from_owned(sections.into_boxed_slice()),
+            chunk_pos,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(&world),
+        );
+        proto.initialize_light_sources();
+        proto.set_status(ChunkStatus::InitializeLight);
+        set_visible_block_light(&proto, source, 15);
+        insert_proto_chunk_at_status(&world, proto, ChunkStatus::InitializeLight);
+
+        let changed = world
+            .chunk_map
+            .with_chunk_at_status(chunk_pos, ChunkStatus::InitializeLight, |chunk| {
+                chunk.set_block_state(
+                    opened,
+                    vanilla_blocks::AIR.default_state(),
+                    UpdateFlags::UPDATE_NONE,
+                )
+            })
+            .flatten();
+
+        let Some((opened_light, east_light)) = world.chunk_map.with_chunk_at_status(
+            chunk_pos,
+            ChunkStatus::InitializeLight,
+            |chunk| {
+                let light = chunk.light();
+                (
+                    light.get_light_value(LightLayer::Block, opened),
+                    light.get_light_value(LightLayer::Block, east),
+                )
+            },
+        ) else {
+            panic!("test proto chunk should remain available");
+        };
+
+        assert_eq!(changed, Some(vanilla_blocks::STONE.default_state()));
+        assert_eq!(opened_light, 14);
+        assert_eq!(east_light, 13);
     }
 }

@@ -256,7 +256,7 @@ impl ChunkMap {
                 let holder = self
                     .chunks
                     .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))?;
-                if holder.try_chunk(ChunkStatus::Full).is_none() {
+                if holder.try_chunk(ChunkStatus::InitializeLight).is_none() {
                     return None;
                 }
                 Some(holder)
