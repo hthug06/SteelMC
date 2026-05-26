@@ -48,6 +48,7 @@ pub fn propagate_block_light_changes(
                 let mut queues = PackedLightPropagationQueues::new();
 
                 {
+                    initialize_block_light_nibbles(section_cache, light_cache);
                     let mut context =
                         BlockLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
                     for position in positions {
@@ -64,6 +65,50 @@ pub fn propagate_block_light_changes(
             })
         })
     })
+}
+
+fn initialize_block_light_nibbles(
+    sections: &LightSectionReadCache<'_>,
+    light: &mut LightLayerWriteCache<'_>,
+) -> usize {
+    let layout = sections.layout();
+    let mut initialized = 0;
+
+    for section_slot in 0..layout.section_slot_count() {
+        let Some(section_pos) = layout.section_pos_for_slot(section_slot) else {
+            continue;
+        };
+        if !has_non_empty_neighbor_section(sections, section_pos) {
+            continue;
+        }
+        if light.set_section_slot_non_null(section_slot) {
+            initialized += 1;
+        }
+    }
+
+    initialized
+}
+
+fn has_non_empty_neighbor_section(
+    sections: &LightSectionReadCache<'_>,
+    section_pos: SectionPos,
+) -> bool {
+    for offset_z in -1..=1 {
+        for offset_x in -1..=1 {
+            for offset_y in -1..=1 {
+                let neighbor = SectionPos::new(
+                    section_pos.x() + offset_x,
+                    section_pos.y() + offset_y,
+                    section_pos.z() + offset_z,
+                );
+                if sections.has_non_empty_section(neighbor) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// ScalableLux-style block-light propagation over scoped Steel light caches.
@@ -566,7 +611,6 @@ mod tests {
         let mut section = ChunkSection::new_empty();
         section.set_block_state(1, 1, 1, vanilla_blocks::LIGHT.default_state());
         let holder = holder_with_section(center, section);
-        set_block_nibble_non_null(&holder, 0);
         let layout = LightCacheLayout::new(center, range());
         let Ok(workset) = LightWorkset::setup(
             layout,
@@ -582,7 +626,7 @@ mod tests {
             panic!("matching block caches should run block light updates");
         };
 
-        assert_eq!(result.updated_sections, vec![SectionPos::new(0, 0, 0)]);
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
 
         let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
             panic!("test chunk should be available");
@@ -642,7 +686,7 @@ mod tests {
             panic!("matching block caches should run block light updates");
         };
 
-        assert_eq!(result.updated_sections, vec![SectionPos::new(0, 0, 0)]);
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
 
         let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
             panic!("test chunk should be available");

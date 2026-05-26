@@ -288,6 +288,17 @@ impl LightSectionReadCache<'_> {
         section.states.get_at_index(cached_block.local_index)
     }
 
+    /// Returns whether a cached section exists and is non-empty.
+    #[must_use]
+    pub fn has_non_empty_section(&self, section_pos: SectionPos) -> bool {
+        let Some(cached_section) = self.layout.cached_section(section_pos) else {
+            return false;
+        };
+        self.sections
+            .get_slot(cached_section.section_slot)
+            .is_some_and(|section| !section.is_empty())
+    }
+
     fn air() -> BlockStateId {
         REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR)
     }
@@ -331,6 +342,28 @@ impl LightLayerWriteCache<'_> {
     pub fn has_non_null_updating(&self, cached_block: CachedLightBlock) -> bool {
         self.nibble(cached_block.section_slot)
             .is_some_and(|nibble| !nibble.is_null_updating())
+    }
+
+    /// Marks a cached light section non-null without allocating light bytes.
+    ///
+    /// Returns false when the section has no writable cached nibble.
+    pub fn set_section_non_null(&mut self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        self.set_section_slot_non_null(section_slot)
+    }
+
+    /// Marks a cached section slot non-null without allocating light bytes.
+    ///
+    /// Returns false when the section slot has no writable cached nibble.
+    pub fn set_section_slot_non_null(&mut self, section_slot: usize) -> bool {
+        let Some(nibble) = self.nibble_mut(section_slot) else {
+            return false;
+        };
+        let was_null = nibble.is_null_updating();
+        nibble.set_non_null();
+        was_null
     }
 
     /// Returns an updating light value for a section slot and local nibble index.
@@ -563,6 +596,33 @@ mod tests {
     }
 
     #[test]
+    fn section_read_cache_reports_non_empty_sections() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(1, 2, 3, vanilla_blocks::STONE.default_state());
+        let holder = holder_with_section(center, section);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        workset.with_chunk_read_cache(|chunk_cache| {
+            chunk_cache.with_section_read_cache(|section_cache| {
+                assert!(section_cache.has_non_empty_section(SectionPos::new(0, 0, 0)));
+                assert!(!section_cache.has_non_empty_section(SectionPos::new(0, 1, 0)));
+                assert!(!section_cache.has_non_empty_section(SectionPos::new(1, 0, 0)));
+            });
+        });
+    }
+
+    #[test]
     fn light_write_cache_reads_writes_and_publishes_cached_nibbles() {
         init_tests();
         let center = ChunkPos::new(0, 0);
@@ -700,6 +760,50 @@ mod tests {
         };
         assert!(nibble.is_null_updating());
         assert_eq!(nibble.get_updating_at_index(cached_block.local_index), 0);
+    }
+
+    #[test]
+    fn light_write_cache_can_mark_sections_non_null_without_allocating() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let holder = holder_with_section(center, ChunkSection::new_empty());
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+        let section_pos = SectionPos::new(0, 0, 0);
+
+        workset.with_chunk_read_cache(|chunk_cache| {
+            chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
+                assert!(light_cache.set_section_non_null(section_pos));
+                assert!(!light_cache.set_section_non_null(section_pos));
+
+                let mut updated_sections = Vec::new();
+                assert_eq!(
+                    light_cache.update_visible(None, |updated| {
+                        updated_sections.push(updated);
+                    }),
+                    1
+                );
+                assert_eq!(updated_sections, vec![section_pos]);
+            });
+        });
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should still be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.block.nibble(0) else {
+            panic!("block nibble should be present");
+        };
+        assert!(!nibble.is_null_visible());
+        assert!(!nibble.is_initialized_visible());
     }
 
     #[test]
