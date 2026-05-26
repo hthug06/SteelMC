@@ -39,11 +39,30 @@ use steel_utils::{ChunkPos, Identifier};
 use tokio::runtime::Runtime;
 use toml::map::Map;
 
+#[derive(Clone, Deserialize, Debug, Eq, PartialEq)]
+struct LightSectionDebug {
+    state: String,
+    #[serde(default)]
+    non_zero_bytes: Option<usize>,
+    #[serde(default)]
+    byte_hash: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Debug, Eq, PartialEq)]
+struct LightChunkDebug {
+    min_section_y: i32,
+    section_count: usize,
+    sky: Vec<LightSectionDebug>,
+    block: Vec<LightSectionDebug>,
+}
+
 #[derive(Deserialize, Debug)]
 struct ChunkStageEntry {
     x: i32,
     z: i32,
     stages: FxHashMap<String, String>,
+    #[serde(default)]
+    light_debug: Option<LightChunkDebug>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -63,6 +82,8 @@ struct ChunkStageHashesJson {
     light_hash_capture: Option<String>,
     #[serde(default)]
     light_hash_format: Option<String>,
+    #[serde(default)]
+    light_debug_format: Option<String>,
     dimensions: FxHashMap<String, DimensionData>,
 }
 
@@ -101,6 +122,7 @@ const FEATURE_HASH_CAPTURE_AFTER_ALL_READY: &str = "after_all_tracked_features_r
 const HASHSET_ITERATION_ORDER_INSERTION: &str = "insertion_order";
 const LIGHT_HASH_CAPTURE_AFTER_LIGHT_STATUS_READY: &str = "after_light_status_ready";
 const LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_v1";
+const LIGHT_DEBUG_FORMAT_SECTION_MARKERS_V1: &str = "section_markers_v1";
 
 fn load_expected_hashes() -> ChunkStageHashesJson {
     let json_str = include_str!("../test_assets/chunk_stage_hashes.json");
@@ -327,60 +349,162 @@ fn bitset_contains(bitset: &steel_utils::codec::BitSet, index: usize) -> bool {
         .is_some_and(|bits| bits & (1 << (index % 64)) != 0)
 }
 
-fn light_layer_markers(
+fn md5_hex(bytes: &[u8]) -> String {
+    let mut ctx = md5::Context::new();
+    ctx.consume(bytes);
+    format!("{:x}", ctx.finalize())
+}
+
+fn light_layer_debug(
     section_count: usize,
     data_mask: &steel_utils::codec::BitSet,
     empty_mask: &steel_utils::codec::BitSet,
     updates: &[Vec<u8>],
-) -> Vec<String> {
+) -> Vec<LightSectionDebug> {
     let mut update_index = 0;
-    let mut markers = Vec::with_capacity(section_count);
+    let mut sections = Vec::with_capacity(section_count);
     for section_index in 0..section_count {
         if bitset_contains(empty_mask, section_index) {
-            markers.push("empty".to_owned());
+            sections.push(LightSectionDebug {
+                state: "empty".to_owned(),
+                non_zero_bytes: None,
+                byte_hash: None,
+            });
         } else if bitset_contains(data_mask, section_index) {
             let update = &updates[update_index];
             let non_zero = update.iter().filter(|byte| **byte != 0).count();
             let all_full = update.iter().all(|byte| *byte == 0xff);
-            markers.push(if all_full {
-                "full".to_owned()
-            } else {
-                format!("data({non_zero} nz-bytes)")
+            sections.push(LightSectionDebug {
+                state: if all_full { "full" } else { "data" }.to_owned(),
+                non_zero_bytes: (non_zero != 0).then_some(non_zero),
+                byte_hash: Some(md5_hex(update)),
             });
             update_index += 1;
         } else {
-            markers.push("null".to_owned());
+            sections.push(LightSectionDebug {
+                state: "null".to_owned(),
+                non_zero_bytes: None,
+                byte_hash: None,
+            });
         }
     }
-    markers
+    sections
 }
 
-fn debug_light_summary(light: &ChunkLightData) -> String {
+fn actual_light_debug(light: &ChunkLightData) -> LightChunkDebug {
     let packet = build_chunk_light_update_packet(light);
     let range = light.sky.range();
-    let sky = light_layer_markers(
+    let sky = light_layer_debug(
         range.section_count(),
         &packet.sky_y_mask,
         &packet.empty_sky_y_mask,
         &packet.sky_updates,
     );
-    let block = light_layer_markers(
+    let block = light_layer_debug(
         range.section_count(),
         &packet.block_y_mask,
         &packet.empty_block_y_mask,
         &packet.block_updates,
     );
 
+    LightChunkDebug {
+        min_section_y: range.min_section_y(),
+        section_count: range.section_count(),
+        sky,
+        block,
+    }
+}
+
+fn format_light_section_debug(section: &LightSectionDebug) -> String {
+    let mut label = section.state.clone();
+    if let Some(non_zero_bytes) = section.non_zero_bytes {
+        let _ = write!(label, "({non_zero_bytes} nz-bytes");
+        if let Some(byte_hash) = &section.byte_hash {
+            let _ = write!(label, ", {byte_hash}");
+        }
+        label.push(')');
+    } else if let Some(byte_hash) = &section.byte_hash {
+        let _ = write!(label, "({byte_hash})");
+    }
+    label
+}
+
+fn format_light_debug(debug: &LightChunkDebug) -> String {
     let mut out = String::new();
-    for section_index in 0..range.section_count() {
-        let Some(section_y) = range.section_y(section_index) else {
+    for section_index in 0..debug.section_count {
+        let Ok(section_offset) = i32::try_from(section_index) else {
             continue;
         };
+        let section_y = debug.min_section_y + section_offset;
+        let sky = debug
+            .sky
+            .get(section_index)
+            .map(format_light_section_debug)
+            .unwrap_or_else(|| "missing".to_owned());
+        let block = debug
+            .block
+            .get(section_index)
+            .map(format_light_section_debug)
+            .unwrap_or_else(|| "missing".to_owned());
+        let _ = writeln!(out, "    y={section_y:4}: sky={:18} block={}", sky, block);
+    }
+    out
+}
+
+fn debug_light_differences(expected: &LightChunkDebug, actual: &LightChunkDebug) -> String {
+    let mut out = String::new();
+    if expected.min_section_y != actual.min_section_y
+        || expected.section_count != actual.section_count
+    {
         let _ = writeln!(
             out,
-            "    y={section_y:4}: sky={:18} block={}",
-            sky[section_index], block[section_index]
+            "    range expected min={} count={}, actual min={} count={}",
+            expected.min_section_y,
+            expected.section_count,
+            actual.min_section_y,
+            actual.section_count
         );
+    }
+
+    let section_count = expected.section_count.min(actual.section_count);
+    let mut shown = 0;
+    for section_index in 0..section_count {
+        let expected_sky = expected.sky.get(section_index);
+        let actual_sky = actual.sky.get(section_index);
+        let expected_block = expected.block.get(section_index);
+        let actual_block = actual.block.get(section_index);
+        if expected_sky == actual_sky && expected_block == actual_block {
+            continue;
+        }
+
+        let Ok(section_offset) = i32::try_from(section_index) else {
+            continue;
+        };
+        let section_y = expected.min_section_y + section_offset;
+        let _ = writeln!(
+            out,
+            "    y={section_y:4}: expected sky={:18} block={}; actual sky={:18} block={}",
+            expected_sky
+                .map(format_light_section_debug)
+                .unwrap_or_else(|| "missing".to_owned()),
+            expected_block
+                .map(format_light_section_debug)
+                .unwrap_or_else(|| "missing".to_owned()),
+            actual_sky
+                .map(format_light_section_debug)
+                .unwrap_or_else(|| "missing".to_owned()),
+            actual_block
+                .map(format_light_section_debug)
+                .unwrap_or_else(|| "missing".to_owned()),
+        );
+        shown += 1;
+        if shown == 12 {
+            break;
+        }
+    }
+
+    if shown == 0 && out.is_empty() {
+        out.push_str("    no section-marker differences found\n");
     }
     out
 }
@@ -886,7 +1010,7 @@ fn chunk_light_hashes_inner() {
                 entry
                     .stages
                     .get(LIGHT_STAGE)
-                    .map(|hash| (entry.x, entry.z, hash.as_str()))
+                    .map(|hash| (entry.x, entry.z, hash.as_str(), entry.light_debug.as_ref()))
             })
             .collect::<Vec<_>>();
         if stage_entries.is_empty() {
@@ -905,6 +1029,16 @@ fn chunk_light_hashes_inner() {
             Some(LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1),
             "light hashes must use the packet data-layer format; rerun the extractor"
         );
+        if stage_entries
+            .iter()
+            .any(|(_, _, _, light_debug)| light_debug.is_some())
+        {
+            assert_eq!(
+                expected.light_debug_format.as_deref(),
+                Some(LIGHT_DEBUG_FORMAT_SECTION_MARKERS_V1),
+                "light debug data must use the section-marker format; rerun the extractor"
+            );
+        }
 
         let dim_short = dim_key.strip_prefix("minecraft:").unwrap_or(dim_key);
         let dim_type = match dim_key {
@@ -938,7 +1072,9 @@ fn chunk_light_hashes_inner() {
         let total = stage_entries.len();
         let mut mismatches = Vec::new();
         let mut light_requests = Vec::with_capacity(total);
-        for (i, (chunk_x, chunk_z, expected_hash)) in stage_entries.iter().copied().enumerate() {
+        for (i, (chunk_x, chunk_z, expected_hash, expected_light_debug)) in
+            stage_entries.iter().copied().enumerate()
+        {
             let pos = ChunkPos::new(chunk_x, chunk_z);
             let request =
                 world
@@ -959,8 +1095,9 @@ fn chunk_light_hashes_inner() {
                 panic!("ready light chunk missing at ({chunk_x}, {chunk_z})");
             };
             let light = chunk.light();
-            let summary = emit_light_summary.then(|| {
-                let mut summary = debug_light_summary(&light);
+            let actual_debug = emit_light_summary.then(|| actual_light_debug(&light));
+            let summary = actual_debug.as_ref().map(|debug| {
+                let mut summary = format_light_debug(debug);
                 let section_summary = debug_chunk_section_summary(&chunk);
                 if !section_summary.is_empty() {
                     let _ = writeln!(summary, "  generated non-empty sections:");
@@ -986,6 +1123,18 @@ fn chunk_light_hashes_inner() {
                 if let Some(summary) = summary {
                     eprintln!(
                         "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) actual packet light sections:\n{summary}"
+                    );
+                }
+                if let (Some(expected_debug), Some(actual_debug)) =
+                    (expected_light_debug, actual_debug.as_ref())
+                {
+                    eprintln!(
+                        "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) expected vanilla packet light sections:\n{}",
+                        format_light_debug(expected_debug)
+                    );
+                    eprintln!(
+                        "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) differing light sections:\n{}",
+                        debug_light_differences(expected_debug, &actual_debug)
                     );
                 }
                 mismatches.push((chunk_x, chunk_z, expected_hash.to_owned(), actual_hash));
