@@ -680,12 +680,11 @@ impl LevelChunk {
 
         if was_empty != is_empty {
             self.update_light_section_emptiness(y, is_empty);
-            // TODO: Notify LevelLightEngine::update_section_status once Steel owns live light storage.
         }
 
-        if has_different_light_properties(old_state, state) {
+        let light_properties_changed = has_different_light_properties(old_state, state);
+        if light_properties_changed {
             self.update_sky_light_sources(local_x, y, local_z);
-            // TODO: Notify LevelLightEngine::check_block once Steel owns live light storage.
         }
 
         // Re-read the block to verify it wasn't changed concurrently
@@ -699,6 +698,10 @@ impl LevelChunk {
         }
 
         if let Some(level) = self.get_level() {
+            if light_properties_changed {
+                level.propagate_light_change_after_block_set(pos, old_state, state);
+            }
+
             // Update POI storage when block states change
             level
                 .poi_storage

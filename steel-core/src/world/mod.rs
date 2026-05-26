@@ -684,6 +684,22 @@ impl World {
             .unwrap_or_else(|| REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR))
     }
 
+    pub(crate) fn propagate_light_change_after_block_set(
+        &self,
+        pos: BlockPos,
+        old_state: BlockStateId,
+        new_state: BlockStateId,
+    ) {
+        if !has_different_light_properties(old_state, new_state) {
+            return;
+        }
+
+        if self.dimension_type.has_skylight {
+            self.chunk_map.propagate_sky_light_change(pos);
+        }
+        self.chunk_map.propagate_block_light_change(pos);
+    }
+
     fn light_value_at(&self, layer: LightLayer, pos: BlockPos) -> u8 {
         if layer == LightLayer::Sky && !self.dimension_type.has_skylight {
             return 0;
@@ -779,12 +795,6 @@ impl World {
         // Record the block change for broadcasting to clients
         log::debug!("Block changed at {pos:?}: {old_state:?} -> {block_state:?}");
         self.chunk_map.block_changed(pos);
-        if has_different_light_properties(old_state, block_state) {
-            if self.dimension_type.has_skylight {
-                self.chunk_map.propagate_sky_light_change(pos);
-            }
-            self.chunk_map.propagate_block_light_change(pos);
-        }
 
         // Neighbor updates (when UPDATE_NEIGHBORS is set)
         if flags.contains(UpdateFlags::UPDATE_NEIGHBORS) {
@@ -2540,10 +2550,12 @@ mod tests {
     use std::sync::Arc;
 
     use rayon::ThreadPoolBuilder;
-    use steel_registry::{test_support::init_test_registry, vanilla_dimension_types};
+    use steel_registry::{
+        test_support::init_test_registry, vanilla_blocks, vanilla_dimension_types,
+    };
     use steel_utils::{
         BlockPos, ChunkPos, Identifier, SectionPos,
-        types::{Difficulty, GameType},
+        types::{Difficulty, GameType, UpdateFlags},
     };
     use tokio::runtime::Builder as RuntimeBuilder;
 
@@ -2615,6 +2627,31 @@ mod tests {
         Sections::from_owned(sections.into_boxed_slice())
     }
 
+    fn insert_full_proto_chunk(world: &Arc<World>, proto: ProtoChunk) {
+        let chunk_pos = proto.pos;
+        let level_chunk = LevelChunk::from_proto(
+            proto,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(world),
+        );
+        let holder = Arc::new(ChunkHolder::new(
+            chunk_pos,
+            0,
+            world.get_min_y(),
+            world.get_height(),
+        ));
+        holder.insert_chunk(ChunkAccess::Full(level_chunk), ChunkStatus::Full);
+        if world
+            .chunk_map
+            .chunks
+            .insert_sync(chunk_pos, holder)
+            .is_err()
+        {
+            panic!("test chunk should insert into empty chunk map");
+        }
+    }
+
     fn insert_full_chunk_with_visible_light(
         world: &Arc<World>,
         chunk_pos: ChunkPos,
@@ -2649,27 +2686,22 @@ mod tests {
             assert!(sky.update_visible());
         }
 
-        let level_chunk = LevelChunk::from_proto(
-            proto,
-            world.get_min_y(),
-            world.get_height(),
-            Arc::downgrade(world),
-        );
-        let holder = Arc::new(ChunkHolder::new(
-            chunk_pos,
-            0,
-            world.get_min_y(),
-            world.get_height(),
-        ));
-        holder.insert_chunk(ChunkAccess::Full(level_chunk), ChunkStatus::Full);
-        if world
-            .chunk_map
-            .chunks
-            .insert_sync(chunk_pos, holder)
-            .is_err()
-        {
-            panic!("test chunk should insert into empty chunk map");
-        }
+        insert_full_proto_chunk(world, proto);
+    }
+
+    fn set_visible_block_light(proto: &ProtoChunk, pos: BlockPos, level: u8) {
+        let section_y = SectionPos::block_to_section_coord(pos.y());
+        let local_x = (pos.x() & 15) as usize;
+        let local_y = (pos.y() & 15) as usize;
+        let local_z = (pos.z() & 15) as usize;
+
+        let mut light = proto.light.write();
+        let Some(block) = light.block.nibble_mut(section_y) else {
+            panic!("test block light section should be inside light range");
+        };
+        block.set_non_null();
+        block.set(local_x, local_y, local_z, level);
+        assert!(block.update_visible());
     }
 
     #[test]
@@ -2682,5 +2714,49 @@ mod tests {
 
         assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 0), 9);
         assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 7), 3);
+    }
+
+    #[test]
+    fn direct_full_chunk_block_change_updates_light() {
+        init_tests();
+        let world = empty_test_world();
+        let chunk_pos = ChunkPos::new(0, 0);
+        let source = BlockPos::new(0, world.get_min_y() + 1, 1);
+        let opened = BlockPos::new(1, world.get_min_y() + 1, 1);
+        let east = BlockPos::new(2, world.get_min_y() + 1, 1);
+        let local_y = (source.y() & 15) as usize;
+
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(0, local_y, 1, vanilla_blocks::LIGHT.default_state());
+        section.set_block_state(1, local_y, 1, vanilla_blocks::STONE.default_state());
+
+        let mut sections = (0..(world.get_height() / 16) as usize)
+            .map(|_| ChunkSection::new_empty())
+            .collect::<Vec<_>>();
+        sections[0] = section;
+        let proto = ProtoChunk::new(
+            Sections::from_owned(sections.into_boxed_slice()),
+            chunk_pos,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(&world),
+        );
+        set_visible_block_light(&proto, source, 15);
+        insert_full_proto_chunk(&world, proto);
+
+        let changed = world
+            .chunk_map
+            .with_full_chunk(chunk_pos, |chunk| {
+                chunk.set_block_state(
+                    opened,
+                    vanilla_blocks::AIR.default_state(),
+                    UpdateFlags::UPDATE_NONE,
+                )
+            })
+            .flatten();
+
+        assert_eq!(changed, Some(vanilla_blocks::STONE.default_state()));
+        assert_eq!(world.light_value_at(LightLayer::Block, opened), 14);
+        assert_eq!(world.light_value_at(LightLayer::Block, east), 13);
     }
 }
