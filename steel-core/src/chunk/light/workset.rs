@@ -366,6 +366,26 @@ impl LightLayerWriteCache<'_> {
         was_null
     }
 
+    /// Returns true when a cached section has a writable non-null updating nibble.
+    #[must_use]
+    pub fn has_non_null_section(&self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        self.nibble(section_slot)
+            .is_some_and(|nibble| !nibble.is_null_updating())
+    }
+
+    /// Returns true when a cached section has initialized updating light bytes.
+    #[must_use]
+    pub fn is_section_initialized_updating(&self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        self.nibble(section_slot)
+            .is_some_and(LightNibbleArray::is_initialized_updating)
+    }
+
     /// Returns an updating light value for a section slot and local nibble index.
     #[must_use]
     pub fn get_updating_at_section_index(&self, section_slot: usize, local_index: usize) -> u8 {
@@ -783,6 +803,8 @@ mod tests {
             chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
                 assert!(light_cache.set_section_non_null(section_pos));
                 assert!(!light_cache.set_section_non_null(section_pos));
+                assert!(light_cache.has_non_null_section(section_pos));
+                assert!(!light_cache.is_section_initialized_updating(section_pos));
 
                 let mut updated_sections = Vec::new();
                 assert_eq!(
