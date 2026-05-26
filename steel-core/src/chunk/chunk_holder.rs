@@ -195,7 +195,7 @@ impl ChunkHolder {
         !self.queued_for_broadcast.swap(true, Ordering::AcqRel)
     }
 
-    /// Records a light-section change.
+    /// Records a light-section change for a full chunk and marks loaded chunks dirty.
     ///
     /// Returns `true` if this is the first pending broadcast change for the
     /// chunk holder.
@@ -208,6 +208,24 @@ impl ChunkHolder {
             return false;
         };
         if range.section_index(section_pos.y()).is_none() {
+            return false;
+        }
+
+        let ready_for_packet = {
+            let chunk = self.data.read();
+            match &*chunk {
+                ChunkAccess::Full(_) => {
+                    chunk.mark_dirty();
+                    true
+                }
+                ChunkAccess::Proto(_) => {
+                    chunk.mark_dirty();
+                    false
+                }
+                ChunkAccess::Unloaded => false,
+            }
+        };
+        if !ready_for_packet {
             return false;
         }
 
@@ -632,13 +650,43 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Weak;
+
+    use steel_registry::test_support::init_test_registry;
     use steel_utils::{BlockPos, ChunkPos, SectionPos};
 
     use super::*;
+    use crate::{
+        behavior::init_behaviors,
+        chunk::{
+            level_chunk::LevelChunk,
+            proto_chunk::ProtoChunk,
+            section::{ChunkSection, Sections},
+        },
+    };
+
+    fn sections_for_height(height: i32) -> Sections {
+        let section_count = (height / 16) as usize;
+        let sections = (0..section_count)
+            .map(|_| ChunkSection::new_empty())
+            .collect::<Vec<_>>();
+        Sections::from_owned(sections.into_boxed_slice())
+    }
+
+    fn holder_with_full_chunk(pos: ChunkPos, min_y: i32, height: i32) -> ChunkHolder {
+        init_test_registry();
+        init_behaviors();
+        let sections = sections_for_height(height);
+        let proto = ProtoChunk::new(sections, pos, min_y, height, Weak::new());
+        let full = LevelChunk::from_proto(proto, min_y, height, Weak::new());
+        let holder = ChunkHolder::new(pos, 0, min_y, height);
+        holder.insert_chunk(ChunkAccess::Full(full), ChunkStatus::Full);
+        holder
+    }
 
     #[test]
     fn light_changed_tracks_layer_sections() {
-        let holder = ChunkHolder::new(ChunkPos::new(2, -3), 0, 0, 32);
+        let holder = holder_with_full_chunk(ChunkPos::new(2, -3), 0, 32);
         let section = SectionPos::new(2, 0, -3);
 
         assert!(!holder.has_changes_to_broadcast());
@@ -658,7 +706,7 @@ mod tests {
 
     #[test]
     fn block_and_light_changes_share_broadcast_queue_state() {
-        let holder = ChunkHolder::new(ChunkPos::new(0, 0), 0, 0, 16);
+        let holder = holder_with_full_chunk(ChunkPos::new(0, 0), 0, 16);
 
         assert!(holder.block_changed(BlockPos::new(1, 2, 3)));
         assert!(!holder.light_changed(LightLayer::Block, SectionPos::new(0, 0, 0)));
@@ -672,5 +720,31 @@ mod tests {
         assert!(!holder.has_changes_to_broadcast());
 
         assert!(holder.light_changed(LightLayer::Sky, SectionPos::new(0, -1, 0)));
+    }
+
+    #[test]
+    fn light_changed_marks_proto_chunk_dirty_without_queueing_broadcast() {
+        init_test_registry();
+        let pos = ChunkPos::new(0, 0);
+        let holder = ChunkHolder::new(pos, 0, 0, 16);
+        let sections = sections_for_height(16);
+        let proto = ProtoChunk::new(sections, pos, 0, 16, Weak::new());
+        proto.dirty.store(false, Ordering::Release);
+        holder.insert_chunk(ChunkAccess::Proto(proto), ChunkStatus::Light);
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Light) else {
+            panic!("test chunk should be loaded");
+        };
+        assert!(!chunk.is_dirty());
+        drop(chunk);
+
+        assert!(!holder.light_changed(LightLayer::Sky, SectionPos::new(0, 0, 0)));
+        assert!(!holder.has_changes_to_broadcast());
+        assert!(holder.take_changed_light_sections().is_empty());
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Light) else {
+            panic!("test chunk should still be loaded");
+        };
+        assert!(chunk.is_dirty());
     }
 }

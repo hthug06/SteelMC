@@ -22,7 +22,7 @@ use steel_core::chunk::chunk_access::{ChunkAccess, ChunkStatus};
 use steel_core::chunk::chunk_generation_task::StaticCache2D;
 use steel_core::chunk::chunk_holder::ChunkHolder;
 use steel_core::chunk::chunk_pyramid::GENERATION_PYRAMID;
-use steel_core::chunk::chunk_request::{ChunkRequest, ChunkRequestState, ChunkTicketKind};
+use steel_core::chunk::chunk_request::{ChunkRequestState, ChunkTicketKind};
 use steel_core::chunk::light::{ChunkLightData, LightLayer, build_chunk_light_update_packet};
 use steel_core::chunk::proto_chunk::ProtoChunk;
 use steel_core::chunk::section::{ChunkSection, Sections};
@@ -930,53 +930,49 @@ fn chunk_light_hashes_inner() {
             _ => unreachable!(),
         });
         let world = create_test_world(dim_key, dim_type, seed, generator);
-        let positions = stage_entries
-            .iter()
-            .map(|(x, z, _)| ChunkPos::new(*x, *z))
-            .collect::<Vec<_>>();
-        let request = world.chunk_map.request_chunks(ChunkRequest {
-            status: ChunkStatus::Light,
-            positions,
-            ticket_kind: ChunkTicketKind::Command,
-        });
-
         eprintln!(
-            "[{dim_short}/{LIGHT_STAGE}] requesting {} chunks to LIGHT",
+            "[{dim_short}/{LIGHT_STAGE}] requesting {} chunks to LIGHT in x/z order",
             stage_entries.len()
         );
-        drive_chunk_request(&world, &request, dim_short);
-        let Some(ready_chunks) = request.ready_chunks() else {
-            panic!("{dim_short}/{LIGHT_STAGE}: request reported ready without ready chunks");
-        };
 
-        let mut actual_by_pos =
-            FxHashMap::with_capacity_and_hasher(ready_chunks.holders.len(), FxBuildHasher);
-        let mut summary_by_pos =
-            FxHashMap::with_capacity_and_hasher(ready_chunks.holders.len(), FxBuildHasher);
-        for holder in ready_chunks.holders {
-            let pos = holder.get_pos();
+        let total = stage_entries.len();
+        let mut mismatches = Vec::new();
+        let mut light_requests = Vec::with_capacity(total);
+        for (i, (chunk_x, chunk_z, expected_hash)) in stage_entries.iter().copied().enumerate() {
+            let pos = ChunkPos::new(chunk_x, chunk_z);
+            let request =
+                world
+                    .chunk_map
+                    .request_chunk(pos, ChunkStatus::Light, ChunkTicketKind::Command);
+            drive_chunk_request(&world, &request, dim_short);
+            let Some(ready_chunks) = request.ready_chunks() else {
+                panic!(
+                    "{dim_short}/{LIGHT_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
+                );
+            };
+            let Some(holder) = ready_chunks.holders.into_iter().next() else {
+                panic!(
+                    "{dim_short}/{LIGHT_STAGE}: missing ready holder for ({chunk_x}, {chunk_z})"
+                );
+            };
             let Some(chunk) = holder.try_chunk(ChunkStatus::Light) else {
-                panic!("ready light chunk missing at ({}, {})", pos.0.x, pos.0.y);
+                panic!("ready light chunk missing at ({chunk_x}, {chunk_z})");
             };
             let light = chunk.light();
-            if emit_light_summary {
+            let summary = emit_light_summary.then(|| {
                 let mut summary = debug_light_summary(&light);
                 let section_summary = debug_chunk_section_summary(&chunk);
                 if !section_summary.is_empty() {
                     let _ = writeln!(summary, "  generated non-empty sections:");
                     summary.push_str(&section_summary);
                 }
-                summary_by_pos.insert((pos.0.x, pos.0.y), summary);
-            }
-            actual_by_pos.insert((pos.0.x, pos.0.y), compute_light_hash(&light));
-        }
+                summary
+            });
+            let actual_hash = compute_light_hash(&light);
+            drop(light);
+            drop(chunk);
+            light_requests.push(request);
 
-        let total = stage_entries.len();
-        let mut mismatches = Vec::new();
-        for (i, (chunk_x, chunk_z, expected_hash)) in stage_entries.iter().copied().enumerate() {
-            let Some(actual_hash) = actual_by_pos.get(&(chunk_x, chunk_z)) else {
-                panic!("{dim_short}/{LIGHT_STAGE}: missing generated chunk ({chunk_x}, {chunk_z})");
-            };
             let ok = actual_hash == expected_hash;
             if (i + 1) % 10 == 0 || i + 1 == total || !ok {
                 let status = if ok { "OK" } else { "MISMATCH" };
@@ -987,18 +983,12 @@ fn chunk_light_hashes_inner() {
             }
 
             if !ok {
-                if emit_light_summary && let Some(summary) = summary_by_pos.get(&(chunk_x, chunk_z))
-                {
+                if let Some(summary) = summary {
                     eprintln!(
                         "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) actual packet light sections:\n{summary}"
                     );
                 }
-                mismatches.push((
-                    chunk_x,
-                    chunk_z,
-                    expected_hash.to_owned(),
-                    actual_hash.to_owned(),
-                ));
+                mismatches.push((chunk_x, chunk_z, expected_hash.to_owned(), actual_hash));
                 if stop_after_first_mismatch {
                     break;
                 }

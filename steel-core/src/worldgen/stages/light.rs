@@ -6,12 +6,13 @@ use crate::chunk::{
     chunk_holder::ChunkHolder,
     chunk_pyramid::ChunkStep,
     light::{
-        BlockLightChunkEdgeChecks, LightCacheLayout, LightCacheSetupRadius, LightSectionRange,
-        LightWorkset, SkyLightChunkEdgeChecks, propagate_block_light_chunk,
+        BlockLightChunkEdgeChecks, LightCacheLayout, LightCacheSetupRadius, LightLayer,
+        LightSectionRange, LightWorkset, SkyLightChunkEdgeChecks, propagate_block_light_chunk,
         propagate_sky_light_chunk,
     },
 };
 use crate::worldgen::context::WorldGenContext;
+use steel_utils::SectionPos;
 
 pub(crate) fn initialize(
     _context: Arc<WorldGenContext>,
@@ -27,15 +28,20 @@ pub(crate) fn initialize(
 }
 
 pub(crate) fn generate(
-    _context: Arc<WorldGenContext>,
+    context: Arc<WorldGenContext>,
     _step: &ChunkStep,
     cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
     holder: Arc<ChunkHolder>,
 ) {
-    run_light_stage(cache, holder.as_ref());
+    let (sky_updates, block_updates) = run_light_stage(cache, holder.as_ref());
+    publish_light_updates(&context, LightLayer::Sky, sky_updates);
+    publish_light_updates(&context, LightLayer::Block, block_updates);
 }
 
-fn run_light_stage(cache: &StaticCache2D<Arc<ChunkHolder>>, holder: &ChunkHolder) {
+fn run_light_stage(
+    cache: &StaticCache2D<Arc<ChunkHolder>>,
+    holder: &ChunkHolder,
+) -> (Vec<SectionPos>, Vec<SectionPos>) {
     let center = holder.get_pos();
     if holder.try_chunk(ChunkStatus::InitializeLight).is_none() {
         panic!("Chunk not found at status InitializeLight");
@@ -66,12 +72,32 @@ fn run_light_stage(cache: &StaticCache2D<Arc<ChunkHolder>>, holder: &ChunkHolder
         panic!("required light-stage chunk is missing");
     };
 
-    let Ok(_) = propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required) else {
+    let Ok(sky_result) = propagate_sky_light_chunk(&workset, SkyLightChunkEdgeChecks::Required)
+    else {
         panic!("sky light chunk propagation failed");
     };
-    let Ok(_) = propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required) else {
+    let Ok(block_result) =
+        propagate_block_light_chunk(&workset, BlockLightChunkEdgeChecks::Required)
+    else {
         panic!("block light chunk propagation failed");
     };
+
+    (sky_result.updated_sections, block_result.updated_sections)
+}
+
+fn publish_light_updates(
+    context: &WorldGenContext,
+    layer: LightLayer,
+    updated_sections: Vec<SectionPos>,
+) {
+    if updated_sections.is_empty() {
+        return;
+    }
+
+    let world = context.world();
+    for section_pos in updated_sections {
+        world.chunk_map.light_changed(layer, section_pos);
+    }
 }
 
 #[cfg(test)]

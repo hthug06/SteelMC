@@ -51,7 +51,8 @@ pub const REGION_MAGIC: [u8; 4] = *b"STLR";
 /// v14: Added buried treasure procedural piece persistence.
 /// v15: Added procedural structure-piece payload persistence.
 /// v16: Added chunk-owned light nibble persistence.
-pub const FORMAT_VERSION: u16 = 16;
+/// v17: Invalidated pre-ScalableLux empty-section light data.
+pub const FORMAT_VERSION: u16 = 17;
 
 /// Number of chunks per region side (32×32 = 1024 chunks per region).
 pub const REGION_SIZE: usize = 32;
