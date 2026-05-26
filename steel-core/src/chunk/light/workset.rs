@@ -180,7 +180,10 @@ impl LightChunkReadCache<'_> {
             }
         }
 
-        let cache = LightSectionReadCache { sections };
+        let cache = LightSectionReadCache {
+            layout: self.layout,
+            sections,
+        };
         f(&cache)
     }
 
@@ -260,10 +263,17 @@ impl LightChunkReadCache<'_> {
 
 /// Flat cached chunk-section reads for ScalableLux-style block-state access.
 pub struct LightSectionReadCache<'a> {
+    layout: LightCacheLayout,
     sections: LightSectionSlotArray<RwLockReadGuard<'a, ChunkSection>>,
 }
 
 impl LightSectionReadCache<'_> {
+    /// Returns this read cache's layout.
+    #[must_use]
+    pub const fn layout(&self) -> LightCacheLayout {
+        self.layout
+    }
+
     /// Returns the block state for a cached light block, or air for missing sections.
     #[must_use]
     pub fn get_block_state(&self, cached_block: CachedLightBlock) -> BlockStateId {
@@ -314,6 +324,13 @@ impl LightLayerWriteCache<'_> {
     #[must_use]
     pub fn get_updating(&self, cached_block: CachedLightBlock) -> u8 {
         self.get_updating_at_section_index(cached_block.section_slot, cached_block.local_index)
+    }
+
+    /// Returns true when a cached block has a non-null updating nibble.
+    #[must_use]
+    pub fn has_non_null_updating(&self, cached_block: CachedLightBlock) -> bool {
+        self.nibble(cached_block.section_slot)
+            .is_some_and(|nibble| !nibble.is_null_updating())
     }
 
     /// Returns an updating light value for a section slot and local nibble index.
