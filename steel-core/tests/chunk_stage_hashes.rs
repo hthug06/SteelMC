@@ -39,7 +39,7 @@ use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::structure::TerrainAdjustment;
 use steel_registry::{dimension_type::DimensionTypeRef, vanilla_dimension_types};
 use steel_utils::types::{Difficulty, GameType};
-use steel_utils::{ChunkPos, Identifier};
+use steel_utils::{BlockPos, ChunkPos, Identifier};
 use tokio::runtime::Runtime;
 use toml::map::Map;
 
@@ -120,6 +120,7 @@ const DEBUG_CHUNK_ENV: &str = "STEEL_HASH_DEBUG_CHUNK";
 const DEBUG_DIMENSION_ENV: &str = "STEEL_HASH_DEBUG_DIMENSION";
 const DEBUG_STAGE_ENV: &str = "STEEL_HASH_DEBUG_STAGE";
 const DEBUG_LIGHT_SUMMARY_ENV: &str = "STEEL_HASH_DEBUG_LIGHT_SUMMARY";
+const DEBUG_LIGHT_WINDOW_ENV: &str = "STEEL_HASH_DEBUG_LIGHT_WINDOW";
 const DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV: &str = "STEEL_HASH_STOP_AFTER_FIRST_MISMATCH";
 const DEBUG_FIXTURE_PATH_ENV: &str = "STEEL_HASH_FIXTURE_PATH";
 const DEBUG_LIGHT_DATA_PATH_ENV: &str = "STEEL_HASH_LIGHT_DATA_PATH";
@@ -129,7 +130,7 @@ const LIGHT_STAGE: &str = "minecraft:light";
 const CHUNK_GENERATION_ORDER_X_Z_ASCENDING: &str = "x_z_ascending";
 const FEATURE_HASH_CAPTURE_AFTER_ALL_READY: &str = "after_all_tracked_features_ready";
 const HASHSET_ITERATION_ORDER_INSERTION: &str = "insertion_order";
-const LIGHT_HASH_CAPTURE_AFTER_LIGHT_STATUS_READY: &str = "after_light_status_ready";
+const LIGHT_HASH_CAPTURE_AFTER_ALL_TRACKED_LIGHT_READY: &str = "after_all_tracked_light_ready";
 const LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_v1";
 const LIGHT_DEBUG_FORMAT_SECTION_MARKERS_V1: &str = "section_markers_v1";
 const LIGHT_BINARY_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_binary_v1";
@@ -199,6 +200,58 @@ fn debug_stage_filter() -> Option<String> {
     env::var(DEBUG_STAGE_ENV)
         .ok()
         .filter(|stage| !stage.is_empty())
+}
+
+#[derive(Clone, Copy)]
+struct DebugLightWindow {
+    chunk_x: i32,
+    chunk_z: i32,
+    min_x: usize,
+    min_y: i32,
+    min_z: usize,
+    size_x: usize,
+    size_y: usize,
+    size_z: usize,
+}
+
+fn debug_light_window_filter() -> Option<DebugLightWindow> {
+    let value = env::var(DEBUG_LIGHT_WINDOW_ENV).ok()?;
+    let parts = value
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<i32>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|err| panic!("{DEBUG_LIGHT_WINDOW_ENV} has invalid integer: {err}"));
+    if parts.len() != 8 {
+        panic!(
+            "{DEBUG_LIGHT_WINDOW_ENV} must be '<chunk_x>,<chunk_z>,<local_x>,<world_y>,<local_z>,<size_x>,<size_y>,<size_z>'"
+        );
+    }
+
+    let [
+        chunk_x,
+        chunk_z,
+        min_x,
+        min_y,
+        min_z,
+        size_x,
+        size_y,
+        size_z,
+    ] = parts.as_slice()
+    else {
+        unreachable!();
+    };
+
+    Some(DebugLightWindow {
+        chunk_x: *chunk_x,
+        chunk_z: *chunk_z,
+        min_x: usize::try_from(*min_x).expect("light window local_x must be non-negative"),
+        min_y: *min_y,
+        min_z: usize::try_from(*min_z).expect("light window local_z must be non-negative"),
+        size_x: usize::try_from(*size_x).expect("light window size_x must be non-negative"),
+        size_y: usize::try_from(*size_y).expect("light window size_y must be non-negative"),
+        size_z: usize::try_from(*size_z).expect("light window size_z must be non-negative"),
+    })
 }
 
 fn empty_proto_chunk(
@@ -695,6 +748,93 @@ fn debug_raw_light_differences(
         out.push_str("    no raw light value differences found\n");
     }
     out
+}
+
+fn format_debug_light_window(
+    window: DebugLightWindow,
+    expected: Option<&ChunkLightBytes>,
+    actual: &ChunkLightData,
+    chunk: &ChunkAccess,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "    window chunk=({}, {}) local=({}, {}, {}) size=({}, {}, {})",
+        window.chunk_x,
+        window.chunk_z,
+        window.min_x,
+        window.min_y,
+        window.min_z,
+        window.size_x,
+        window.size_y,
+        window.size_z
+    );
+
+    for dy in (0..window.size_y).rev() {
+        let world_y = window.min_y + dy as i32;
+        let _ = writeln!(out, "      y={world_y}");
+        for dz in 0..window.size_z {
+            let local_z = window.min_z + dz;
+            let mut expected_row = String::with_capacity(window.size_x);
+            let mut actual_row = String::with_capacity(window.size_x);
+            let mut state_row = String::new();
+            for dx in 0..window.size_x {
+                let local_x = window.min_x + dx;
+                let world_x = window.chunk_x * 16 + local_x as i32;
+                let world_z = window.chunk_z * 16 + local_z as i32;
+                let actual_level = actual
+                    .get_light_value(LightLayer::Block, BlockPos::new(world_x, world_y, world_z));
+                let expected_level = expected
+                    .and_then(|light| light_bytes_block_value(light, world_y, local_x, local_z));
+                push_light_digit(&mut actual_row, actual_level);
+                match expected_level {
+                    Some(level) => push_light_digit(&mut expected_row, level),
+                    None => expected_row.push('?'),
+                }
+
+                if let Some(state) = chunk_state_at(chunk, local_x, world_y, local_z)
+                    && (state.get_light_emission() > 0 || expected_level.unwrap_or(0) > 8)
+                {
+                    let _ = write!(
+                        state_row,
+                        " ({local_x},{local_z})={}:{}",
+                        i32::from(state.0),
+                        state.get_light_emission()
+                    );
+                }
+            }
+            let _ = writeln!(
+                out,
+                "        z={local_z:2} expected={expected_row} actual={actual_row}{state_row}"
+            );
+        }
+    }
+
+    out
+}
+
+fn light_bytes_block_value(
+    light: &ChunkLightBytes,
+    world_y: i32,
+    local_x: usize,
+    local_z: usize,
+) -> Option<u8> {
+    let section_y = world_y.div_euclid(16);
+    let local_y = usize::try_from(world_y.rem_euclid(16)).ok()?;
+    let section_index = usize::try_from(section_y - light.min_section_y).ok()?;
+    let section = light.block.get(section_index)?;
+    let index = local_x | (local_z << 4) | (local_y << 8);
+    Some(light_value_from_section(section, index))
+}
+
+fn push_light_digit(out: &mut String, level: u8) {
+    let digit = match level {
+        0 => '.',
+        1..=9 => char::from(b'0' + level),
+        10..=15 => char::from(b'a' + (level - 10)),
+        _ => '?',
+    };
+    out.push(digit);
 }
 
 fn format_light_column_differences(
@@ -1402,6 +1542,7 @@ fn chunk_light_hashes_inner() {
     let debug_filter = debug_chunk_filter();
     let stop_after_first_mismatch = env::var_os(DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV).is_some();
     let emit_light_summary = env::var_os(DEBUG_LIGHT_SUMMARY_ENV).is_some();
+    let debug_light_window = debug_light_window_filter();
     let mut saw_light_hashes = false;
 
     for &dim_key in DIMENSION_ORDER {
@@ -1438,8 +1579,8 @@ fn chunk_light_hashes_inner() {
 
         assert_eq!(
             expected.light_hash_capture.as_deref(),
-            Some(LIGHT_HASH_CAPTURE_AFTER_LIGHT_STATUS_READY),
-            "light hashes must be extracted after LIGHT status is ready; rerun the extractor"
+            Some(LIGHT_HASH_CAPTURE_AFTER_ALL_TRACKED_LIGHT_READY),
+            "light hashes must be extracted after all tracked LIGHT chunks are ready; rerun the extractor"
         );
         assert_eq!(
             expected.light_hash_format.as_deref(),
@@ -1509,17 +1650,47 @@ fn chunk_light_hashes_inner() {
         );
 
         let total = stage_entries.len();
-        let mut mismatches = Vec::new();
         let mut light_requests = Vec::with_capacity(total);
-        for (i, (chunk_x, chunk_z, expected_hash, expected_light_debug)) in
-            stage_entries.iter().copied().enumerate()
-        {
+        for (i, (chunk_x, chunk_z, _, _)) in stage_entries.iter().copied().enumerate() {
             let pos = ChunkPos::new(chunk_x, chunk_z);
             let request =
                 world
                     .chunk_map
                     .request_chunk(pos, ChunkStatus::Light, ChunkTicketKind::Command);
             drive_chunk_request(&world, &request, dim_short);
+            let Some(ready_chunks) = request.ready_chunks() else {
+                panic!(
+                    "{dim_short}/{LIGHT_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
+                );
+            };
+            if ready_chunks.holders.is_empty() {
+                panic!(
+                    "{dim_short}/{LIGHT_STAGE}: missing ready holder for ({chunk_x}, {chunk_z})"
+                );
+            }
+            light_requests.push(request);
+
+            if (i + 1) % 10 == 0 || i + 1 == total {
+                eprintln!(
+                    "[{dim_short}/{LIGHT_STAGE}] ({chunk_x:3},{chunk_z:3}) ready [{}/{}]",
+                    i + 1,
+                    total
+                );
+            }
+        }
+
+        eprintln!(
+            "[{dim_short}/{LIGHT_STAGE}] comparing {} chunks after all tracked LIGHT requests are ready",
+            stage_entries.len()
+        );
+
+        let mut mismatches = Vec::new();
+        for (i, ((chunk_x, chunk_z, expected_hash, expected_light_debug), request)) in stage_entries
+            .iter()
+            .copied()
+            .zip(light_requests.iter())
+            .enumerate()
+        {
             let Some(ready_chunks) = request.ready_chunks() else {
                 panic!(
                     "{dim_short}/{LIGHT_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
@@ -1564,9 +1735,17 @@ fn chunk_light_hashes_inner() {
             } else {
                 None
             };
+            if let Some(window) = debug_light_window
+                && window.chunk_x == chunk_x
+                && window.chunk_z == chunk_z
+            {
+                eprintln!(
+                    "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) debug light window:\n{}",
+                    format_debug_light_window(window, expected_light_bytes, &light, &chunk)
+                );
+            }
             drop(light);
             drop(chunk);
-            light_requests.push(request);
 
             let ok = actual_hash == expected_hash;
             if (i + 1) % 10 == 0 || i + 1 == total || !ok {
