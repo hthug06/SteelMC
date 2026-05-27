@@ -12,6 +12,7 @@ use std::fmt::Write;
 use std::fs;
 use std::io::{BufReader, Cursor, Read as IoRead};
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -23,7 +24,10 @@ use steel_core::chunk::chunk_generation_task::StaticCache2D;
 use steel_core::chunk::chunk_holder::ChunkHolder;
 use steel_core::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use steel_core::chunk::chunk_request::{ChunkRequestState, ChunkTicketKind};
-use steel_core::chunk::light::{ChunkLightData, LightLayer, build_chunk_light_update_packet};
+use steel_core::chunk::light::{
+    ChunkLightData, DATA_LAYER_BLOCK_COUNT, DATA_LAYER_SIZE, LightLayer,
+    build_chunk_light_update_packet,
+};
 use steel_core::chunk::proto_chunk::ProtoChunk;
 use steel_core::chunk::section::{ChunkSection, Sections};
 use steel_core::level_data::WorldGenerationSettings;
@@ -84,6 +88,8 @@ struct ChunkStageHashesJson {
     light_hash_format: Option<String>,
     #[serde(default)]
     light_debug_format: Option<String>,
+    #[serde(default)]
+    light_binary_format: Option<String>,
     dimensions: FxHashMap<String, DimensionData>,
 }
 
@@ -103,6 +109,7 @@ const GENERATE_STRUCTURES: bool = true;
 
 /// Max block-level diffs to show per chunk before truncating.
 const MAX_DIFFS_PER_CHUNK: usize = 30;
+const MAX_LIGHT_DIFFS_PER_CHUNK: usize = 40;
 
 /// Set specific chunk coordinates to test only those chunks.
 /// When non-empty, only these chunks are generated and checked (ignores the JSON list).
@@ -115,6 +122,7 @@ const DEBUG_STAGE_ENV: &str = "STEEL_HASH_DEBUG_STAGE";
 const DEBUG_LIGHT_SUMMARY_ENV: &str = "STEEL_HASH_DEBUG_LIGHT_SUMMARY";
 const DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV: &str = "STEEL_HASH_STOP_AFTER_FIRST_MISMATCH";
 const DEBUG_FIXTURE_PATH_ENV: &str = "STEEL_HASH_FIXTURE_PATH";
+const DEBUG_LIGHT_DATA_PATH_ENV: &str = "STEEL_HASH_LIGHT_DATA_PATH";
 
 const FEATURE_STAGE: &str = "minecraft:features";
 const LIGHT_STAGE: &str = "minecraft:light";
@@ -124,6 +132,7 @@ const HASHSET_ITERATION_ORDER_INSERTION: &str = "insertion_order";
 const LIGHT_HASH_CAPTURE_AFTER_LIGHT_STATUS_READY: &str = "after_light_status_ready";
 const LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_v1";
 const LIGHT_DEBUG_FORMAT_SECTION_MARKERS_V1: &str = "section_markers_v1";
+const LIGHT_BINARY_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_binary_v1";
 
 fn load_expected_hashes() -> ChunkStageHashesJson {
     let json = if let Ok(path) = env::var(DEBUG_FIXTURE_PATH_ENV) {
@@ -422,6 +431,69 @@ fn actual_light_debug(light: &ChunkLightData) -> LightChunkDebug {
     }
 }
 
+fn light_layer_bytes(
+    section_count: usize,
+    data_mask: &steel_utils::codec::BitSet,
+    empty_mask: &steel_utils::codec::BitSet,
+    updates: &[Vec<u8>],
+) -> Vec<LightSectionBytes> {
+    let mut update_index = 0;
+    let mut sections = Vec::with_capacity(section_count);
+    for section_index in 0..section_count {
+        if bitset_contains(empty_mask, section_index) {
+            sections.push(LightSectionBytes {
+                state: 1,
+                bytes: None,
+            });
+        } else if bitset_contains(data_mask, section_index) {
+            let update = &updates[update_index];
+            sections.push(LightSectionBytes {
+                state: 2,
+                bytes: Some(update.clone()),
+            });
+            update_index += 1;
+        } else {
+            sections.push(LightSectionBytes {
+                state: 0,
+                bytes: None,
+            });
+        }
+    }
+
+    if update_index != updates.len() {
+        panic!(
+            "light packet carried {} unused updates after consuming {update_index}",
+            updates.len()
+        );
+    }
+
+    sections
+}
+
+fn actual_light_bytes(light: &ChunkLightData) -> ChunkLightBytes {
+    let packet = build_chunk_light_update_packet(light);
+    let range = light.sky.range();
+    let sky = light_layer_bytes(
+        range.section_count(),
+        &packet.sky_y_mask,
+        &packet.empty_sky_y_mask,
+        &packet.sky_updates,
+    );
+    let block = light_layer_bytes(
+        range.section_count(),
+        &packet.block_y_mask,
+        &packet.empty_block_y_mask,
+        &packet.block_updates,
+    );
+
+    ChunkLightBytes {
+        min_section_y: range.min_section_y(),
+        section_count: range.section_count(),
+        sky,
+        block,
+    }
+}
+
 fn format_light_section_debug(section: &LightSectionDebug) -> String {
     let mut label = section.state.clone();
     if let Some(non_zero_bytes) = section.non_zero_bytes {
@@ -514,6 +586,241 @@ fn debug_light_differences(expected: &LightChunkDebug, actual: &LightChunkDebug)
         out.push_str("    no section-marker differences found\n");
     }
     out
+}
+
+fn light_section_state_name(state: u8) -> &'static str {
+    match state {
+        0 => "null",
+        1 => "empty",
+        2 => "data",
+        _ => "invalid",
+    }
+}
+
+fn light_value_from_section(section: &LightSectionBytes, index: usize) -> u8 {
+    let Some(bytes) = section.bytes.as_ref() else {
+        return 0;
+    };
+    let packed = bytes[index >> 1];
+    packed >> ((index & 1) << 2) & 0x0f
+}
+
+fn debug_raw_light_differences(
+    expected: &ChunkLightBytes,
+    actual: &ChunkLightBytes,
+    chunk: &ChunkAccess,
+    chunk_x: i32,
+    chunk_z: i32,
+) -> String {
+    let mut out = String::new();
+    if expected.min_section_y != actual.min_section_y
+        || expected.section_count != actual.section_count
+    {
+        let _ = writeln!(
+            out,
+            "    range expected min={} count={}, actual min={} count={}",
+            expected.min_section_y,
+            expected.section_count,
+            actual.min_section_y,
+            actual.section_count
+        );
+    }
+
+    let mut shown = 0;
+    for (layer_name, expected_layer, actual_layer) in [
+        ("sky", expected.sky.as_slice(), actual.sky.as_slice()),
+        ("block", expected.block.as_slice(), actual.block.as_slice()),
+    ] {
+        let section_count = expected_layer.len().min(actual_layer.len());
+        for section_index in 0..section_count {
+            let expected_section = &expected_layer[section_index];
+            let actual_section = &actual_layer[section_index];
+            let Ok(section_offset) = i32::try_from(section_index) else {
+                continue;
+            };
+            let section_y = expected.min_section_y + section_offset;
+
+            if expected_section.state != actual_section.state {
+                let _ = writeln!(
+                    out,
+                    "    {layer_name:5} y={section_y:4}: state vanilla={} steel={}",
+                    light_section_state_name(expected_section.state),
+                    light_section_state_name(actual_section.state),
+                );
+                shown += 1;
+                if shown == MAX_LIGHT_DIFFS_PER_CHUNK {
+                    out.push_str("    ... more light differences omitted\n");
+                    return out;
+                }
+            }
+
+            for index in 0..DATA_LAYER_BLOCK_COUNT {
+                let vanilla = light_value_from_section(expected_section, index);
+                let steel = light_value_from_section(actual_section, index);
+                if vanilla == steel {
+                    continue;
+                }
+
+                let local_x = index & 15;
+                let local_z = (index >> 4) & 15;
+                let local_y = (index >> 8) & 15;
+                let world_x = chunk_x * 16 + local_x as i32;
+                let world_y = section_y * 16 + local_y as i32;
+                let world_z = chunk_z * 16 + local_z as i32;
+                let state_context = format_light_state_context(chunk, local_x, world_y, local_z);
+                let _ = writeln!(
+                    out,
+                    "    {layer_name:5} y={section_y:4} local=({local_x:2},{local_y:2},{local_z:2}) world=({world_x},{world_y},{world_z}): vanilla={vanilla:2} steel={steel:2}{state_context}",
+                );
+                if shown == 0 {
+                    out.push_str(&format_light_column_differences(
+                        expected_section,
+                        actual_section,
+                        chunk,
+                        local_x,
+                        section_y,
+                        local_z,
+                    ));
+                }
+                shown += 1;
+                if shown == MAX_LIGHT_DIFFS_PER_CHUNK {
+                    out.push_str("    ... more light differences omitted\n");
+                    return out;
+                }
+            }
+        }
+    }
+
+    if shown == 0 {
+        out.push_str("    no raw light value differences found\n");
+    }
+    out
+}
+
+fn format_light_column_differences(
+    expected_section: &LightSectionBytes,
+    actual_section: &LightSectionBytes,
+    chunk: &ChunkAccess,
+    local_x: usize,
+    section_y: i32,
+    local_z: usize,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "      column local=({local_x},*,{local_z}) values:");
+    for local_y in (0..16).rev() {
+        let index = local_x | (local_z << 4) | (local_y << 8);
+        let vanilla = light_value_from_section(expected_section, index);
+        let steel = light_value_from_section(actual_section, index);
+        let world_y = (section_y << 4) | local_y as i32;
+        let state = chunk_state_at(chunk, local_x, world_y, local_z)
+            .map(format_light_state)
+            .unwrap_or_else(|| "missing".to_owned());
+        let _ = writeln!(
+            out,
+            "        y={world_y:4} local_y={local_y:2}: vanilla={vanilla:2} steel={steel:2} {state}",
+        );
+    }
+    out
+}
+
+fn format_light_state_context(
+    chunk: &ChunkAccess,
+    local_x: usize,
+    world_y: i32,
+    local_z: usize,
+) -> String {
+    let current = chunk_state_at(chunk, local_x, world_y, local_z)
+        .map(format_light_state)
+        .unwrap_or_else(|| "missing".to_owned());
+    let above = chunk_state_at(chunk, local_x, world_y + 1, local_z)
+        .map(format_light_state)
+        .unwrap_or_else(|| "missing".to_owned());
+    let above_non_air = first_non_air_above(chunk, local_x, world_y, local_z)
+        .map(|(y, state)| format!("{y}:{}", format_light_state(state)))
+        .unwrap_or_else(|| "none".to_owned());
+    let source_y = chunk
+        .sky_light_sources()
+        .get_lowest_source_y(local_x, local_z);
+    let source_neighbors = format_light_source_neighbors(chunk, local_x, local_z);
+
+    format!(
+        " source_y={source_y} {source_neighbors} state={current} above={above} first_non_air_above={above_non_air}"
+    )
+}
+
+fn format_light_source_neighbors(chunk: &ChunkAccess, local_x: usize, local_z: usize) -> String {
+    let sources = chunk.sky_light_sources();
+    let north = if local_z > 0 {
+        sources
+            .get_lowest_source_y(local_x, local_z - 1)
+            .to_string()
+    } else {
+        "edge".to_owned()
+    };
+    let south = if local_z + 1 < 16 {
+        sources
+            .get_lowest_source_y(local_x, local_z + 1)
+            .to_string()
+    } else {
+        "edge".to_owned()
+    };
+    let west = if local_x > 0 {
+        sources
+            .get_lowest_source_y(local_x - 1, local_z)
+            .to_string()
+    } else {
+        "edge".to_owned()
+    };
+    let east = if local_x + 1 < 16 {
+        sources
+            .get_lowest_source_y(local_x + 1, local_z)
+            .to_string()
+    } else {
+        "edge".to_owned()
+    };
+
+    format!("source_neighbors=n:{north} s:{south} w:{west} e:{east}")
+}
+
+fn format_light_state(state: steel_utils::BlockStateId) -> String {
+    format!(
+        "{} opacity={}",
+        describe_state(i32::from(state.0)),
+        state.get_light_dampening()
+    )
+}
+
+fn chunk_state_at(
+    chunk: &ChunkAccess,
+    local_x: usize,
+    world_y: i32,
+    local_z: usize,
+) -> Option<steel_utils::BlockStateId> {
+    let offset_y = world_y.checked_sub(chunk.min_y())?;
+    if offset_y < 0 {
+        return None;
+    }
+    let section_index = usize::try_from(offset_y / 16).ok()?;
+    let local_y = usize::try_from(offset_y & 15).ok()?;
+    let section = chunk.sections().sections.get(section_index)?.read();
+    Some(section.states.get(local_x, local_y, local_z))
+}
+
+fn first_non_air_above(
+    chunk: &ChunkAccess,
+    local_x: usize,
+    world_y: i32,
+    local_z: usize,
+) -> Option<(i32, steel_utils::BlockStateId)> {
+    let max_y = chunk.min_y() + chunk.sections().sections.len() as i32 * 16;
+    for y in world_y + 1..max_y {
+        let state = chunk_state_at(chunk, local_x, y, local_z)?;
+        if !state.is_air() {
+            return Some((y, state));
+        }
+    }
+
+    None
 }
 
 fn debug_chunk_section_summary(chunk: &ChunkAccess) -> String {
@@ -620,6 +927,20 @@ struct ChunkBlockData {
     sections: Vec<Option<Vec<i32>>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LightSectionBytes {
+    state: u8,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChunkLightBytes {
+    min_section_y: i32,
+    section_count: usize,
+    sky: Vec<LightSectionBytes>,
+    block: Vec<LightSectionBytes>,
+}
+
 /// Loads binary reference block data for a given stage and dimension.
 ///
 /// Binary format (gzip compressed, all integers big-endian):
@@ -685,6 +1006,95 @@ fn load_reference_blocks(
     }
 
     Some(map)
+}
+
+fn default_light_data_file_name(dim_short: &str) -> String {
+    format!("chunk_stage_{dim_short}_light_layers.bin.gz")
+}
+
+fn default_light_data_path(dim_short: &str) -> PathBuf {
+    let file_name = default_light_data_file_name(dim_short);
+    if let Ok(path) = env::var(DEBUG_LIGHT_DATA_PATH_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return path.join(file_name);
+        }
+        return path;
+    }
+
+    if let Ok(fixture_path) = env::var(DEBUG_FIXTURE_PATH_ENV) {
+        let fixture_path = PathBuf::from(fixture_path);
+        if let Some(parent) = fixture_path.parent() {
+            return parent.join(file_name);
+        }
+    }
+
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test_assets")
+        .join(file_name)
+}
+
+fn load_reference_lights(dim_short: &str) -> Option<FxHashMap<(i32, i32), ChunkLightBytes>> {
+    let path = default_light_data_path(dim_short);
+    let compressed = fs::read(&path).ok()?;
+
+    let decoder = GzDecoder::new(Cursor::new(compressed));
+    let mut buf = Vec::new();
+    BufReader::new(decoder).read_to_end(&mut buf).ok()?;
+
+    let mut pos = 0;
+    let read_i32 = |pos: &mut usize| -> i32 {
+        let val = i32::from_be_bytes(
+            buf[*pos..*pos + 4]
+                .try_into()
+                .expect("slice should be 4 bytes"),
+        );
+        *pos += 4;
+        val
+    };
+
+    let chunk_count = read_i32(&mut pos) as usize;
+    let mut map = FxHashMap::with_capacity_and_hasher(chunk_count, FxBuildHasher);
+    for _ in 0..chunk_count {
+        let cx = read_i32(&mut pos);
+        let cz = read_i32(&mut pos);
+        let min_section_y = read_i32(&mut pos);
+        let section_count = read_i32(&mut pos) as usize;
+        let sky = read_light_layer_bytes(&buf, &mut pos, section_count);
+        let block = read_light_layer_bytes(&buf, &mut pos, section_count);
+        map.insert(
+            (cx, cz),
+            ChunkLightBytes {
+                min_section_y,
+                section_count,
+                sky,
+                block,
+            },
+        );
+    }
+
+    Some(map)
+}
+
+fn read_light_layer_bytes(
+    buf: &[u8],
+    pos: &mut usize,
+    section_count: usize,
+) -> Vec<LightSectionBytes> {
+    let mut sections = Vec::with_capacity(section_count);
+    for _ in 0..section_count {
+        let state = buf[*pos];
+        *pos += 1;
+        let bytes = if state == 2 {
+            let data = buf[*pos..*pos + DATA_LAYER_SIZE].to_vec();
+            *pos += DATA_LAYER_SIZE;
+            Some(data)
+        } else {
+            None
+        };
+        sections.push(LightSectionBytes { state, bytes });
+    }
+    sections
 }
 
 /// Format a state ID as "id (`block_name`[props])" for human-readable output.
@@ -1048,6 +1458,14 @@ fn chunk_light_hashes_inner() {
         }
 
         let dim_short = dim_key.strip_prefix("minecraft:").unwrap_or(dim_key);
+        let reference_lights = load_reference_lights(dim_short);
+        if reference_lights.is_some() {
+            assert_eq!(
+                expected.light_binary_format.as_deref(),
+                Some(LIGHT_BINARY_FORMAT_PACKET_DATA_LAYERS_V1),
+                "light binary data must use the packet data-layer binary format; rerun the extractor"
+            );
+        }
         let dim_type = match dim_key {
             "minecraft:overworld" => &vanilla_dimension_types::OVERWORLD,
             "minecraft:the_nether" => &vanilla_dimension_types::THE_NETHER,
@@ -1071,6 +1489,20 @@ fn chunk_light_hashes_inner() {
             _ => unreachable!(),
         });
         let world = create_test_world(dim_key, dim_type, seed, generator);
+        eprintln!(
+            "[{dim_short}/{LIGHT_STAGE}] preparing {} chunks to FEATURES in x/z order",
+            stage_entries.len()
+        );
+        let mut feature_requests = Vec::with_capacity(stage_entries.len());
+        for (chunk_x, chunk_z, _, _) in stage_entries.iter().copied() {
+            let pos = ChunkPos::new(chunk_x, chunk_z);
+            let request =
+                world
+                    .chunk_map
+                    .request_chunk(pos, ChunkStatus::Features, ChunkTicketKind::Command);
+            drive_chunk_request(&world, &request, dim_short);
+            feature_requests.push(request);
+        }
         eprintln!(
             "[{dim_short}/{LIGHT_STAGE}] requesting {} chunks to LIGHT in x/z order",
             stage_entries.len()
@@ -1103,6 +1535,10 @@ fn chunk_light_hashes_inner() {
             };
             let light = chunk.light();
             let actual_debug = emit_light_summary.then(|| actual_light_debug(&light));
+            let expected_light_bytes = reference_lights
+                .as_ref()
+                .and_then(|lights| lights.get(&(chunk_x, chunk_z)));
+            let actual_light_bytes = expected_light_bytes.map(|_| actual_light_bytes(&light));
             let summary = actual_debug.as_ref().map(|debug| {
                 let mut summary = format_light_debug(debug);
                 let section_summary = debug_chunk_section_summary(&chunk);
@@ -1113,6 +1549,21 @@ fn chunk_light_hashes_inner() {
                 summary
             });
             let actual_hash = compute_light_hash(&light);
+            let raw_light_diff = if actual_hash == expected_hash {
+                None
+            } else if let (Some(expected_light_bytes), Some(actual_light_bytes)) =
+                (expected_light_bytes, actual_light_bytes.as_ref())
+            {
+                Some(debug_raw_light_differences(
+                    expected_light_bytes,
+                    actual_light_bytes,
+                    &chunk,
+                    chunk_x,
+                    chunk_z,
+                ))
+            } else {
+                None
+            };
             drop(light);
             drop(chunk);
             light_requests.push(request);
@@ -1144,12 +1595,19 @@ fn chunk_light_hashes_inner() {
                         debug_light_differences(expected_debug, &actual_debug)
                     );
                 }
+                if let Some(raw_light_diff) = raw_light_diff {
+                    eprintln!(
+                        "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) raw light value differences:\n{}",
+                        raw_light_diff
+                    );
+                }
                 mismatches.push((chunk_x, chunk_z, expected_hash.to_owned(), actual_hash));
                 if stop_after_first_mismatch {
                     break;
                 }
             }
         }
+        drop(feature_requests);
 
         if mismatches.is_empty() {
             continue;

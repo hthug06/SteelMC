@@ -2,10 +2,10 @@ use steel_registry::{blocks::block_state_ext::BlockStateExt, vanilla_blocks};
 use steel_utils::{BlockPos, ChunkPos, Direction, SectionPos};
 
 use super::{
-    CachedLightBlock, LIGHT_BLOCKED, LightAxisDirection, LightCacheLayout, LightDirectionSet,
-    LightLayer, LightLayerWriteCache, LightQueueFlags, LightSectionReadCache, LightWorkset,
-    MAX_LIGHT_LEVEL, PackedLightPropagationQueues, PackedLightQueueEntry, get_light_block_into,
-    get_light_opacity, light_occlusion_shape,
+    CachedLightBlock, ChunkSkyLightSources, LIGHT_BLOCKED, LightAxisDirection, LightCacheLayout,
+    LightDirectionSet, LightLayer, LightLayerWriteCache, LightQueueFlags, LightSectionReadCache,
+    LightWorkset, MAX_LIGHT_LEVEL, PackedLightPropagationQueues, PackedLightQueueEntry,
+    SkyLightSourceNeighborhood, get_light_block_into, get_light_opacity, light_occlusion_shape,
 };
 
 /// Error returned when a sky-light propagation context is built from mismatched caches.
@@ -26,6 +26,11 @@ pub enum SkyLightPropagationContextError {
     /// The workset does not contain its center chunk.
     MissingCenterChunk {
         /// Missing center chunk position.
+        chunk_pos: ChunkPos,
+    },
+    /// A chunk needed for vanilla sky-source seeding is missing.
+    MissingSkyLightSources {
+        /// Missing source chunk position.
         chunk_pos: ChunkPos,
     },
 }
@@ -82,6 +87,31 @@ pub fn propagate_sky_light_chunk(
             });
         }
 
+        let center_sources = sky_light_sources(chunk_cache, layout.center_chunk())?;
+        let north_sources = sky_light_sources(
+            chunk_cache,
+            ChunkPos::new(layout.center_chunk().0.x, layout.center_chunk().0.y - 1),
+        )?;
+        let south_sources = sky_light_sources(
+            chunk_cache,
+            ChunkPos::new(layout.center_chunk().0.x, layout.center_chunk().0.y + 1),
+        )?;
+        let west_sources = sky_light_sources(
+            chunk_cache,
+            ChunkPos::new(layout.center_chunk().0.x - 1, layout.center_chunk().0.y),
+        )?;
+        let east_sources = sky_light_sources(
+            chunk_cache,
+            ChunkPos::new(layout.center_chunk().0.x + 1, layout.center_chunk().0.y),
+        )?;
+        let source_neighborhood = SkyLightSourceNeighborhood::new(
+            &center_sources,
+            &north_sources,
+            &south_sources,
+            &west_sources,
+            &east_sources,
+        );
+
         chunk_cache.with_section_read_cache(|section_cache| {
             chunk_cache.with_light_write_cache(LightLayer::Sky, |light_cache| {
                 let mut queues = PackedLightPropagationQueues::new();
@@ -91,7 +121,7 @@ pub fn propagate_sky_light_chunk(
                         SkyLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
                     context.reset_center_chunk_nibbles();
                     context.handle_unlit_empty_section_changes(layout.center_chunk());
-                    context.light_chunk(layout.center_chunk(), edge_checks);
+                    context.light_chunk(layout.center_chunk(), edge_checks, source_neighborhood);
                 }
 
                 let mut updated_sections = Vec::new();
@@ -102,6 +132,20 @@ pub fn propagate_sky_light_chunk(
             })
         })
     })
+}
+
+fn sky_light_sources(
+    chunk_cache: &super::LightChunkReadCache<'_>,
+    chunk_pos: ChunkPos,
+) -> Result<ChunkSkyLightSources, SkyLightPropagationContextError> {
+    let Some(cached_chunk) = chunk_cache.layout().cached_chunk(chunk_pos) else {
+        return Err(SkyLightPropagationContextError::MissingSkyLightSources { chunk_pos });
+    };
+    let Some(chunk) = chunk_cache.chunk(cached_chunk) else {
+        return Err(SkyLightPropagationContextError::MissingSkyLightSources { chunk_pos });
+    };
+
+    Ok(chunk.sky_light_sources().clone())
 }
 
 /// Runs ScalableLux-style sky-light propagation for changed blocks in a scoped workset.
@@ -293,7 +337,12 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
     }
 
     /// Runs sky chunk lighting with the selected ScalableLux edge-check mode.
-    pub fn light_chunk(&mut self, chunk_pos: ChunkPos, edge_checks: SkyLightChunkEdgeChecks) {
+    pub fn light_chunk(
+        &mut self,
+        chunk_pos: ChunkPos,
+        edge_checks: SkyLightChunkEdgeChecks,
+        source_neighborhood: SkyLightSourceNeighborhood<'_>,
+    ) {
         let min_section = self.layout.range().min_chunk_section_y();
         let mut highest_non_empty_section = self.layout.range().max_chunk_section_y_exclusive() - 1;
 
@@ -317,16 +366,12 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         }
 
         if highest_non_empty_section >= min_section {
-            let min_x = chunk_pos.0.x << 4;
-            let max_x = min_x | 15;
-            let min_z = chunk_pos.0.y << 4;
-            let max_z = min_z | 15;
-            let start_y = (highest_non_empty_section << 4) | 15;
-            for z in min_z..=max_z {
-                for x in min_x..=max_x {
-                    self.try_propagate_skylight(x, start_y + 1, z, false);
-                }
-            }
+            self.propagate_sky_sources_from_heightmap(
+                chunk_pos,
+                self.layout.range().min_section_y(),
+                highest_non_empty_section,
+                source_neighborhood,
+            );
         }
 
         match edge_checks {
@@ -514,6 +559,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         self.sections.has_non_empty_section(section_pos)
     }
 
+    /// Initializes null sections from center/cardinal neighbors that vanilla materializes.
     fn check_null_section(
         &mut self,
         chunk_pos: ChunkPos,
@@ -528,9 +574,11 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         }
         self.null_section_checked[section_index] = true;
 
-        let mut need_init_neighbors = false;
-        'search: for offset_z in -1..=1 {
-            for offset_x in -1..=1 {
+        let center_section_pos = SectionPos::new(chunk_pos.0.x, section_y, chunk_pos.0.y);
+        let mut need_init_neighbors = self.light.has_non_null_section(center_section_pos);
+        if !need_init_neighbors {
+            for direction in LightAxisDirection::HORIZONTAL {
+                let (offset_x, _, offset_z) = direction.offset();
                 let section_pos = SectionPos::new(
                     chunk_pos.0.x + offset_x,
                     section_y,
@@ -538,7 +586,7 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
                 );
                 if self.light.has_non_null_section(section_pos) {
                     need_init_neighbors = true;
-                    break 'search;
+                    break;
                 }
             }
         }
@@ -599,8 +647,146 @@ impl<'a, 'sections, 'light> SkyLightPropagationContext<'a, 'sections, 'light> {
         }
     }
 
-    fn try_propagate_skylight(&mut self, x: i32, y: i32, z: i32, extrude_initialized: bool) -> i32 {
-        self.try_propagate_skylight_inner(x, y, z, extrude_initialized, None)
+    fn propagate_sky_sources_from_heightmap(
+        &mut self,
+        chunk_pos: ChunkPos,
+        from_section: i32,
+        to_section: i32,
+        source_neighborhood: SkyLightSourceNeighborhood<'_>,
+    ) {
+        let section_min_x = chunk_pos.0.x << 4;
+        let section_min_z = chunk_pos.0.y << 4;
+
+        for section_y in (from_section..=to_section).rev() {
+            let section_pos = SectionPos::new(chunk_pos.0.x, section_y, chunk_pos.0.y);
+            if !self.light.has_non_null_section(section_pos) {
+                continue;
+            }
+
+            let section_min_y = section_y << 4;
+            let section_max_y = section_min_y | 15;
+            let mut sources_below = false;
+
+            for z in 0..16 {
+                for x in 0..16 {
+                    let lowest_source_y = source_neighborhood.center.get_lowest_source_y(x, z);
+                    let north_lowest_source_y = if z == 0 {
+                        source_neighborhood
+                            .north
+                            .get_lowest_source_y(x, super::CHUNK_EDGE - 1)
+                    } else {
+                        source_neighborhood.center.get_lowest_source_y(x, z - 1)
+                    };
+                    let south_lowest_source_y = if z == super::CHUNK_EDGE - 1 {
+                        source_neighborhood.south.get_lowest_source_y(x, 0)
+                    } else {
+                        source_neighborhood.center.get_lowest_source_y(x, z + 1)
+                    };
+                    let west_lowest_source_y = if x == 0 {
+                        source_neighborhood
+                            .west
+                            .get_lowest_source_y(super::CHUNK_EDGE - 1, z)
+                    } else {
+                        source_neighborhood.center.get_lowest_source_y(x - 1, z)
+                    };
+                    let east_lowest_source_y = if x == super::CHUNK_EDGE - 1 {
+                        source_neighborhood.east.get_lowest_source_y(0, z)
+                    } else {
+                        source_neighborhood.center.get_lowest_source_y(x + 1, z)
+                    };
+                    let neighbor_lowest_source_y = north_lowest_source_y
+                        .max(south_lowest_source_y)
+                        .max(west_lowest_source_y)
+                        .max(east_lowest_source_y);
+
+                    if section_y == to_section && lowest_source_y == section_max_y + 1 {
+                        let block_pos = BlockPos::new(
+                            section_min_x + x as i32,
+                            lowest_source_y,
+                            section_min_z + z as i32,
+                        );
+                        self.enqueue_increase(
+                            block_pos,
+                            MAX_LIGHT_LEVEL,
+                            Self::sky_source_directions(
+                                true,
+                                lowest_source_y < north_lowest_source_y,
+                                lowest_source_y < south_lowest_source_y,
+                                lowest_source_y < west_lowest_source_y,
+                                lowest_source_y < east_lowest_source_y,
+                            ),
+                            LightQueueFlags::EMPTY,
+                        );
+                    }
+
+                    if lowest_source_y > section_max_y {
+                        continue;
+                    }
+
+                    let min_source_y = section_min_y.max(lowest_source_y);
+
+                    for y in (min_source_y..=section_max_y).rev() {
+                        let block_pos =
+                            BlockPos::new(section_min_x + x as i32, y, section_min_z + z as i32);
+                        let Some(cached_block) = self.layout.cached_block(block_pos) else {
+                            continue;
+                        };
+                        if !self.light.set(cached_block, MAX_LIGHT_LEVEL) {
+                            continue;
+                        }
+
+                        if y == lowest_source_y || y < neighbor_lowest_source_y {
+                            self.enqueue_increase(
+                                block_pos,
+                                MAX_LIGHT_LEVEL,
+                                Self::sky_source_directions(
+                                    y == lowest_source_y,
+                                    y < north_lowest_source_y,
+                                    y < south_lowest_source_y,
+                                    y < west_lowest_source_y,
+                                    y < east_lowest_source_y,
+                                ),
+                                LightQueueFlags::HAS_SIDED_TRANSPARENT_BLOCKS,
+                            );
+                        }
+                    }
+
+                    if lowest_source_y < section_min_y {
+                        sources_below = true;
+                    }
+                }
+            }
+
+            if !sources_below {
+                break;
+            }
+        }
+    }
+
+    fn sky_source_directions(
+        down: bool,
+        north: bool,
+        south: bool,
+        west: bool,
+        east: bool,
+    ) -> LightDirectionSet {
+        let mut directions = LightDirectionSet::empty();
+        if down {
+            directions = directions.with(LightAxisDirection::NegativeY);
+        }
+        if north {
+            directions = directions.with(LightAxisDirection::NegativeZ);
+        }
+        if south {
+            directions = directions.with(LightAxisDirection::PositiveZ);
+        }
+        if west {
+            directions = directions.with(LightAxisDirection::NegativeX);
+        }
+        if east {
+            directions = directions.with(LightAxisDirection::PositiveX);
+        }
+        directions
     }
 
     fn try_propagate_skylight_delayed(
@@ -1324,6 +1510,7 @@ mod tests {
     fn holder_with_section(pos: ChunkPos, section: ChunkSection) -> Arc<ChunkHolder> {
         let sections = Sections::from_owned(vec![section].into_boxed_slice());
         let proto = ProtoChunk::new(sections, pos, 0, 16, Weak::new());
+        proto.initialize_light_sources();
         let holder = Arc::new(ChunkHolder::new(pos, 0, 0, 16));
         holder.insert_chunk(ChunkAccess::Proto(proto), ChunkStatus::Light);
         holder
@@ -1345,9 +1532,86 @@ mod tests {
             height,
             Weak::new(),
         );
+        proto.initialize_light_sources();
         let holder = Arc::new(ChunkHolder::new(pos, 0, 0, height));
         holder.insert_chunk(ChunkAccess::Proto(proto), ChunkStatus::Light);
         holder
+    }
+
+    fn empty_holder_with_section_count(pos: ChunkPos, section_count: usize) -> Arc<ChunkHolder> {
+        holder_with_sections(
+            pos,
+            (0..section_count)
+                .map(|_| ChunkSection::new_empty())
+                .collect(),
+        )
+    }
+
+    fn horizontal_empty_neighbors(
+        center: ChunkPos,
+        section_count: usize,
+    ) -> Vec<(ChunkPos, Arc<ChunkHolder>)> {
+        [
+            ChunkPos::new(center.0.x, center.0.y - 1),
+            ChunkPos::new(center.0.x, center.0.y + 1),
+            ChunkPos::new(center.0.x - 1, center.0.y),
+            ChunkPos::new(center.0.x + 1, center.0.y),
+        ]
+        .into_iter()
+        .map(|pos| (pos, empty_holder_with_section_count(pos, section_count)))
+        .collect()
+    }
+
+    fn roofed_holder(
+        pos: ChunkPos,
+        section_count: usize,
+        roof_section_index: usize,
+        roof_local_y: usize,
+    ) -> Arc<ChunkHolder> {
+        let mut sections = (0..section_count)
+            .map(|_| ChunkSection::new_empty())
+            .collect::<Vec<_>>();
+        for z in 0..16 {
+            for x in 0..16 {
+                sections[roof_section_index].set_block_state(
+                    x,
+                    roof_local_y,
+                    z,
+                    vanilla_blocks::STONE.default_state(),
+                );
+            }
+        }
+        holder_with_sections(pos, sections)
+    }
+
+    fn roofed_holder_square(
+        center: ChunkPos,
+        radius: i32,
+        section_count: usize,
+        roof_section_index: usize,
+        roof_local_y: usize,
+    ) -> Vec<(ChunkPos, Arc<ChunkHolder>)> {
+        let mut holders = Vec::new();
+        for z in -radius..=radius {
+            for x in -radius..=radius {
+                let pos = ChunkPos::new(center.0.x + x, center.0.y + z);
+                holders.push((
+                    pos,
+                    roofed_holder(pos, section_count, roof_section_index, roof_local_y),
+                ));
+            }
+        }
+        holders
+    }
+
+    fn find_holder(
+        holders: &[(ChunkPos, Arc<ChunkHolder>)],
+        pos: ChunkPos,
+    ) -> Option<Arc<ChunkHolder>> {
+        holders
+            .iter()
+            .find(|(holder_pos, _)| *holder_pos == pos)
+            .map(|(_, holder)| Arc::clone(holder))
     }
 
     fn set_visible_sky_light(
@@ -1411,12 +1675,19 @@ mod tests {
         let mut section = ChunkSection::new_empty();
         section.set_block_state(1, 0, 1, vanilla_blocks::STONE.default_state());
         let holder = holder_with_section(center, section);
+        let neighbors = horizontal_empty_neighbors(center, 1);
         let layout = LightCacheLayout::new(center, range());
         let Ok(workset) = LightWorkset::setup(
             layout,
             LightCacheSetupRadius::Inner,
             true,
-            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&holder))
+                } else {
+                    find_holder(&neighbors, pos)
+                }
+            },
             |_| true,
         ) else {
             panic!("relaxed setup should accept missing neighbors");
@@ -1451,6 +1722,130 @@ mod tests {
     }
 
     #[test]
+    fn sky_light_chunk_without_edge_checks_propagates_from_virtual_top_source() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let mut section = ChunkSection::new_empty();
+        for z in 0..16 {
+            for x in 0..16 {
+                section.set_block_state(x, 15, z, vanilla_blocks::ACACIA_LEAVES.default_state());
+            }
+        }
+        let holder = holder_with_section(center, section);
+        let neighbors = horizontal_empty_neighbors(center, 1);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&holder))
+                } else {
+                    find_holder(&neighbors, pos)
+                }
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+
+        let Ok(result) = propagate_sky_light_chunk_without_edge_checks(&workset) else {
+            panic!("matching sky caches should run sky chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("test nibble should be inside light range");
+        };
+        let Some(top_leaf) = layout.cached_block(BlockPos::new(8, 15, 8)) else {
+            panic!("top leaf block should be cached");
+        };
+        let Some(air_below_leaf) = layout.cached_block(BlockPos::new(8, 14, 8)) else {
+            panic!("air below leaf block should be cached");
+        };
+
+        assert_eq!(nibble.get_visible_at_index(top_leaf.local_index), 14);
+        assert_eq!(nibble.get_visible_at_index(air_below_leaf.local_index), 13);
+    }
+
+    #[test]
+    fn sky_light_chunk_ignores_diagonal_only_null_section_sources() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let diagonal = ChunkPos::new(1, 1);
+        let Ok(range) = LightSectionRange::from_world_height(0, 48) else {
+            panic!("test height should create a valid light range");
+        };
+
+        let mut center_lower = ChunkSection::new_empty();
+        center_lower.set_block_state(1, 0, 1, vanilla_blocks::STONE.default_state());
+        let center_holder = holder_with_sections(
+            center,
+            vec![
+                center_lower,
+                ChunkSection::new_empty(),
+                ChunkSection::new_empty(),
+            ],
+        );
+        let diagonal_holder = empty_holder_with_section_count(diagonal, 3);
+        set_visible_sky_light(&diagonal_holder, 2, 0, 0, 0, 15);
+
+        let mut holders = Vec::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos::new(center.0.x + x, center.0.y + z);
+                if pos == center {
+                    holders.push((pos, Arc::clone(&center_holder)));
+                } else if pos == diagonal {
+                    holders.push((pos, Arc::clone(&diagonal_holder)));
+                } else {
+                    holders.push((pos, empty_holder_with_section_count(pos, 3)));
+                }
+            }
+        }
+
+        let layout = LightCacheLayout::new(center, range);
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Full,
+            true,
+            |pos| find_holder(&holders, pos),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept cached test chunks");
+        };
+
+        let Ok(result) = propagate_sky_light_chunk_without_edge_checks(&workset) else {
+            panic!("matching sky caches should run sky chunk lighting");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 1, 0)));
+
+        let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should be available");
+        };
+        let light = chunk.light();
+        let Some(top_source_nibble) = light.sky.nibble(1) else {
+            panic!("top source sky nibble should be inside light range");
+        };
+        let Some(above_source_nibble) = light.sky.nibble(2) else {
+            panic!("above-source sky nibble should be inside light range");
+        };
+
+        assert_eq!(
+            top_source_nibble.visible_state(),
+            LightNibbleState::Initialized
+        );
+        assert_eq!(above_source_nibble.visible_state(), LightNibbleState::Null);
+    }
+
+    #[test]
     fn sky_light_chunk_without_edge_checks_keeps_sealed_roof_dark() {
         init_tests();
         let center = ChunkPos::new(0, 0);
@@ -1461,13 +1856,20 @@ mod tests {
             }
         }
         let holder = holder_with_section(center, section);
+        let neighbors = roofed_holder_square(center, 2, 1, 0, 15);
         let layout = LightCacheLayout::new(center, range());
-        let Ok(workset) = LightWorkset::setup(
+        let Ok(workset) = LightWorkset::setup_with_scopes(
             layout,
-            LightCacheSetupRadius::Inner,
+            LightCacheSetupRadius::Full,
             true,
-            |pos| (pos == center).then(|| Arc::clone(&holder)),
-            |_| true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&holder))
+                } else {
+                    find_holder(&neighbors, pos)
+                }
+            },
+            |cached_chunk, _, _| (true, cached_chunk.chunk_pos == center),
         ) else {
             panic!("relaxed setup should accept missing neighbors");
         };
@@ -1507,6 +1909,7 @@ mod tests {
             }
         }
         let holder = holder_with_section(center, section);
+        let neighbors = roofed_holder_square(center, 2, 1, 0, 15);
         let layout = LightCacheLayout::new(center, range());
 
         {
@@ -1521,12 +1924,18 @@ mod tests {
             assert!(nibble.update_visible());
         }
 
-        let Ok(workset) = LightWorkset::setup(
+        let Ok(workset) = LightWorkset::setup_with_scopes(
             layout,
-            LightCacheSetupRadius::Inner,
+            LightCacheSetupRadius::Full,
             true,
-            |pos| (pos == center).then(|| Arc::clone(&holder)),
-            |_| true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&holder))
+                } else {
+                    find_holder(&neighbors, pos)
+                }
+            },
+            |cached_chunk, _, _| (true, cached_chunk.chunk_pos == center),
         ) else {
             panic!("relaxed setup should accept missing neighbors");
         };
@@ -1646,14 +2055,8 @@ mod tests {
             }
         }
         let center_holder = holder_with_sections(center, vec![lower, middle, upper]);
-        let east_holder = holder_with_sections(
-            east,
-            vec![
-                ChunkSection::new_empty(),
-                ChunkSection::new_empty(),
-                ChunkSection::new_empty(),
-            ],
-        );
+        let east_holder = roofed_holder(east, 3, 2, 0);
+        let neighbors = roofed_holder_square(center, 2, 3, 2, 0);
 
         {
             let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
@@ -1685,7 +2088,7 @@ mod tests {
 
         let Ok(workset) = LightWorkset::setup(
             layout,
-            LightCacheSetupRadius::Inner,
+            LightCacheSetupRadius::Full,
             true,
             |pos| {
                 if pos == center {
@@ -1693,7 +2096,7 @@ mod tests {
                 } else if pos == east {
                     Some(Arc::clone(&east_holder))
                 } else {
-                    None
+                    find_holder(&neighbors, pos)
                 }
             },
             |_| true,
@@ -1833,6 +2236,7 @@ mod tests {
         }
         let center_holder = holder_with_section(center, center_section);
         let east_holder = holder_with_section(east_chunk, ChunkSection::new_empty());
+        let neighbors = horizontal_empty_neighbors(center, 1);
         set_visible_sky_light(&east_holder, 0, 0, 14, 1, 15);
         let layout = LightCacheLayout::new(center, range());
         let Ok(workset) = LightWorkset::setup(
@@ -1845,7 +2249,7 @@ mod tests {
                 } else if pos == east_chunk {
                     Some(Arc::clone(&east_holder))
                 } else {
-                    None
+                    find_holder(&neighbors, pos)
                 }
             },
             |_| true,

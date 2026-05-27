@@ -180,6 +180,12 @@ impl LightDirectionSet {
         Self(direction.bit())
     }
 
+    /// Returns this set with one additional direction.
+    #[must_use]
+    pub const fn with(self, direction: LightAxisDirection) -> Self {
+        Self(self.0 | direction.bit())
+    }
+
     /// Creates a direction set containing all directions except one.
     #[must_use]
     pub const fn all_except(direction: LightAxisDirection) -> Self {

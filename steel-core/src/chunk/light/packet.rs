@@ -1,8 +1,8 @@
 use steel_protocol::packets::game::LightUpdatePacketData;
 use steel_utils::{ChunkPos, SectionPos, codec::BitSet};
 
-use super::LightLayer;
 use super::{ChunkLightData, ChunkLightLayerStorage, DataLayerStorageMap, LightSectionRange};
+use super::{LightLayer, LightNibbleState, MAX_LIGHT_LEVEL};
 
 /// Builds protocol light-update data for one chunk column.
 ///
@@ -74,8 +74,8 @@ pub fn build_chunk_light_update_packet(light: &ChunkLightData) -> LightUpdatePac
     let mut block_updates = Vec::new();
 
     for section_index in 0..range.section_count() {
-        prepare_nibble_section_data(
-            &light.sky,
+        prepare_chunk_sky_nibble_section_data(
+            light,
             section_index,
             &mut sky_y_mask,
             &mut empty_sky_y_mask,
@@ -177,6 +177,37 @@ fn prepare_section_data(
     }
 }
 
+fn prepare_chunk_sky_nibble_section_data(
+    light: &ChunkLightData,
+    section_index: usize,
+    mask: &mut BitSet,
+    empty_mask: &mut BitSet,
+    updates: &mut Vec<Vec<u8>>,
+) {
+    let Some(nibble) = light.sky.nibbles().get(section_index) else {
+        return;
+    };
+    let Some(layer) = nibble.to_data_layer() else {
+        if should_send_empty_nibble_section(&light.sky, section_index) {
+            empty_mask.set(section_index, true);
+        }
+        return;
+    };
+
+    if layer.is_empty() {
+        empty_mask.set(section_index, true);
+        return;
+    }
+
+    let bytes = layer.to_bytes();
+    if should_omit_full_sky_section_above_local_sources(light, section_index, bytes.as_ref()) {
+        return;
+    }
+
+    mask.set(section_index, true);
+    updates.push(bytes.as_ref().to_vec());
+}
+
 fn prepare_nibble_section_data(
     layers: &ChunkLightLayerStorage,
     section_index: usize,
@@ -201,6 +232,38 @@ fn prepare_nibble_section_data(
         let bytes = layer.to_bytes();
         updates.push(bytes.as_ref().to_vec());
     }
+}
+
+fn should_omit_full_sky_section_above_local_sources(
+    light: &ChunkLightData,
+    section_index: usize,
+    bytes: &[u8; super::DATA_LAYER_SIZE],
+) -> bool {
+    let full_byte = MAX_LIGHT_LEVEL | (MAX_LIGHT_LEVEL << 4);
+    if bytes.iter().any(|byte| *byte != full_byte) {
+        return false;
+    }
+
+    let Some(section_y) = light.sky.range().section_y(section_index) else {
+        return false;
+    };
+    let Some(highest) = highest_non_empty_section_y(&light.sky) else {
+        return false;
+    };
+    if section_y <= highest + 1 {
+        return false;
+    }
+
+    light
+        .block
+        .nibbles()
+        .get(section_index)
+        .is_none_or(|nibble| {
+            matches!(
+                nibble.visible_state(),
+                LightNibbleState::Null | LightNibbleState::Hidden
+            )
+        })
 }
 
 fn should_send_empty_nibble_section(layers: &ChunkLightLayerStorage, section_index: usize) -> bool {
