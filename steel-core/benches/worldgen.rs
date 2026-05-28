@@ -559,16 +559,23 @@ struct FeatureTaskWallTime {
     elapsed: Duration,
 }
 
-struct FullPipelineStage {
+struct PipelineStage {
     step: &'static ChunkStep,
     holders: Vec<Arc<ChunkHolder>>,
+}
+
+struct LightFixture {
+    context: Arc<WorldGenContext>,
+    cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
+    target: Arc<ChunkHolder>,
+    _world: Arc<World>,
 }
 
 struct ConcurrentFullPipelineFixture {
     chunk_runtime: Arc<Runtime>,
     chunk_map: Arc<ChunkMap>,
     cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
-    stages: Vec<FullPipelineStage>,
+    stages: Vec<PipelineStage>,
     generation_pool: Arc<rayon::ThreadPool>,
     targets: Vec<Arc<ChunkHolder>>,
     _world: Arc<World>,
@@ -631,6 +638,17 @@ const FULL_PIPELINE_STATUSES: [ChunkStatus; 12] = [
     ChunkStatus::Spawn,
     ChunkStatus::Full,
 ];
+const LIGHT_PIPELINE_STATUSES: [ChunkStatus; 9] = [
+    ChunkStatus::Empty,
+    ChunkStatus::StructureStarts,
+    ChunkStatus::StructureReferences,
+    ChunkStatus::Biomes,
+    ChunkStatus::Noise,
+    ChunkStatus::Surface,
+    ChunkStatus::Carvers,
+    ChunkStatus::Features,
+    ChunkStatus::InitializeLight,
+];
 
 fn concurrent_feature_centers() -> Vec<ChunkPos> {
     let side = CONCURRENT_FEATURE_GRID_MAX - CONCURRENT_FEATURE_GRID_MIN + 1;
@@ -654,7 +672,11 @@ fn concurrent_feature_cache_radius(centers: &[ChunkPos]) -> i32 {
 }
 
 fn concurrent_full_pipeline_cache_radius(centers: &[ChunkPos]) -> i32 {
-    let target_step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Full);
+    pipeline_cache_radius(centers, ChunkStatus::Full)
+}
+
+fn pipeline_cache_radius(centers: &[ChunkPos], target_status: ChunkStatus) -> i32 {
+    let target_step = GENERATION_PYRAMID.get_step_to(target_status);
     let dependency_radius = target_step.get_accumulated_radius_of(ChunkStatus::Empty) as i32;
 
     centers
@@ -664,7 +686,7 @@ fn concurrent_full_pipeline_cache_radius(centers: &[ChunkPos]) -> i32 {
         .unwrap_or(dependency_radius)
 }
 
-fn full_pipeline_positions_for_status(
+fn pipeline_positions_for_status(
     centers: &[ChunkPos],
     target_step: &ChunkStep,
     status: ChunkStatus,
@@ -688,18 +710,28 @@ fn full_pipeline_positions_for_status(
 fn full_pipeline_stages(
     cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
     centers: &[ChunkPos],
-) -> Vec<FullPipelineStage> {
-    let target_step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Full);
+) -> Vec<PipelineStage> {
+    pipeline_stages_to(cache, centers, ChunkStatus::Full, &FULL_PIPELINE_STATUSES)
+}
 
-    FULL_PIPELINE_STATUSES
-        .into_iter()
+fn pipeline_stages_to(
+    cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
+    centers: &[ChunkPos],
+    target_status: ChunkStatus,
+    statuses: &[ChunkStatus],
+) -> Vec<PipelineStage> {
+    let target_step = GENERATION_PYRAMID.get_step_to(target_status);
+
+    statuses
+        .iter()
+        .copied()
         .map(|status| {
-            let holders = full_pipeline_positions_for_status(centers, target_step, status)
+            let holders = pipeline_positions_for_status(centers, target_step, status)
                 .into_iter()
-                .map(|pos| cache.get(pos.0.x, pos.0.y).clone())
+                .map(|pos| Arc::clone(cache.get(pos.0.x, pos.0.y)))
                 .collect();
 
-            FullPipelineStage {
+            PipelineStage {
                 step: GENERATION_PYRAMID.get_step_to(status),
                 holders,
             }
@@ -882,6 +914,100 @@ fn build_concurrent_full_pipeline_fixture(
     }
 }
 
+fn build_overworld_light_fixture(seed: i64, center: ChunkPos) -> LightFixture {
+    let generator_key = Identifier::vanilla_static("overworld");
+    let generator_config = toml::Value::Table(Map::new());
+    let output = WorldGeneratorRegistry::new_with_builtins()
+        .expect("built-in world generators should register")
+        .create(&generator_key, &generator_config, seed)
+        .expect("light benchmark should use the built-in overworld generator");
+    let dim = output.dimension_type;
+    let generator = Arc::new(output.generator);
+    let generation_settings = WorldGenerationSettings::from_generator_config(
+        Identifier::vanilla_static("overworld"),
+        &output.config,
+        dim.key.clone(),
+        dim.min_y,
+        dim.height,
+    );
+    let chunk_runtime = Arc::new(
+        RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("light benchmark runtime should build"),
+    );
+    let generation_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|index| format!("bench-light-{index}"))
+            .build()
+            .expect("light benchmark generation pool should build"),
+    );
+    let world_config = WorldConfig {
+        storage: WorldStorageConfig::RamOnly,
+        level_data_path: None,
+        generator: Arc::clone(&generator),
+        generation_settings,
+        view_distance: 10,
+        simulation_distance: 10,
+        compression: None,
+        is_flat: false,
+        sea_level: output.sea_level,
+        default_gamemode: GameType::Survival,
+        difficulty: Difficulty::Normal,
+    };
+    let world = chunk_runtime
+        .block_on(World::new_with_config(
+            Arc::clone(&chunk_runtime),
+            Identifier::new("bench", "overworld_light"),
+            dim,
+            seed,
+            world_config,
+            Arc::clone(&generation_pool),
+        ))
+        .expect("light benchmark world should build");
+    let chunk_map = Arc::clone(&world.chunk_map);
+
+    let centers = [center];
+    let cache_radius = pipeline_cache_radius(&centers, ChunkStatus::Light);
+    let chunk_map_for_factory = Arc::clone(&chunk_map);
+    let cache = Arc::new(StaticCache2D::create(
+        center.0.x,
+        center.0.y,
+        cache_radius,
+        move |x, z| {
+            let pos = ChunkPos::new(x, z);
+            let holder = Arc::new(ChunkHolder::new(pos, 0, dim.min_y, dim.height));
+            let _ = chunk_map_for_factory
+                .chunks
+                .insert_sync(pos, Arc::clone(&holder));
+            holder
+        },
+    ));
+    let stages = pipeline_stages_to(
+        &cache,
+        &centers,
+        ChunkStatus::Light,
+        &LIGHT_PIPELINE_STATUSES,
+    );
+    for stage in &stages {
+        run_pipeline_stage(&chunk_runtime, &chunk_map, &cache, &generation_pool, stage);
+    }
+
+    let target = Arc::clone(cache.get(center.0.x, center.0.y));
+    assert!(
+        target.try_chunk(ChunkStatus::InitializeLight).is_some(),
+        "light benchmark target chunk did not reach InitializeLight"
+    );
+
+    LightFixture {
+        context: Arc::clone(&chunk_map.world_gen_context),
+        cache,
+        target,
+        _world: world,
+    }
+}
+
 fn bench_overworld_features_concurrent_overlap(c: &mut Criterion) {
     ensure_registry();
     let step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Features);
@@ -909,6 +1035,27 @@ fn bench_overworld_features_concurrent_overlap(c: &mut Criterion) {
                         }
                     });
                 }
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_overworld_light(c: &mut Criterion) {
+    ensure_registry();
+    let step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Light);
+
+    c.bench_function("overworld_generate_light", |b| {
+        b.iter_batched(
+            || build_overworld_light_fixture(PROFILE_FEATURE_SEED, ChunkPos::new(0, 0)),
+            |fixture| {
+                let LightFixture {
+                    context,
+                    cache,
+                    target,
+                    _world,
+                } = fixture;
+                ChunkStatusTasks::light(context, step, &cache, target);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -1049,18 +1196,34 @@ fn run_concurrent_full_pipeline_batch(fixture: ConcurrentFullPipelineFixture) {
     }
 }
 
-fn run_full_pipeline_stage(fixture: &ConcurrentFullPipelineFixture, stage: &FullPipelineStage) {
-    fixture.chunk_runtime.block_on(async {
+fn run_full_pipeline_stage(fixture: &ConcurrentFullPipelineFixture, stage: &PipelineStage) {
+    run_pipeline_stage(
+        &fixture.chunk_runtime,
+        &fixture.chunk_map,
+        &fixture.cache,
+        &fixture.generation_pool,
+        stage,
+    );
+}
+
+fn run_pipeline_stage(
+    chunk_runtime: &Runtime,
+    chunk_map: &Arc<ChunkMap>,
+    cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
+    generation_pool: &Arc<rayon::ThreadPool>,
+    stage: &PipelineStage,
+) {
+    chunk_runtime.block_on(async {
         let futures = stage
             .holders
             .iter()
             .filter_map(|holder| {
                 holder.apply_step(
                     stage.step,
-                    &fixture.chunk_map,
-                    &fixture.cache,
-                    fixture.generation_pool.clone(),
-                    fixture.chunk_map.cancel_token.child_token(),
+                    chunk_map,
+                    cache,
+                    Arc::clone(generation_pool),
+                    chunk_map.cancel_token.child_token(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1417,6 +1580,8 @@ criterion_group!(
     bench_overworld_features,
     bench_nether_features,
     bench_end_features,
+    // Light
+    bench_overworld_light,
     // Structure starts
     bench_overworld_structure_starts,
     bench_nether_structure_starts,

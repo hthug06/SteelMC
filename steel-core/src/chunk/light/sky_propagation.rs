@@ -28,11 +28,6 @@ pub enum SkyLightPropagationContextError {
         /// Missing center chunk position.
         chunk_pos: ChunkPos,
     },
-    /// A chunk needed for vanilla sky-source seeding is missing.
-    MissingSkyLightSources {
-        /// Missing source chunk position.
-        chunk_pos: ChunkPos,
-    },
 }
 
 /// Sections whose visible sky-light data changed during a scoped update.
