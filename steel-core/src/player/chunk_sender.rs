@@ -40,8 +40,18 @@ const MAX_UNACKNOWLEDGED_BATCHES: u16 = 10;
 pub struct PreparedBatch {
     /// Chunk holders to encode.
     pub holders: Vec<Arc<ChunkHolder>>,
+    /// Whether the world dimension has a vanilla sky-light layer.
+    pub has_skylight: bool,
     /// Snapshot of the player's generation counter at prepare time.
     pub epoch_snapshot: u32,
+}
+
+/// Encoded full-chunk packet with the chunk it satisfies.
+pub struct EncodedChunkPacket {
+    /// Chunk position for the encoded full chunk.
+    pub pos: ChunkPos,
+    /// Encoded `CLevelChunkWithLight` packet.
+    pub packet: EncodedPacket,
 }
 
 /// This struct is responsible for sending chunks to the client.
@@ -65,6 +75,12 @@ impl ChunkSender {
     /// Marks a chunk as pending to be sent to the client.
     pub fn mark_chunk_pending_to_send(&mut self, pos: ChunkPos) {
         self.pending_chunks.insert(pos);
+    }
+
+    /// Returns whether the chunk is still waiting for its full chunk packet.
+    #[must_use]
+    pub fn is_pending(&self, pos: ChunkPos) -> bool {
+        self.pending_chunks.contains(&pos)
     }
 
     /// Drops a chunk from the client's view.
@@ -116,6 +132,7 @@ impl ChunkSender {
 
         Some(PreparedBatch {
             holders,
+            has_skylight: world.dimension_type.has_skylight,
             epoch_snapshot,
         })
     }
@@ -131,14 +148,17 @@ impl ChunkSender {
         batch: &PreparedBatch,
         cache: &mut rustc_hash::FxHashMap<ChunkPos, EncodedPacket>,
         compression: Option<CompressionInfo>,
-    ) -> Vec<EncodedPacket> {
+    ) -> Vec<EncodedChunkPacket> {
         let mut encoded_chunks = Vec::with_capacity(batch.holders.len());
 
         for holder in &batch.holders {
             let pos = ChunkPos::new(holder.get_pos().0.x, holder.get_pos().0.y);
 
             if let Some(cached) = cache.get(&pos) {
-                encoded_chunks.push(cached.clone());
+                encoded_chunks.push(EncodedChunkPacket {
+                    pos,
+                    packet: cached.clone(),
+                });
                 continue;
             }
 
@@ -154,7 +174,7 @@ impl ChunkSender {
                     x: pos.0.x,
                     z: pos.0.y,
                     chunk_data: chunk.extract_chunk_data(),
-                    light_data: chunk.extract_light_data(),
+                    light_data: chunk.extract_light_data(batch.has_skylight),
                 },
                 compression,
                 ConnectionProtocol::Play,
@@ -162,7 +182,10 @@ impl ChunkSender {
             .expect("Failed to encode chunk packet");
 
             cache.insert(pos, encoded.clone());
-            encoded_chunks.push(encoded);
+            encoded_chunks.push(EncodedChunkPacket {
+                pos,
+                packet: encoded,
+            });
         }
 
         encoded_chunks
@@ -175,7 +198,7 @@ impl ChunkSender {
     pub fn commit_batch(
         &mut self,
         batch: &PreparedBatch,
-        encoded_chunks: Vec<EncodedPacket>,
+        encoded_chunks: Vec<EncodedChunkPacket>,
         connection: &PlayerConnection,
         chunk_send_epoch: &AtomicU32,
     ) {
@@ -193,9 +216,10 @@ impl ChunkSender {
         Self::send_packet(connection, CChunkBatchStart {});
 
         let batch_size = encoded_chunks.len();
-        for encoded in encoded_chunks {
-            connection.send_encoded(encoded);
+        for encoded in &encoded_chunks {
+            connection.send_encoded(encoded.packet.clone());
         }
+        self.mark_encoded_chunks_sent(&encoded_chunks);
 
         Self::send_packet(
             connection,
@@ -203,6 +227,12 @@ impl ChunkSender {
                 batch_size: batch_size as i32,
             },
         );
+    }
+
+    fn mark_encoded_chunks_sent(&mut self, encoded_chunks: &[EncodedChunkPacket]) {
+        for encoded in encoded_chunks {
+            self.pending_chunks.remove(&encoded.pos);
+        }
     }
 
     fn collect_candidates(
@@ -234,7 +264,6 @@ impl ChunkSender {
                 && holder.persisted_status() == Some(ChunkStatus::Full)
             {
                 chunks_to_send.push(holder);
-                self.pending_chunks.remove(&pos);
             }
         }
         chunks_to_send
@@ -274,5 +303,36 @@ impl Default for ChunkSender {
             batch_quota: 0.0,
             max_unacknowledged_batches: 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use steel_protocol::packets::game::CChunkBatchStart;
+    use steel_protocol::utils::ConnectionProtocol;
+
+    fn encoded_chunk(pos: ChunkPos) -> EncodedChunkPacket {
+        let packet = EncodedPacket::from_bare(CChunkBatchStart {}, None, ConnectionProtocol::Play)
+            .expect("test packet should encode");
+        EncodedChunkPacket { pos, packet }
+    }
+
+    #[test]
+    fn sent_full_chunks_clear_pending_entries_only_after_commit() {
+        let mut sender = ChunkSender::default();
+        let first = ChunkPos::new(1, 2);
+        let second = ChunkPos::new(3, 4);
+        let unsent = ChunkPos::new(5, 6);
+
+        sender.mark_chunk_pending_to_send(first);
+        sender.mark_chunk_pending_to_send(second);
+        sender.mark_chunk_pending_to_send(unsent);
+
+        sender.mark_encoded_chunks_sent(&[encoded_chunk(first), encoded_chunk(second)]);
+
+        assert!(!sender.is_pending(first));
+        assert!(!sender.is_pending(second));
+        assert!(sender.is_pending(unsent));
     }
 }

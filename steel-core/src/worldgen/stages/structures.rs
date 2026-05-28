@@ -52,7 +52,9 @@ pub(crate) fn generate_references(
         for source_z in (target_z - 8)..=(target_z + 8) {
             let source_holder = cache.get(source_x, source_z);
             let Some(source_chunk) = source_holder.try_chunk(ChunkStatus::StructureStarts) else {
-                continue;
+                panic!(
+                    "Structure reference generation for ({target_x}, {target_z}) missing source chunk ({source_x}, {source_z}) at StructureStarts"
+                );
             };
 
             for (structure_id, start) in source_chunk.structure_starts().iter() {
@@ -85,7 +87,7 @@ pub(crate) fn generate_references(
             target_references
                 .entry(structure_id)
                 .or_default()
-                .extend(source_chunks);
+                .extend(source_chunks.insertion_order_iter().copied());
         }
         target_chunk.mark_dirty();
     }

@@ -181,6 +181,10 @@ impl ChunkHolder {
     /// Records a block change at the given position.
     /// Returns `true` if this is the first change (chunk should be added to broadcast list).
     pub fn block_changed(&self, pos: BlockPos) -> bool {
+        if pos.0.y < self.min_y || pos.0.y >= self.min_y + self.height {
+            return false;
+        }
+
         let section_index = ((pos.0.y - self.min_y) / 16) as usize;
         if section_index >= self.changed_blocks_per_section.len() {
             return false;
@@ -558,7 +562,7 @@ impl ChunkHolder {
         });
     }
 
-    fn post_process_generation(&self) {
+    pub(crate) fn post_process_generation(&self) {
         let postprocessing = {
             let chunk = self.data.read();
             let ChunkAccess::Full(full) = &*chunk else {
@@ -596,14 +600,6 @@ impl ChunkHolder {
             }
             ChunkResult::Ok(_) => {}
         });
-
-        self.post_publish_status_hooks(status);
-    }
-
-    fn post_publish_status_hooks(&self, status: ChunkStatus) {
-        if status == ChunkStatus::Full {
-            self.post_process_generation();
-        }
     }
 
     /// Inserts a chunk into the holder with a specific status.
@@ -720,6 +716,20 @@ mod tests {
         assert!(!holder.has_changes_to_broadcast());
 
         assert!(holder.light_changed(LightLayer::Sky, SectionPos::new(0, -1, 0)));
+    }
+
+    #[test]
+    fn block_changed_rejects_positions_outside_build_height() {
+        let holder = holder_with_full_chunk(ChunkPos::new(0, 0), 0, 16);
+
+        assert!(!holder.block_changed(BlockPos::new(1, -1, 1)));
+        assert!(!holder.block_changed(BlockPos::new(1, 16, 1)));
+        assert!(!holder.has_changes_to_broadcast());
+        assert!(holder.take_changed_blocks().is_empty());
+
+        assert!(holder.block_changed(BlockPos::new(1, 0, 1)));
+        assert!(holder.has_changes_to_broadcast());
+        assert_eq!(holder.take_changed_blocks().len(), 1);
     }
 
     #[test]

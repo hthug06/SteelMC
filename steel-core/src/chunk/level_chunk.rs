@@ -28,8 +28,8 @@ use crate::block_entity::{BlockEntityStorage, SharedBlockEntity};
 use crate::chunk::{
     heightmap::{ChunkHeightmaps, HeightmapType},
     light::{
-        ChunkLightData, ChunkSkyLightSources, build_chunk_light_update_packet,
-        has_different_light_properties,
+        ChunkLightData, ChunkSkyLightSources, LightSectionEmptinessChange,
+        build_chunk_light_update_packet, has_different_light_properties,
     },
     proto_chunk::ProtoChunk,
     section::Sections,
@@ -367,7 +367,7 @@ impl LevelChunk {
         ))
     }
 
-    /// Runs vanilla proto postprocessing after this chunk has been promoted to full.
+    /// Runs vanilla proto postprocessing when this full chunk becomes block-ticking.
     pub(crate) fn post_process_generation(
         world: &Arc<World>,
         chunk_pos: ChunkPos,
@@ -678,9 +678,19 @@ impl LevelChunk {
         let old_block = old_state.get_block();
         let new_block = state.get_block();
 
-        if was_empty != is_empty {
+        let empty_section_change = if was_empty != is_empty {
             self.update_light_section_emptiness(y, is_empty);
-        }
+            Some(LightSectionEmptinessChange {
+                section_pos: SectionPos::new(
+                    self.pos.0.x,
+                    SectionPos::block_to_section_coord(y),
+                    self.pos.0.y,
+                ),
+                empty: is_empty,
+            })
+        } else {
+            None
+        };
 
         let light_properties_changed = has_different_light_properties(old_state, state);
         if light_properties_changed {
@@ -698,8 +708,13 @@ impl LevelChunk {
         }
 
         if let Some(level) = self.get_level() {
-            if light_properties_changed {
-                level.propagate_light_change_after_block_set(pos, old_state, state);
+            if light_properties_changed || empty_section_change.is_some() {
+                level.queue_light_change_after_block_set(
+                    pos,
+                    old_state,
+                    state,
+                    empty_section_change,
+                );
             }
 
             // Update POI storage when block states change
@@ -785,18 +800,22 @@ impl LevelChunk {
     #[must_use]
     pub fn get_block_state(&self, pos: BlockPos) -> BlockStateId {
         let y = pos.0.y;
+
+        if y < self.min_y || y >= self.min_y + self.height {
+            return REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR);
+        }
+
         let section_index = self.get_section_index(y);
 
-        // Bounds check - return air if out of range
         if section_index >= self.sections.sections.len() {
-            return REGISTRY.blocks.get_base_state_id(&vanilla_blocks::VOID_AIR);
+            return REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR);
         }
 
         let section = &self.sections.sections[section_index];
         let section_guard = section.read();
 
         if section_guard.is_empty() {
-            return REGISTRY.blocks.get_base_state_id(&vanilla_blocks::VOID_AIR);
+            return REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR);
         }
 
         let local_x = (pos.0.x & 15) as usize;
@@ -868,8 +887,46 @@ impl LevelChunk {
 
     /// Extracts the light data for sending to the client.
     #[must_use]
-    pub fn extract_light_data(&self) -> LightUpdatePacketData {
+    pub fn extract_light_data(&self, has_skylight: bool) -> LightUpdatePacketData {
         let light = self.light.read();
-        build_chunk_light_update_packet(&light)
+        build_chunk_light_update_packet(&light, has_skylight)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Weak;
+
+    use steel_registry::{REGISTRY, test_support::init_test_registry, vanilla_blocks};
+    use steel_utils::{BlockPos, ChunkPos};
+
+    use super::*;
+    use crate::behavior::init_behaviors;
+    use crate::chunk::{
+        proto_chunk::ProtoChunk,
+        section::{ChunkSection, Sections},
+    };
+
+    #[test]
+    fn get_block_state_outside_build_height_does_not_wrap_to_bottom_section() {
+        init_test_registry();
+        init_behaviors();
+        let stone = vanilla_blocks::STONE.default_state();
+        let air = REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR);
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(0, 15, 0, stone);
+        let proto = ProtoChunk::new(
+            Sections::from_owned(vec![section].into_boxed_slice()),
+            ChunkPos::new(0, 0),
+            0,
+            16,
+            Weak::new(),
+        );
+        let chunk = LevelChunk::from_proto(proto, 0, 16, Weak::new());
+
+        assert_eq!(chunk.get_block_state(BlockPos::new(0, 15, 0)), stone);
+        assert_eq!(chunk.get_block_state(BlockPos::new(0, -1, 0)), air);
+        assert_eq!(chunk.get_block_state(BlockPos::new(0, 16, 0)), air);
+        assert_eq!(chunk.get_block_state(BlockPos::new(1, 0, 1)), air);
     }
 }

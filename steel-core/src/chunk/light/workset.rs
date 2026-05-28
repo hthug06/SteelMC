@@ -205,6 +205,7 @@ impl LightChunkReadCache<'_> {
     /// without storing self-referential borrows inside [`LightWorkset`].
     pub fn with_section_read_cache<R>(&self, f: impl FnOnce(&LightSectionReadCache<'_>) -> R) -> R {
         let mut sections = LightSectionSlotArray::new(self.layout);
+        let mut emptiness_maps = LightChunkSlotArray::new();
 
         for chunk_slot in 0..self.chunks.slot_count() {
             let Some(chunk_guard) = self.chunks.get_slot(chunk_slot) else {
@@ -213,6 +214,9 @@ impl LightChunkReadCache<'_> {
             let Some(chunk_pos) = self.layout.chunk_pos_for_slot(chunk_slot) else {
                 continue;
             };
+
+            emptiness_maps.insert_slot(chunk_slot, chunk_guard.sections().section_emptiness_map());
+
             let Some(section_slots) = self.layout.inner_light_section_slots_for_chunk(chunk_pos)
             else {
                 continue;
@@ -237,6 +241,7 @@ impl LightChunkReadCache<'_> {
         let cache = LightSectionReadCache {
             layout: self.layout,
             sections,
+            emptiness_maps,
         };
         f(&cache)
     }
@@ -267,6 +272,8 @@ impl LightChunkReadCache<'_> {
             layer,
             chunks,
             nibbles,
+            removed_null_nibbles: LightSectionSlotArray::new(self.layout),
+            transient_nibbles: Vec::new(),
         };
         f(&mut cache)
     }
@@ -303,10 +310,10 @@ impl LightChunkReadCache<'_> {
 
                 nibbles.insert(
                     cached_section,
-                    LightNibbleCacheEntry {
+                    LightNibbleCacheEntry::Stored(StoredLightNibbleCacheEntry {
                         chunk_slot,
                         nibble_index,
-                    },
+                    }),
                 );
             }
         }
@@ -319,6 +326,7 @@ impl LightChunkReadCache<'_> {
 pub struct LightSectionReadCache<'a> {
     layout: LightCacheLayout,
     sections: LightSectionSlotArray<RwLockReadGuard<'a, ChunkSection>>,
+    emptiness_maps: LightChunkSlotArray<Box<[bool]>>,
 }
 
 impl LightSectionReadCache<'_> {
@@ -353,15 +361,42 @@ impl LightSectionReadCache<'_> {
             .is_some_and(|section| !section.is_empty())
     }
 
+    /// Returns whether a cached section was admitted into the section-read cache.
+    #[must_use]
+    pub fn has_cached_section(&self, section_pos: SectionPos) -> bool {
+        let Some(cached_section) = self.layout.cached_section(section_pos) else {
+            return false;
+        };
+        self.sections
+            .get_slot(cached_section.section_slot)
+            .is_some()
+    }
+
+    /// Returns known real-section emptiness for a readable cached chunk column.
+    #[must_use]
+    pub fn section_empty(&self, section_pos: SectionPos) -> Option<bool> {
+        let chunk_pos = ChunkPos::new(section_pos.x(), section_pos.z());
+        let cached_chunk = self.layout.cached_chunk(chunk_pos)?;
+        let emptiness_map = self.emptiness_maps.get_slot(cached_chunk.chunk_slot)?;
+        let section_index = self.layout.range().chunk_section_index(section_pos.y())?;
+        emptiness_map.get(section_index).copied()
+    }
+
     fn air() -> BlockStateId {
         REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LightNibbleCacheEntry {
+struct StoredLightNibbleCacheEntry {
     chunk_slot: usize,
     nibble_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LightNibbleCacheEntry {
+    Stored(StoredLightNibbleCacheEntry),
+    Transient(usize),
 }
 
 /// Flat cached light-nibble writes for one layer and one scoped lighting operation.
@@ -370,6 +405,8 @@ pub struct LightLayerWriteCache<'a> {
     layer: LightLayer,
     chunks: LightChunkSlotArray<RwLockWriteGuard<'a, ChunkLightData>>,
     nibbles: LightSectionSlotArray<LightNibbleCacheEntry>,
+    removed_null_nibbles: LightSectionSlotArray<StoredLightNibbleCacheEntry>,
+    transient_nibbles: Vec<LightNibbleArray>,
 }
 
 impl LightLayerWriteCache<'_> {
@@ -407,21 +444,6 @@ impl LightLayerWriteCache<'_> {
         self.nibble(section_slot).is_some()
     }
 
-    /// Returns true when the cached chunk column has a known emptiness map for this layer.
-    #[must_use]
-    pub fn has_emptiness_map(&self, chunk_pos: ChunkPos) -> bool {
-        let Some(cached_chunk) = self.layout.cached_chunk(chunk_pos) else {
-            return false;
-        };
-        let Some(light_data) = self.chunks.get_slot(cached_chunk.chunk_slot) else {
-            return false;
-        };
-
-        Self::layer_storage(light_data, self.layer)
-            .emptiness_map()
-            .is_some()
-    }
-
     /// Returns known real-section emptiness for a cached chunk column.
     #[must_use]
     pub fn section_empty(&self, section_pos: SectionPos) -> Option<bool> {
@@ -430,6 +452,77 @@ impl LightLayerWriteCache<'_> {
         let light_data = self.chunks.get_slot(cached_chunk.chunk_slot)?;
 
         Self::layer_storage(light_data, self.layer).section_empty(section_pos.y())
+    }
+
+    /// Removes null sky nibbles from the temporary cache.
+    ///
+    /// ScalableLux rewrites null sky cache entries to absent cache entries
+    /// before skylight chunk lighting and edge checks. Later
+    /// `initRemovedNibbles` calls may materialize a temporary nibble for
+    /// propagation, but that nibble is not stored back into the chunk.
+    pub fn rewrite_null_nibbles_for_skylight(&mut self) {
+        debug_assert_eq!(self.layer, LightLayer::Sky);
+
+        for section_slot in 0..self.nibbles.slot_count() {
+            let Some(LightNibbleCacheEntry::Stored(stored)) =
+                self.nibbles.get_slot(section_slot).copied()
+            else {
+                continue;
+            };
+
+            let is_null = {
+                let Some(nibble) = self.stored_nibble_mut(stored) else {
+                    continue;
+                };
+                if !nibble.is_null_updating() {
+                    false
+                } else {
+                    nibble.update_visible();
+                    true
+                }
+            };
+
+            if is_null {
+                self.nibbles.take_slot(section_slot);
+                self.removed_null_nibbles.insert_slot(section_slot, stored);
+            }
+        }
+    }
+
+    /// Materializes a sky nibble that was removed from the temporary cache.
+    ///
+    /// Returns false when the section was not part of the writable cache or was
+    /// not removed by [`Self::rewrite_null_nibbles_for_skylight`].
+    pub fn materialize_removed_null_section(&mut self, section_pos: SectionPos) -> bool {
+        let Some(section_slot) = self.layout.section_slot(section_pos) else {
+            return false;
+        };
+        if self.nibbles.get_slot(section_slot).is_some() {
+            return true;
+        }
+        if self.removed_null_nibbles.get_slot(section_slot).is_none() {
+            return false;
+        }
+
+        let transient_index = self.transient_nibbles.len();
+        self.transient_nibbles.push(LightNibbleArray::null());
+        self.nibbles.insert_slot(
+            section_slot,
+            LightNibbleCacheEntry::Transient(transient_index),
+        );
+        true
+    }
+
+    /// Updates the cached light layer's real-section emptiness map.
+    ///
+    /// Returns the previous value when the target layer and section are writable.
+    pub fn set_section_empty(&mut self, section_pos: SectionPos, empty: bool) -> Option<bool> {
+        let chunk_pos = ChunkPos::new(section_pos.x(), section_pos.z());
+        let cached_chunk = self.layout.cached_chunk(chunk_pos)?;
+        let layer = self.layer;
+        let light_data = self.chunks.get_mut_slot(cached_chunk.chunk_slot)?;
+
+        Self::layer_storage_mut(light_data, layer).set_section_empty(section_pos.y(), empty)
     }
 
     /// Marks a cached light section non-null without allocating light bytes.
@@ -652,15 +745,32 @@ impl LightLayerWriteCache<'_> {
     }
 
     fn nibble(&self, section_slot: usize) -> Option<&LightNibbleArray> {
-        let entry = self.nibbles.get_slot(section_slot)?;
+        let entry = *self.nibbles.get_slot(section_slot)?;
+        match entry {
+            LightNibbleCacheEntry::Stored(stored) => self.stored_nibble(stored),
+            LightNibbleCacheEntry::Transient(index) => self.transient_nibbles.get(index),
+        }
+    }
+
+    fn nibble_mut(&mut self, section_slot: usize) -> Option<&mut LightNibbleArray> {
+        let entry = *self.nibbles.get_slot(section_slot)?;
+        match entry {
+            LightNibbleCacheEntry::Stored(stored) => self.stored_nibble_mut(stored),
+            LightNibbleCacheEntry::Transient(index) => self.transient_nibbles.get_mut(index),
+        }
+    }
+
+    fn stored_nibble(&self, entry: StoredLightNibbleCacheEntry) -> Option<&LightNibbleArray> {
         let light_data = self.chunks.get_slot(entry.chunk_slot)?;
         Self::layer_storage(light_data, self.layer)
             .nibbles()
             .get(entry.nibble_index)
     }
 
-    fn nibble_mut(&mut self, section_slot: usize) -> Option<&mut LightNibbleArray> {
-        let entry = *self.nibbles.get_slot(section_slot)?;
+    fn stored_nibble_mut(
+        &mut self,
+        entry: StoredLightNibbleCacheEntry,
+    ) -> Option<&mut LightNibbleArray> {
         let layer = self.layer;
         let light_data = self.chunks.get_mut_slot(entry.chunk_slot)?;
         Self::layer_storage_mut(light_data, layer)
@@ -843,6 +953,47 @@ mod tests {
     }
 
     #[test]
+    fn section_read_cache_reports_outer_chunk_emptiness_maps() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let outer = ChunkPos::new(2, 0);
+        let center_holder = holder_with_section(center, ChunkSection::new_empty());
+        let mut outer_section = ChunkSection::new_empty();
+        outer_section.set_block_state(1, 2, 3, vanilla_blocks::STONE.default_state());
+        let outer_holder = holder_with_section(outer, outer_section);
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Full,
+            true,
+            |pos| {
+                if pos == center {
+                    Some(Arc::clone(&center_holder))
+                } else if pos == outer {
+                    Some(Arc::clone(&outer_holder))
+                } else {
+                    None
+                }
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept cached test chunks");
+        };
+
+        workset.with_chunk_read_cache(|chunk_cache| {
+            chunk_cache.with_section_read_cache(|section_cache| {
+                assert_eq!(
+                    section_cache.section_empty(SectionPos::new(outer.0.x, 0, outer.0.y)),
+                    Some(false)
+                );
+                assert!(
+                    !section_cache.has_non_empty_section(SectionPos::new(outer.0.x, 0, outer.0.y))
+                );
+            });
+        });
+    }
+
+    #[test]
     fn light_write_cache_reads_writes_and_publishes_cached_nibbles() {
         init_tests();
         let center = ChunkPos::new(0, 0);
@@ -980,6 +1131,59 @@ mod tests {
         };
         assert!(nibble.is_null_updating());
         assert_eq!(nibble.get_updating_at_index(cached_block.local_index), 0);
+    }
+
+    #[test]
+    fn sky_write_cache_materializes_removed_null_sections_transiently() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let holder = holder_with_section(center, ChunkSection::new_empty());
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Inner,
+            true,
+            |pos| (pos == center).then(|| Arc::clone(&holder)),
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept missing neighbors");
+        };
+        let section_pos = SectionPos::new(0, 0, 0);
+        let Some(cached_block) = layout.cached_block(BlockPos::new(1, 2, 3)) else {
+            panic!("test block should be inside light cache");
+        };
+
+        workset.with_chunk_read_cache(|chunk_cache| {
+            chunk_cache.with_light_write_cache(LightLayer::Sky, |light_cache| {
+                light_cache.rewrite_null_nibbles_for_skylight();
+                assert!(!light_cache.has_cached_section(section_pos));
+                assert!(!light_cache.set(cached_block, 12));
+
+                assert!(light_cache.materialize_removed_null_section(section_pos));
+                assert!(light_cache.has_cached_section(section_pos));
+                assert!(light_cache.set_section_non_null(section_pos));
+                assert!(light_cache.set(cached_block, 12));
+
+                let mut updated_sections = Vec::new();
+                assert_eq!(
+                    light_cache.update_visible(None, |updated| {
+                        updated_sections.push(updated);
+                    }),
+                    1
+                );
+                assert_eq!(updated_sections, vec![section_pos]);
+            });
+        });
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("test chunk should still be available");
+        };
+        let light = chunk.light();
+        let Some(nibble) = light.sky.nibble(0) else {
+            panic!("sky nibble should be present");
+        };
+        assert!(nibble.is_null_visible());
+        assert_eq!(nibble.get_visible_at_index(cached_block.local_index), 0);
     }
 
     #[test]

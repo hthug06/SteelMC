@@ -3,9 +3,9 @@ use steel_utils::{BlockPos, ChunkPos, Direction, SectionPos};
 
 use super::{
     CachedLightBlock, LIGHT_BLOCKED, LightAxisDirection, LightCacheLayout, LightDirectionSet,
-    LightLayer, LightLayerWriteCache, LightQueueFlags, LightSectionReadCache, LightWorkset,
-    MAX_LIGHT_LEVEL, PackedLightPropagationQueues, PackedLightQueueEntry, get_light_block_into,
-    get_light_opacity, light_occlusion_shape,
+    LightLayer, LightLayerWriteCache, LightQueueFlags, LightSectionEmptinessChange,
+    LightSectionReadCache, LightWorkset, MAX_LIGHT_LEVEL, PackedLightPropagationQueues,
+    PackedLightQueueEntry, get_light_block_into, get_light_opacity, light_occlusion_shape,
 };
 
 /// Error returned when a block-light propagation context is built from mismatched caches.
@@ -56,13 +56,24 @@ pub fn propagate_block_light_changes(
     workset: &LightWorkset,
     positions: impl IntoIterator<Item = BlockPos>,
 ) -> Result<BlockLightUpdateResult, BlockLightPropagationContextError> {
+    propagate_block_light_changes_with_empty_sections(workset, positions, [])
+}
+
+/// Runs block-light propagation after applying real section emptiness transitions.
+pub fn propagate_block_light_changes_with_empty_sections(
+    workset: &LightWorkset,
+    positions: impl IntoIterator<Item = BlockPos>,
+    empty_sections: impl IntoIterator<Item = LightSectionEmptinessChange>,
+) -> Result<BlockLightUpdateResult, BlockLightPropagationContextError> {
+    let empty_sections = empty_sections.into_iter().collect::<Vec<_>>();
+
     workset.with_chunk_read_cache(|chunk_cache| {
         chunk_cache.with_section_read_cache(|section_cache| {
             chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
                 let mut queues = PackedLightPropagationQueues::new();
 
                 {
-                    initialize_block_light_nibbles(section_cache, light_cache);
+                    apply_block_empty_section_changes(section_cache, light_cache, &empty_sections);
                     let mut context =
                         BlockLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
                     for position in positions {
@@ -79,6 +90,27 @@ pub fn propagate_block_light_changes(
             })
         })
     })
+}
+
+fn apply_block_empty_section_changes(
+    sections: &LightSectionReadCache<'_>,
+    light: &mut LightLayerWriteCache<'_>,
+    empty_sections: &[LightSectionEmptinessChange],
+) -> usize {
+    let mut changed_chunks = Vec::new();
+    for change in empty_sections {
+        light.set_section_empty(change.section_pos, change.empty);
+        let chunk_pos = ChunkPos::new(change.section_pos.x(), change.section_pos.z());
+        if !changed_chunks.contains(&chunk_pos) {
+            changed_chunks.push(chunk_pos);
+        }
+    }
+
+    let mut initialized = 0;
+    for chunk_pos in changed_chunks {
+        initialized += sync_block_empty_section_nibbles(sections, light, chunk_pos);
+    }
+    initialized
 }
 
 /// Seeds and propagates block light for the center chunk of a scoped workset.
@@ -110,7 +142,7 @@ pub fn propagate_block_light_chunk(
 
                 {
                     light_cache.reset_chunk_nibbles_to_null(layout.center_chunk());
-                    handle_unlit_block_empty_section_changes(
+                    sync_block_empty_section_nibbles(
                         section_cache,
                         light_cache,
                         layout.center_chunk(),
@@ -140,29 +172,93 @@ pub fn propagate_block_light_chunk(
     })
 }
 
-fn initialize_block_light_nibbles(
-    sections: &LightSectionReadCache<'_>,
-    light: &mut LightLayerWriteCache<'_>,
-) -> usize {
-    let layout = sections.layout();
-    let mut initialized = 0;
+/// Force-synchronizes block-light nibbles for an already-lit loaded chunk.
+///
+/// This matches the block layer of ScalableLux `forceLoadInChunk`: existing
+/// light data is kept, empty-section nibbles are synchronized, and dirty
+/// visible nibbles are published before the later edge-check pass.
+pub fn force_load_block_light_chunk(
+    workset: &LightWorkset,
+) -> Result<BlockLightUpdateResult, BlockLightPropagationContextError> {
+    workset.with_chunk_read_cache(|chunk_cache| {
+        let layout = ensure_center_chunk(chunk_cache)?;
 
-    for section_slot in 0..layout.section_slot_count() {
-        let Some(section_pos) = layout.section_pos_for_slot(section_slot) else {
-            continue;
-        };
-        if !has_non_empty_neighbor_section(sections, section_pos) {
-            continue;
-        }
-        if light.set_section_slot_non_null(section_slot) {
-            initialized += 1;
-        }
-    }
+        chunk_cache.with_section_read_cache(|section_cache| {
+            chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
+                sync_block_empty_section_nibbles(section_cache, light_cache, layout.center_chunk());
 
-    initialized
+                let mut updated_sections = Vec::new();
+                light_cache.update_visible(None, |section_pos| {
+                    updated_sections.push(section_pos);
+                });
+                Ok(BlockLightUpdateResult { updated_sections })
+            })
+        })
+    })
 }
 
-fn handle_unlit_block_empty_section_changes(
+/// Validates already-loaded block-light chunk edges without resetting nibbles.
+///
+/// This matches ScalableLux `checkBlockEdges`: the force-load pass has already
+/// synchronized empty-section nibbles, so this pass only checks horizontal
+/// consistency against loaded neighbors and publishes its own dirty nibbles.
+pub fn check_block_light_chunk_edges(
+    workset: &LightWorkset,
+) -> Result<BlockLightUpdateResult, BlockLightPropagationContextError> {
+    workset.with_chunk_read_cache(|chunk_cache| {
+        let layout = ensure_center_chunk(chunk_cache)?;
+
+        chunk_cache.with_section_read_cache(|section_cache| {
+            chunk_cache.with_light_write_cache(LightLayer::Block, |light_cache| {
+                let mut queues = PackedLightPropagationQueues::new();
+
+                {
+                    let mut context =
+                        BlockLightPropagationContext::new(section_cache, light_cache, &mut queues)?;
+                    context.check_chunk_edges(layout.center_chunk());
+                }
+
+                let mut updated_sections = Vec::new();
+                light_cache.update_visible(None, |section_pos| {
+                    updated_sections.push(section_pos);
+                });
+                Ok(BlockLightUpdateResult { updated_sections })
+            })
+        })
+    })
+}
+
+/// Loads already-persisted block light and validates chunk edges without resetting nibbles.
+///
+/// This is the complete block-layer `lit == true` path: force-load
+/// empty-section state first, then run the edge-check pass.
+pub fn load_block_light_chunk(
+    workset: &LightWorkset,
+) -> Result<BlockLightUpdateResult, BlockLightPropagationContextError> {
+    let mut updated_sections = force_load_block_light_chunk(workset)?.updated_sections;
+    updated_sections.extend(check_block_light_chunk_edges(workset)?.updated_sections);
+    Ok(BlockLightUpdateResult { updated_sections })
+}
+
+fn ensure_center_chunk(
+    chunk_cache: &super::LightChunkReadCache<'_>,
+) -> Result<LightCacheLayout, BlockLightPropagationContextError> {
+    let layout = chunk_cache.layout();
+    let Some(center_slot) = layout.cached_chunk(layout.center_chunk()) else {
+        return Err(BlockLightPropagationContextError::MissingCenterChunk {
+            chunk_pos: layout.center_chunk(),
+        });
+    };
+    if chunk_cache.chunk(center_slot).is_none() {
+        return Err(BlockLightPropagationContextError::MissingCenterChunk {
+            chunk_pos: layout.center_chunk(),
+        });
+    }
+
+    Ok(layout)
+}
+
+fn sync_block_empty_section_nibbles(
     sections: &LightSectionReadCache<'_>,
     light: &mut LightLayerWriteCache<'_>,
     chunk_pos: ChunkPos,
@@ -197,62 +293,33 @@ fn handle_unlit_block_empty_section_changes(
     for offset_z in -1..=1 {
         for offset_x in -1..=1 {
             let target_chunk = ChunkPos::new(chunk_pos.0.x + offset_x, chunk_pos.0.y + offset_z);
-            let neighbours_loaded = chunk_neighborhood_has_emptiness_maps(light, target_chunk);
 
             for section_y in
                 (layout.range().min_section_y()..layout.range().max_section_y_exclusive()).rev()
             {
                 let section_pos = SectionPos::new(target_chunk.0.x, section_y, target_chunk.0.y);
-                let all_empty =
-                    section_neighborhood_all_empty(sections, light, target_chunk, section_y);
-                if all_empty && neighbours_loaded {
-                    light.set_section_hidden(section_pos);
-                } else if !all_empty && light.set_section_non_null(section_pos) {
-                    initialized += 1;
+                match section_neighborhood_all_empty_if_known(sections, target_chunk, section_y) {
+                    Some(true) => {
+                        light.set_section_hidden(section_pos);
+                    }
+                    Some(false) => {
+                        if light.set_section_non_null(section_pos) {
+                            initialized += 1;
+                        }
+                    }
+                    None => {
+                        if !section_neighborhood_all_empty(sections, light, target_chunk, section_y)
+                            && light.set_section_non_null(section_pos)
+                        {
+                            initialized += 1;
+                        }
+                    }
                 }
             }
         }
     }
 
     initialized
-}
-
-fn has_non_empty_neighbor_section(
-    sections: &LightSectionReadCache<'_>,
-    section_pos: SectionPos,
-) -> bool {
-    for offset_z in -1..=1 {
-        for offset_x in -1..=1 {
-            for offset_y in -1..=1 {
-                let neighbor = SectionPos::new(
-                    section_pos.x() + offset_x,
-                    section_pos.y() + offset_y,
-                    section_pos.z() + offset_z,
-                );
-                if sections.has_non_empty_section(neighbor) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn chunk_neighborhood_has_emptiness_maps(
-    light: &LightLayerWriteCache<'_>,
-    chunk_pos: ChunkPos,
-) -> bool {
-    for offset_z in -1..=1 {
-        for offset_x in -1..=1 {
-            let neighbor = ChunkPos::new(chunk_pos.0.x + offset_x, chunk_pos.0.y + offset_z);
-            if !light.has_emptiness_map(neighbor) {
-                return false;
-            }
-        }
-    }
-
-    true
 }
 
 fn section_neighborhood_all_empty(
@@ -286,11 +353,46 @@ fn section_neighborhood_all_empty(
     true
 }
 
+fn section_neighborhood_all_empty_if_known(
+    sections: &LightSectionReadCache<'_>,
+    chunk_pos: ChunkPos,
+    section_y: i32,
+) -> Option<bool> {
+    for offset_y in -1..=1 {
+        let neighbor_y = section_y + offset_y;
+        if neighbor_y < sections.layout().range().min_chunk_section_y()
+            || neighbor_y >= sections.layout().range().max_chunk_section_y_exclusive()
+        {
+            continue;
+        }
+
+        for offset_z in -1..=1 {
+            for offset_x in -1..=1 {
+                let section_pos = SectionPos::new(
+                    chunk_pos.0.x + offset_x,
+                    neighbor_y,
+                    chunk_pos.0.y + offset_z,
+                );
+                let empty = sections.section_empty(section_pos)?;
+                if !empty {
+                    return Some(false);
+                }
+            }
+        }
+    }
+
+    Some(true)
+}
+
 fn section_is_non_empty(
     sections: &LightSectionReadCache<'_>,
     light: &LightLayerWriteCache<'_>,
     section_pos: SectionPos,
 ) -> bool {
+    if let Some(empty) = sections.section_empty(section_pos) {
+        return !empty;
+    }
+
     if let Some(empty) = light.section_empty(section_pos) {
         return !empty;
     }
@@ -1119,6 +1221,85 @@ mod tests {
 
         assert_eq!(nibble.get_visible_at_index(source.local_index), 15);
         assert_eq!(nibble.get_visible_at_index(east.local_index), 14);
+    }
+
+    #[test]
+    fn block_light_changes_apply_empty_section_transitions() {
+        init_tests();
+        let center = ChunkPos::new(0, 0);
+        let removed_pos = BlockPos::new(1, 1, 1);
+        let mut holders = Vec::new();
+        let mut center_holder = None;
+        for z in -2..=2 {
+            for x in -2..=2 {
+                let pos = ChunkPos::new(x, z);
+                let mut section = ChunkSection::new_empty();
+                if pos == center {
+                    section.set_block_state(1, 1, 1, vanilla_blocks::STONE.default_state());
+                }
+                let holder = holder_with_section(pos, section);
+                initialize_holder_light(&holder);
+                if pos == center {
+                    center_holder = Some(Arc::clone(&holder));
+                }
+                holders.push((pos, holder));
+            }
+        }
+        let Some(center_holder) = center_holder else {
+            panic!("center holder should be created");
+        };
+        set_visible_block_light(&center_holder, 0, 1, 1, 1, 9);
+
+        let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("center chunk should be available");
+        };
+        assert_eq!(
+            chunk.set_block_state(
+                removed_pos,
+                vanilla_blocks::AIR.default_state(),
+                UpdateFlags::UPDATE_NONE,
+            ),
+            Some(vanilla_blocks::STONE.default_state())
+        );
+        drop(chunk);
+
+        let layout = LightCacheLayout::new(center, range());
+        let Ok(workset) = LightWorkset::setup(
+            layout,
+            LightCacheSetupRadius::Full,
+            true,
+            |pos| {
+                holders
+                    .iter()
+                    .find(|(holder_pos, _)| *holder_pos == pos)
+                    .map(|(_, holder)| Arc::clone(holder))
+            },
+            |_| true,
+        ) else {
+            panic!("relaxed setup should accept cached test chunks");
+        };
+
+        let Ok(result) = propagate_block_light_changes_with_empty_sections(
+            &workset,
+            [removed_pos],
+            [LightSectionEmptinessChange {
+                section_pos: SectionPos::new(0, 0, 0),
+                empty: true,
+            }],
+        ) else {
+            panic!("matching block caches should run block light updates");
+        };
+
+        assert!(result.updated_sections.contains(&SectionPos::new(0, 0, 0)));
+        let Some(chunk) = center_holder.try_chunk(ChunkStatus::Empty) else {
+            panic!("center chunk should be available");
+        };
+        let light = chunk.light();
+        assert_eq!(light.block.section_empty(0), Some(true));
+        let Some(nibble) = light.block.nibble(0) else {
+            panic!("center block nibble should exist");
+        };
+        assert_eq!(nibble.visible_state(), LightNibbleState::Hidden);
     }
 
     #[test]

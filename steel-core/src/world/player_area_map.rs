@@ -11,6 +11,15 @@ use steel_utils::ChunkPos;
 use crate::chunk::player_chunk_view::PlayerChunkView;
 use crate::player::Player;
 
+/// Recipient set for vanilla chunk update publishing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkUpdateRecipients {
+    /// Players tracking a chunk that has already been sent to the client.
+    Tracked,
+    /// Tracked players for whom the chunk touches the edge of their sent view.
+    TrackedBorder,
+}
+
 /// Spatial index for player proximity queries.
 ///
 /// Uses packed `ChunkPos` chunk coordinates as keys for efficient hashing.
@@ -120,6 +129,29 @@ impl PlayerAreaMap {
             .unwrap_or_default()
     }
 
+    /// Gets players eligible for vanilla chunk update publishing.
+    ///
+    /// This mirrors vanilla's `ChunkHolder.PlayerProvider#getPlayers`: regular
+    /// block updates use the full tracked set, while light updates use only
+    /// chunks on the tracked border. Chunks still pending their full chunk
+    /// packet are not treated as tracked.
+    #[must_use]
+    pub fn get_chunk_update_players(
+        &self,
+        chunk: ChunkPos,
+        recipients: ChunkUpdateRecipients,
+        mut is_pending: impl FnMut(i32, ChunkPos) -> bool,
+    ) -> Vec<i32> {
+        self.get_tracking_players(chunk)
+            .into_iter()
+            .filter(|&entity_id| {
+                self.is_chunk_tracked(entity_id, chunk, &mut is_pending)
+                    && (recipients == ChunkUpdateRecipients::Tracked
+                        || self.is_chunk_on_tracked_border(entity_id, chunk, &mut is_pending))
+            })
+            .collect()
+    }
+
     /// Returns the number of tracked players.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -158,6 +190,47 @@ impl PlayerAreaMap {
         if should_remove {
             let _ = self.chunks.remove_if_sync(&chunk, |set| set.is_empty());
         }
+    }
+
+    fn player_tracks_chunk(&self, entity_id: i32, chunk: ChunkPos) -> bool {
+        self.player_chunks
+            .read_sync(&entity_id, |_, chunks| chunks.contains(&chunk))
+            .unwrap_or(false)
+    }
+
+    fn is_chunk_tracked(
+        &self,
+        entity_id: i32,
+        chunk: ChunkPos,
+        is_pending: &mut impl FnMut(i32, ChunkPos) -> bool,
+    ) -> bool {
+        self.player_tracks_chunk(entity_id, chunk) && !is_pending(entity_id, chunk)
+    }
+
+    fn is_chunk_on_tracked_border(
+        &self,
+        entity_id: i32,
+        chunk: ChunkPos,
+        is_pending: &mut impl FnMut(i32, ChunkPos) -> bool,
+    ) -> bool {
+        if !self.is_chunk_tracked(entity_id, chunk, is_pending) {
+            return false;
+        }
+
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+
+                let neighbor = ChunkPos::new(chunk.0.x + dx, chunk.0.y + dz);
+                if !self.is_chunk_tracked(entity_id, neighbor, is_pending) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 
@@ -286,5 +359,71 @@ mod tests {
         assert!(players.contains(&entity_id1));
         assert!(players.contains(&entity_id2));
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn chunk_update_players_filter_tracked_border() {
+        let map = PlayerAreaMap::new();
+        let entity_id = 42;
+        let view = PlayerChunkView::new(ChunkPos::new(0, 0), 2);
+
+        let mut player_set = FxHashSet::default();
+        view.for_each(|chunk| {
+            player_set.insert(chunk);
+            map.add_to_chunk(chunk, entity_id);
+        });
+        let _ = map.player_chunks.insert_sync(entity_id, player_set);
+
+        let center = ChunkPos::new(0, 0);
+        let edge = ChunkPos::new(3, 0);
+
+        assert_eq!(
+            map.get_chunk_update_players(center, ChunkUpdateRecipients::Tracked, |_, _| false),
+            vec![entity_id]
+        );
+        assert!(
+            map.get_chunk_update_players(center, ChunkUpdateRecipients::TrackedBorder, |_, _| {
+                false
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            map.get_chunk_update_players(edge, ChunkUpdateRecipients::TrackedBorder, |_, _| false),
+            vec![entity_id]
+        );
+    }
+
+    #[test]
+    fn chunk_update_players_exclude_pending_chunks() {
+        let map = PlayerAreaMap::new();
+        let entity_id = 42;
+        let view = PlayerChunkView::new(ChunkPos::new(0, 0), 2);
+
+        let mut player_set = FxHashSet::default();
+        view.for_each(|chunk| {
+            player_set.insert(chunk);
+            map.add_to_chunk(chunk, entity_id);
+        });
+        let _ = map.player_chunks.insert_sync(entity_id, player_set);
+
+        let center = ChunkPos::new(0, 0);
+        let pending_center = center;
+
+        assert!(
+            map.get_chunk_update_players(center, ChunkUpdateRecipients::Tracked, |_, chunk| {
+                chunk == pending_center
+            })
+            .is_empty()
+        );
+
+        let pending_neighbor = ChunkPos::new(1, 0);
+        assert_eq!(
+            map.get_chunk_update_players(
+                center,
+                ChunkUpdateRecipients::TrackedBorder,
+                |_, chunk| chunk == pending_neighbor
+            ),
+            vec![entity_id]
+        );
     }
 }

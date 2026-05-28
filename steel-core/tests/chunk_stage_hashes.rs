@@ -85,6 +85,8 @@ struct ChunkStageHashesJson {
     #[serde(default)]
     light_hash_capture: Option<String>,
     #[serde(default)]
+    light_dependency_radius: Option<i32>,
+    #[serde(default)]
     light_hash_format: Option<String>,
     #[serde(default)]
     light_debug_format: Option<String>,
@@ -121,16 +123,21 @@ const DEBUG_DIMENSION_ENV: &str = "STEEL_HASH_DEBUG_DIMENSION";
 const DEBUG_STAGE_ENV: &str = "STEEL_HASH_DEBUG_STAGE";
 const DEBUG_LIGHT_SUMMARY_ENV: &str = "STEEL_HASH_DEBUG_LIGHT_SUMMARY";
 const DEBUG_LIGHT_WINDOW_ENV: &str = "STEEL_HASH_DEBUG_LIGHT_WINDOW";
+const DEBUG_EXPECTED_SOURCE_LIGHT_ENV: &str = "STEEL_HASH_DEBUG_EXPECTED_SOURCE_LIGHT";
+const DEBUG_RAW_LIGHT_CHUNK_ENV: &str = "STEEL_HASH_DEBUG_RAW_LIGHT_CHUNK";
+const DEBUG_STRUCTURE_REFS_ENV: &str = "STEEL_HASH_DEBUG_STRUCTURE_REFS";
 const DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV: &str = "STEEL_HASH_STOP_AFTER_FIRST_MISMATCH";
 const DEBUG_FIXTURE_PATH_ENV: &str = "STEEL_HASH_FIXTURE_PATH";
 const DEBUG_LIGHT_DATA_PATH_ENV: &str = "STEEL_HASH_LIGHT_DATA_PATH";
 
+const CARVERS_STAGE: &str = "minecraft:carvers";
 const FEATURE_STAGE: &str = "minecraft:features";
 const LIGHT_STAGE: &str = "minecraft:light";
 const CHUNK_GENERATION_ORDER_X_Z_ASCENDING: &str = "x_z_ascending";
 const FEATURE_HASH_CAPTURE_AFTER_ALL_READY: &str = "after_all_tracked_features_ready";
 const HASHSET_ITERATION_ORDER_INSERTION: &str = "insertion_order";
-const LIGHT_HASH_CAPTURE_AFTER_ALL_TRACKED_LIGHT_READY: &str = "after_all_tracked_light_ready";
+const LIGHT_HASH_CAPTURE_AFTER_ALL_TRACKED_LIGHT_READY_AND_PENDING_TASKS_DRAINED_AND_IDLE: &str =
+    "after_all_tracked_light_ready_pending_tasks_drained_and_light_engine_idle";
 const LIGHT_HASH_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_v1";
 const LIGHT_DEBUG_FORMAT_SECTION_MARKERS_V1: &str = "section_markers_v1";
 const LIGHT_BINARY_FORMAT_PACKET_DATA_LAYERS_V1: &str = "packet_data_layers_binary_v1";
@@ -194,6 +201,34 @@ fn debug_dimension_filter() -> Option<String> {
     env::var(DEBUG_DIMENSION_ENV)
         .ok()
         .filter(|dimension| !dimension.is_empty())
+}
+
+fn debug_raw_light_chunk_filter() -> Option<(i32, i32)> {
+    let value = env::var(DEBUG_RAW_LIGHT_CHUNK_ENV).ok()?;
+    let Some((x, z)) = value.split_once(',') else {
+        panic!("{DEBUG_RAW_LIGHT_CHUNK_ENV} must be formatted as '<chunk_x>,<chunk_z>'");
+    };
+    let Ok(chunk_x) = x.parse::<i32>() else {
+        panic!("{DEBUG_RAW_LIGHT_CHUNK_ENV} chunk_x is not an i32: {x}");
+    };
+    let Ok(chunk_z) = z.parse::<i32>() else {
+        panic!("{DEBUG_RAW_LIGHT_CHUNK_ENV} chunk_z is not an i32: {z}");
+    };
+    Some((chunk_x, chunk_z))
+}
+
+fn debug_structure_refs_filter() -> Option<(i32, i32)> {
+    let value = env::var(DEBUG_STRUCTURE_REFS_ENV).ok()?;
+    let Some((x, z)) = value.split_once(',') else {
+        panic!("{DEBUG_STRUCTURE_REFS_ENV} must be formatted as '<chunk_x>,<chunk_z>'");
+    };
+    let Ok(chunk_x) = x.parse::<i32>() else {
+        panic!("{DEBUG_STRUCTURE_REFS_ENV} chunk_x is not an i32: {x}");
+    };
+    let Ok(chunk_z) = z.parse::<i32>() else {
+        panic!("{DEBUG_STRUCTURE_REFS_ENV} chunk_z is not an i32: {z}");
+    };
+    Some((chunk_x, chunk_z))
 }
 
 fn debug_stage_filter() -> Option<String> {
@@ -460,8 +495,8 @@ fn light_layer_debug(
     sections
 }
 
-fn actual_light_debug(light: &ChunkLightData) -> LightChunkDebug {
-    let packet = build_chunk_light_update_packet(light);
+fn actual_light_debug(light: &ChunkLightData, has_skylight: bool) -> LightChunkDebug {
+    let packet = build_chunk_light_update_packet(light, has_skylight);
     let range = light.sky.range();
     let sky = light_layer_debug(
         range.section_count(),
@@ -523,8 +558,8 @@ fn light_layer_bytes(
     sections
 }
 
-fn actual_light_bytes(light: &ChunkLightData) -> ChunkLightBytes {
-    let packet = build_chunk_light_update_packet(light);
+fn actual_light_bytes(light: &ChunkLightData, has_skylight: bool) -> ChunkLightBytes {
+    let packet = build_chunk_light_update_packet(light, has_skylight);
     let range = light.sky.range();
     let sky = light_layer_bytes(
         range.section_count(),
@@ -813,6 +848,108 @@ fn format_debug_light_window(
     out
 }
 
+fn format_debug_block_window(window: DebugLightWindow, chunk: &ChunkAccess) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "    block window chunk=({}, {}) local=({}, {}, {}) size=({}, {}, {})",
+        window.chunk_x,
+        window.chunk_z,
+        window.min_x,
+        window.min_y,
+        window.min_z,
+        window.size_x,
+        window.size_y,
+        window.size_z
+    );
+
+    for dy in (0..window.size_y).rev() {
+        let world_y = window.min_y + dy as i32;
+        let _ = writeln!(out, "      y={world_y}");
+        for dz in 0..window.size_z {
+            let local_z = window.min_z + dz;
+            let mut state_row = String::new();
+            for dx in 0..window.size_x {
+                let local_x = window.min_x + dx;
+                if let Some(state) = chunk_state_at(chunk, local_x, world_y, local_z) {
+                    let _ = write!(
+                        state_row,
+                        " ({local_x},{local_z})={}",
+                        describe_state(i32::from(state.0))
+                    );
+                }
+            }
+            let _ = writeln!(out, "        z={local_z:2}{state_row}");
+        }
+    }
+
+    out
+}
+
+fn format_expected_source_light_audit(
+    expected: &ChunkLightBytes,
+    chunk: &ChunkAccess,
+    chunk_x: i32,
+    chunk_z: i32,
+) -> Option<String> {
+    let mut out = String::new();
+    let mut source_count = 0usize;
+    let mut underlit_count = 0usize;
+
+    for (section_index, section_holder) in chunk.sections().sections.iter().enumerate() {
+        let section_base_y = chunk.min_y() + section_index as i32 * 16;
+        let section = section_holder.read();
+        for local_y in 0..16usize {
+            let world_y = section_base_y + local_y as i32;
+            for local_z in 0..16usize {
+                for local_x in 0..16usize {
+                    let state = section.states.get(local_x, local_y, local_z);
+                    let emission = state.get_light_emission();
+                    if emission == 0 {
+                        continue;
+                    }
+
+                    source_count += 1;
+                    let expected_level =
+                        light_bytes_block_value(expected, world_y, local_x, local_z).unwrap_or(0);
+                    if expected_level >= emission {
+                        continue;
+                    }
+
+                    underlit_count += 1;
+                    if underlit_count <= MAX_LIGHT_DIFFS_PER_CHUNK {
+                        let world_x = chunk_x * 16 + local_x as i32;
+                        let world_z = chunk_z * 16 + local_z as i32;
+                        let _ = writeln!(
+                            out,
+                            "    local=({local_x:2},{local_y:2},{local_z:2}) world=({world_x},{world_y},{world_z}): vanilla_block={expected_level:2} emission={emission:2} state={}",
+                            describe_state(i32::from(state.0))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if underlit_count == 0 {
+        return None;
+    }
+
+    if underlit_count > MAX_LIGHT_DIFFS_PER_CHUNK {
+        let _ = writeln!(
+            out,
+            "    ... and {} more underlit source blocks",
+            underlit_count - MAX_LIGHT_DIFFS_PER_CHUNK
+        );
+    }
+
+    let mut header = format!(
+        "    {underlit_count}/{source_count} vanilla source blocks are below their own emission\n"
+    );
+    header.push_str(&out);
+    Some(header)
+}
+
 fn light_bytes_block_value(
     light: &ChunkLightBytes,
     world_y: i32,
@@ -1025,7 +1162,7 @@ fn consume_light_layer_hash(
     }
 }
 
-fn compute_light_hash(light: &ChunkLightData) -> String {
+fn compute_light_hash(light: &ChunkLightData, has_skylight: bool) -> String {
     let mut ctx = md5::Context::new();
     let range = light.sky.range();
     let Ok(section_count) = i32::try_from(range.section_count()) else {
@@ -1034,7 +1171,7 @@ fn compute_light_hash(light: &ChunkLightData) -> String {
 
     consume_i32(&mut ctx, range.min_section_y());
     consume_i32(&mut ctx, section_count);
-    let packet = build_chunk_light_update_packet(light);
+    let packet = build_chunk_light_update_packet(light, has_skylight);
     for layer in [LightLayer::Sky, LightLayer::Block] {
         ctx.consume([match layer {
             LightLayer::Sky => 0,
@@ -1253,6 +1390,81 @@ fn describe_state(state_id: i32) -> String {
         let prop_str: Vec<_> = props.iter().map(|(k, v)| format!("{k}={v}")).collect();
         format!("{state_id} ({}[{}])", block.key, prop_str.join(","))
     }
+}
+
+fn format_structure_references(chunk: &ChunkAccess) -> String {
+    let refs = chunk.structure_references();
+    let mut entries = refs
+        .iter()
+        .map(|(structure_id, positions)| {
+            let mut positions = positions
+                .iter()
+                .map(|pos| (pos.0.x, pos.0.y))
+                .collect::<Vec<_>>();
+            positions.sort_unstable();
+            (structure_id.to_string(), positions)
+        })
+        .collect::<Vec<_>>();
+    drop(refs);
+
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    if entries.is_empty() {
+        return "    no structure references\n".to_owned();
+    }
+
+    let mut out = String::new();
+    for (structure_id, positions) in entries {
+        let _ = writeln!(
+            out,
+            "    {structure_id}: {} source chunk(s)",
+            positions.len()
+        );
+        for (source_x, source_z) in positions {
+            let _ = writeln!(out, "      ({source_x}, {source_z})");
+        }
+    }
+    out
+}
+
+fn referenced_structure_positions(chunk: &ChunkAccess, structure_key: &str) -> Vec<ChunkPos> {
+    let refs = chunk.structure_references();
+    let positions = refs
+        .iter()
+        .find(|(structure_id, _)| structure_id.to_string() == structure_key)
+        .map(|(_, positions)| positions.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    drop(refs);
+    positions
+}
+
+fn format_structure_start_summary(chunk: &ChunkAccess, structure_key: &str) -> String {
+    let Ok(structure_id) = structure_key.parse::<Identifier>() else {
+        return format!("      invalid structure key {structure_key}\n");
+    };
+    let starts = chunk.structure_starts();
+    let Some(start) = starts.get(&structure_id) else {
+        return format!("      {structure_key}: no start\n");
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "      {structure_key}: pieces={} references={} bb={:?}",
+        start.pieces.len(),
+        start.references,
+        start.bounding_box
+    );
+    for (index, piece) in start.pieces.iter().take(12).enumerate() {
+        let _ = writeln!(
+            out,
+            "        piece[{index}] type={} depth={} bb={:?}",
+            piece.piece_type, piece.gen_depth, piece.bounding_box
+        );
+    }
+    if start.pieces.len() > 12 {
+        let _ = writeln!(out, "        ... and {} more", start.pieces.len() - 12);
+    }
+    out
 }
 
 struct BlockDiff {
@@ -1512,6 +1724,30 @@ fn drive_chunk_request(
     });
 }
 
+fn drive_chunk_generation_idle(world: &Arc<World>, label: &str) {
+    let runtime = Arc::clone(&world.chunk_map.chunk_runtime);
+    runtime.block_on(async {
+        for _ in 0..60_000 {
+            world.chunk_map.tick_scheduling();
+
+            if world.chunk_map.pending_generation_tasks.lock().is_empty()
+                && world.chunk_map.task_tracker.is_empty()
+            {
+                world.chunk_map.tick_scheduling();
+                if world.chunk_map.pending_generation_tasks.lock().is_empty()
+                    && world.chunk_map.task_tracker.is_empty()
+                {
+                    return;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        panic!("{label} chunk generation did not become idle");
+    });
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "large ignored regression test mirrors chunk_stage_hashes setup"
@@ -1542,7 +1778,10 @@ fn chunk_light_hashes_inner() {
     let debug_filter = debug_chunk_filter();
     let stop_after_first_mismatch = env::var_os(DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV).is_some();
     let emit_light_summary = env::var_os(DEBUG_LIGHT_SUMMARY_ENV).is_some();
+    let audit_expected_source_light = env::var_os(DEBUG_EXPECTED_SOURCE_LIGHT_ENV).is_some();
     let debug_light_window = debug_light_window_filter();
+    let debug_raw_light_chunk = debug_raw_light_chunk_filter();
+    let debug_structure_refs = debug_structure_refs_filter();
     let mut saw_light_hashes = false;
 
     for &dim_key in DIMENSION_ORDER {
@@ -1576,11 +1815,50 @@ fn chunk_light_hashes_inner() {
         }
         saw_light_hashes = true;
         stage_entries.sort_unstable_by_key(|entry| (entry.0, entry.1));
-
+        let dim_short = dim_key.strip_prefix("minecraft:").unwrap_or(dim_key);
+        let light_dependency_radius = expected.light_dependency_radius.unwrap_or(0);
+        assert!(
+            light_dependency_radius >= 0,
+            "light_dependency_radius must be non-negative"
+        );
+        let tracked_light_positions = stage_entries
+            .iter()
+            .map(|(chunk_x, chunk_z, _, _)| (*chunk_x, *chunk_z))
+            .collect::<FxHashSet<_>>();
+        let feature_write_radius = GENERATION_PYRAMID
+            .get_step_to(ChunkStatus::Features)
+            .block_state_write_radius;
+        assert!(
+            feature_write_radius >= 0,
+            "features must declare a non-negative block write radius for light hash comparison"
+        );
+        let comparison_radius = (light_dependency_radius + feature_write_radius).max(1);
+        let comparable_entries = stage_entries
+            .iter()
+            .copied()
+            .filter(|(chunk_x, chunk_z, _, _)| {
+                (-comparison_radius..=comparison_radius).all(|dx| {
+                    (-comparison_radius..=comparison_radius)
+                        .all(|dz| tracked_light_positions.contains(&(chunk_x + dx, chunk_z + dz)))
+                })
+            })
+            .collect::<Vec<_>>();
+        // Feature and light writes cross chunk borders; a chunk on the fixture
+        // perimeter can depend on feature writes into its light dependencies that
+        // this filtered fixture did not drive.
+        if comparable_entries.len() != stage_entries.len() {
+            eprintln!(
+                "[{dim_short}/{LIGHT_STAGE}] comparing {} chunks with a fixture-local {comparison_radius}-radius feature/light halo ({} perimeter chunks skipped)",
+                comparable_entries.len(),
+                stage_entries.len() - comparable_entries.len()
+            );
+        }
         assert_eq!(
             expected.light_hash_capture.as_deref(),
-            Some(LIGHT_HASH_CAPTURE_AFTER_ALL_TRACKED_LIGHT_READY),
-            "light hashes must be extracted after all tracked LIGHT chunks are ready; rerun the extractor"
+            Some(
+                LIGHT_HASH_CAPTURE_AFTER_ALL_TRACKED_LIGHT_READY_AND_PENDING_TASKS_DRAINED_AND_IDLE
+            ),
+            "light hashes must be extracted after all tracked LIGHT chunks are ready, pending light tasks are drained, and the light engine is idle; rerun the extractor"
         );
         assert_eq!(
             expected.light_hash_format.as_deref(),
@@ -1598,7 +1876,6 @@ fn chunk_light_hashes_inner() {
             );
         }
 
-        let dim_short = dim_key.strip_prefix("minecraft:").unwrap_or(dim_key);
         let reference_lights = load_reference_lights(dim_short);
         if reference_lights.is_some() {
             assert_eq!(
@@ -1613,6 +1890,8 @@ fn chunk_light_hashes_inner() {
             "minecraft:the_end" => &vanilla_dimension_types::THE_END,
             _ => panic!("Unknown dimension: {dim_key}"),
         };
+        let min_y = dim_type.min_y;
+        let has_skylight = dim_type.has_skylight;
         let seed = expected.seed;
         let generator: Arc<ChunkGeneratorType> = Arc::new(match dim_key {
             "minecraft:overworld" => {
@@ -1630,6 +1909,178 @@ fn chunk_light_hashes_inner() {
             _ => unreachable!(),
         });
         let world = create_test_world(dim_key, dim_type, seed, generator);
+        let expected_feature_hashes = dim_data
+            .chunks
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .stages
+                    .get(FEATURE_STAGE)
+                    .map(|hash| ((entry.x, entry.z), hash.as_str()))
+            })
+            .collect::<FxHashMap<_, _>>();
+        let expected_carver_hashes = dim_data
+            .chunks
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .stages
+                    .get(CARVERS_STAGE)
+                    .map(|hash| ((entry.x, entry.z), hash.as_str()))
+            })
+            .collect::<FxHashMap<_, _>>();
+        eprintln!(
+            "[{dim_short}/{LIGHT_STAGE}] preparing {} chunks to CARVERS in x/z order",
+            stage_entries.len()
+        );
+        let mut carver_requests = Vec::with_capacity(stage_entries.len());
+        for (chunk_x, chunk_z, _, _) in stage_entries.iter().copied() {
+            let pos = ChunkPos::new(chunk_x, chunk_z);
+            let request =
+                world
+                    .chunk_map
+                    .request_chunk(pos, ChunkStatus::Carvers, ChunkTicketKind::Command);
+            drive_chunk_request(&world, &request, dim_short);
+            carver_requests.push(request);
+        }
+
+        let reference_carver_blocks = load_reference_blocks(CARVERS_STAGE, dim_short);
+        let mut carver_mismatches = Vec::new();
+        let total_carvers = stage_entries.len();
+        eprintln!(
+            "[{dim_short}/{CARVERS_STAGE}] verifying production carver state before {FEATURE_STAGE}"
+        );
+        for (i, ((chunk_x, chunk_z, _, _), request)) in stage_entries
+            .iter()
+            .copied()
+            .zip(carver_requests.iter())
+            .enumerate()
+        {
+            let Some(expected_carver_hash) =
+                expected_carver_hashes.get(&(chunk_x, chunk_z)).copied()
+            else {
+                panic!(
+                    "{dim_short}/{CARVERS_STAGE}: missing carver hash for light fixture chunk ({chunk_x}, {chunk_z})"
+                );
+            };
+            let Some(ready_chunks) = request.ready_chunks() else {
+                panic!(
+                    "{dim_short}/{CARVERS_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
+                );
+            };
+            let Some(holder) = ready_chunks.holders.into_iter().next() else {
+                panic!(
+                    "{dim_short}/{CARVERS_STAGE}: missing ready holder for ({chunk_x}, {chunk_z})"
+                );
+            };
+            let Some(chunk) = holder.try_chunk(ChunkStatus::Carvers) else {
+                panic!("ready carver chunk missing at ({chunk_x}, {chunk_z})");
+            };
+            let actual_carver_hash = compute_block_hash(chunk.sections());
+            let ok = actual_carver_hash == expected_carver_hash;
+            if (i + 1) % 10 == 0 || i + 1 == total_carvers || !ok {
+                let status = if ok { "OK" } else { "MISMATCH" };
+                eprintln!(
+                    "[{dim_short}/{CARVERS_STAGE}] ({chunk_x:3},{chunk_z:3}) {status} expected={expected_carver_hash} actual={actual_carver_hash}  [{}/{} before {FEATURE_STAGE}]",
+                    i + 1,
+                    total_carvers,
+                );
+            }
+
+            if !ok {
+                let block_diffs = reference_carver_blocks
+                    .as_ref()
+                    .and_then(|refs| refs.get(&(chunk_x, chunk_z)))
+                    .map(|ref_data| diff_chunk(chunk.sections(), ref_data, min_y));
+                carver_mismatches.push((
+                    chunk_x,
+                    chunk_z,
+                    expected_carver_hash.to_owned(),
+                    actual_carver_hash,
+                    block_diffs,
+                ));
+                if stop_after_first_mismatch {
+                    break;
+                }
+            }
+        }
+
+        if !carver_mismatches.is_empty() {
+            let failed = carver_mismatches.len();
+            let mut msg = format!(
+                "{dim_short}/{CARVERS_STAGE}: {failed}/{total_carvers} chunks do not match vanilla before {FEATURE_STAGE}\n"
+            );
+            for (x, z, expected_hash, actual_hash, block_diffs) in &carver_mismatches {
+                let _ = writeln!(
+                    msg,
+                    "  Chunk ({x:3},{z:3}): expected={expected_hash} actual={actual_hash}"
+                );
+                if let Some(diffs) = block_diffs {
+                    msg.push_str(&format_chunk_diffs(diffs, *x, *z, min_y));
+                }
+            }
+            panic!("{msg}");
+        }
+
+        if let Some(target) = debug_structure_refs {
+            for ((chunk_x, chunk_z, _, _), request) in
+                stage_entries.iter().copied().zip(carver_requests.iter())
+            {
+                if (chunk_x, chunk_z) != target {
+                    continue;
+                }
+                let Some(ready_chunks) = request.ready_chunks() else {
+                    panic!(
+                        "{dim_short}/{CARVERS_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
+                    );
+                };
+                let Some(holder) = ready_chunks.holders.into_iter().next() else {
+                    panic!(
+                        "{dim_short}/{CARVERS_STAGE}: missing ready holder for ({chunk_x}, {chunk_z})"
+                    );
+                };
+                let Some(chunk) = holder.try_chunk(ChunkStatus::Carvers) else {
+                    panic!("ready carver chunk missing at ({chunk_x}, {chunk_z})");
+                };
+                eprintln!(
+                    "[{dim_short}/{CARVERS_STAGE}] ({chunk_x},{chunk_z}) production structure references before {FEATURE_STAGE}:\n{}",
+                    format_structure_references(&chunk)
+                );
+                let mut start_summary = String::new();
+                for source_pos in referenced_structure_positions(&chunk, "minecraft:mineshaft") {
+                    let _ = writeln!(
+                        start_summary,
+                        "    source ({}, {})",
+                        source_pos.0.x, source_pos.0.y
+                    );
+                    if let Some(source_holder) = world
+                        .chunk_map
+                        .chunks
+                        .read_sync(&source_pos, |_, holder| holder.clone())
+                    {
+                        if let Some(source_chunk) =
+                            source_holder.try_chunk(ChunkStatus::StructureStarts)
+                        {
+                            start_summary.push_str(&format_structure_start_summary(
+                                &source_chunk,
+                                "minecraft:mineshaft",
+                            ));
+                        } else {
+                            start_summary.push_str("      source chunk missing StructureStarts\n");
+                        }
+                    } else {
+                        start_summary.push_str("      source holder missing\n");
+                    }
+                }
+                if !start_summary.is_empty() {
+                    eprintln!(
+                        "[{dim_short}/{CARVERS_STAGE}] ({chunk_x},{chunk_z}) production referenced mineshaft starts before {FEATURE_STAGE}:\n{start_summary}"
+                    );
+                }
+                break;
+            }
+        }
+
         eprintln!(
             "[{dim_short}/{LIGHT_STAGE}] preparing {} chunks to FEATURES in x/z order",
             stage_entries.len()
@@ -1644,14 +2095,139 @@ fn chunk_light_hashes_inner() {
             drive_chunk_request(&world, &request, dim_short);
             feature_requests.push(request);
         }
+        let feature_request_by_pos = stage_entries
+            .iter()
+            .copied()
+            .zip(feature_requests.iter())
+            .map(|((chunk_x, chunk_z, _, _), request)| ((chunk_x, chunk_z), request))
+            .collect::<FxHashMap<_, _>>();
+
+        let reference_feature_blocks = load_reference_blocks(FEATURE_STAGE, dim_short);
+        let mut feature_mismatches = Vec::new();
+        let total_features = comparable_entries.len();
         eprintln!(
-            "[{dim_short}/{LIGHT_STAGE}] requesting {} chunks to LIGHT in x/z order",
-            stage_entries.len()
+            "[{dim_short}/{FEATURE_STAGE}] verifying production feature state before {LIGHT_STAGE}"
+        );
+        for (i, (chunk_x, chunk_z, _, _)) in comparable_entries.iter().copied().enumerate() {
+            let Some(request) = feature_request_by_pos.get(&(chunk_x, chunk_z)).copied() else {
+                panic!(
+                    "{dim_short}/{FEATURE_STAGE}: missing retained feature request for ({chunk_x}, {chunk_z})"
+                );
+            };
+            let Some(expected_feature_hash) =
+                expected_feature_hashes.get(&(chunk_x, chunk_z)).copied()
+            else {
+                panic!(
+                    "{dim_short}/{FEATURE_STAGE}: missing feature hash for light fixture chunk ({chunk_x}, {chunk_z})"
+                );
+            };
+            let Some(ready_chunks) = request.ready_chunks() else {
+                panic!(
+                    "{dim_short}/{FEATURE_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
+                );
+            };
+            let Some(holder) = ready_chunks.holders.into_iter().next() else {
+                panic!(
+                    "{dim_short}/{FEATURE_STAGE}: missing ready holder for ({chunk_x}, {chunk_z})"
+                );
+            };
+            let Some(chunk) = holder.try_chunk(ChunkStatus::Features) else {
+                panic!("ready feature chunk missing at ({chunk_x}, {chunk_z})");
+            };
+            let actual_feature_hash = compute_block_hash(chunk.sections());
+            let ok = actual_feature_hash == expected_feature_hash;
+            if (i + 1) % 10 == 0 || i + 1 == total_features || !ok {
+                let status = if ok { "OK" } else { "MISMATCH" };
+                eprintln!(
+                    "[{dim_short}/{FEATURE_STAGE}] ({chunk_x:3},{chunk_z:3}) {status} expected={expected_feature_hash} actual={actual_feature_hash}  [{}/{} before {LIGHT_STAGE}]",
+                    i + 1,
+                    total_features,
+                );
+            }
+
+            if !ok {
+                let block_diffs = reference_feature_blocks
+                    .as_ref()
+                    .and_then(|refs| refs.get(&(chunk_x, chunk_z)))
+                    .map(|ref_data| diff_chunk(chunk.sections(), ref_data, min_y));
+                feature_mismatches.push((
+                    chunk_x,
+                    chunk_z,
+                    expected_feature_hash.to_owned(),
+                    actual_feature_hash,
+                    block_diffs,
+                ));
+                if stop_after_first_mismatch {
+                    break;
+                }
+            }
+        }
+
+        if !feature_mismatches.is_empty() {
+            let failed = feature_mismatches.len();
+            let mut msg = format!(
+                "{dim_short}/{FEATURE_STAGE}: {failed}/{total_features} chunks do not match vanilla before {LIGHT_STAGE}\n"
+            );
+            for (x, z, expected_hash, actual_hash, block_diffs) in &feature_mismatches {
+                let _ = writeln!(
+                    msg,
+                    "  Chunk ({x:3},{z:3}): expected={expected_hash} actual={actual_hash}"
+                );
+                if let Some(diffs) = block_diffs {
+                    msg.push_str(&format_chunk_diffs(diffs, *x, *z, min_y));
+                }
+            }
+            panic!("{msg}");
+        }
+        drop(carver_requests);
+
+        if let Some(window) = debug_light_window {
+            for ((chunk_x, chunk_z, _, _), request) in
+                stage_entries.iter().copied().zip(feature_requests.iter())
+            {
+                if (chunk_x, chunk_z) != (window.chunk_x, window.chunk_z) {
+                    continue;
+                }
+                let Some(ready_chunks) = request.ready_chunks() else {
+                    panic!(
+                        "{dim_short}/{FEATURE_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
+                    );
+                };
+                let Some(holder) = ready_chunks.holders.into_iter().next() else {
+                    panic!(
+                        "{dim_short}/{FEATURE_STAGE}: missing ready holder for ({chunk_x}, {chunk_z})"
+                    );
+                };
+                let Some(chunk) = holder.try_chunk(ChunkStatus::Features) else {
+                    panic!("ready feature chunk missing at ({chunk_x}, {chunk_z})");
+                };
+                eprintln!(
+                    "[{dim_short}/{FEATURE_STAGE}] ({chunk_x},{chunk_z}) debug block window after tracked FEATURES:\n{}",
+                    format_debug_block_window(window, &chunk)
+                );
+                break;
+            }
+        }
+        let mut light_request_positions = FxHashSet::default();
+        for (chunk_x, chunk_z, _, _) in stage_entries.iter().copied() {
+            for dx in -light_dependency_radius..=light_dependency_radius {
+                for dz in -light_dependency_radius..=light_dependency_radius {
+                    light_request_positions.insert((chunk_x + dx, chunk_z + dz));
+                }
+            }
+        }
+        let light_request_positions = sorted_positions(&light_request_positions);
+
+        eprintln!(
+            "[{dim_short}/{LIGHT_STAGE}] requesting light for {} chunks in x/z order ({} compared, radius {})",
+            light_request_positions.len(),
+            comparable_entries.len(),
+            light_dependency_radius
         );
 
-        let total = stage_entries.len();
-        let mut light_requests = Vec::with_capacity(total);
-        for (i, (chunk_x, chunk_z, _, _)) in stage_entries.iter().copied().enumerate() {
+        let total_requests = light_request_positions.len();
+        let mut light_requests = FxHashMap::with_capacity_and_hasher(total_requests, FxBuildHasher);
+        for (i, (chunk_x, chunk_z)) in light_request_positions.iter().copied().enumerate() {
             let pos = ChunkPos::new(chunk_x, chunk_z);
             let request =
                 world
@@ -1668,29 +2244,49 @@ fn chunk_light_hashes_inner() {
                     "{dim_short}/{LIGHT_STAGE}: missing ready holder for ({chunk_x}, {chunk_z})"
                 );
             }
-            light_requests.push(request);
+            light_requests.insert((chunk_x, chunk_z), request);
 
-            if (i + 1) % 10 == 0 || i + 1 == total {
+            if (i + 1) % 10 == 0 || i + 1 == total_requests {
                 eprintln!(
                     "[{dim_short}/{LIGHT_STAGE}] ({chunk_x:3},{chunk_z:3}) ready [{}/{}]",
                     i + 1,
-                    total
+                    total_requests
                 );
             }
         }
 
+        drive_chunk_generation_idle(&world, dim_short);
+
+        if let Some(window) = debug_light_window
+            && let Some(holder) = world.chunk_map.chunks.read_sync(
+                &ChunkPos::new(window.chunk_x, window.chunk_z),
+                |_, holder| Arc::clone(holder),
+            )
+            && let Some(chunk) = holder.try_chunk(ChunkStatus::Light)
+        {
+            eprintln!(
+                "[{dim_short}/{LIGHT_STAGE}] ({},{}) debug block window after tracked LIGHT:\n{}",
+                window.chunk_x,
+                window.chunk_z,
+                format_debug_block_window(window, &chunk)
+            );
+        }
+
         eprintln!(
-            "[{dim_short}/{LIGHT_STAGE}] comparing {} chunks after all tracked LIGHT requests are ready",
-            stage_entries.len()
+            "[{dim_short}/{LIGHT_STAGE}] comparing {} chunks after all tracked LIGHT requests are ready and generation is idle",
+            comparable_entries.len()
         );
 
         let mut mismatches = Vec::new();
-        for (i, ((chunk_x, chunk_z, expected_hash, expected_light_debug), request)) in stage_entries
-            .iter()
-            .copied()
-            .zip(light_requests.iter())
-            .enumerate()
+        let total = comparable_entries.len();
+        for (i, (chunk_x, chunk_z, expected_hash, expected_light_debug)) in
+            comparable_entries.iter().copied().enumerate()
         {
+            let Some(request) = light_requests.get(&(chunk_x, chunk_z)) else {
+                panic!(
+                    "{dim_short}/{LIGHT_STAGE}: missing retained LIGHT request for ({chunk_x}, {chunk_z})"
+                );
+            };
             let Some(ready_chunks) = request.ready_chunks() else {
                 panic!(
                     "{dim_short}/{LIGHT_STAGE}: request for ({chunk_x}, {chunk_z}) reported ready without ready chunk"
@@ -1705,11 +2301,25 @@ fn chunk_light_hashes_inner() {
                 panic!("ready light chunk missing at ({chunk_x}, {chunk_z})");
             };
             let light = chunk.light();
-            let actual_debug = emit_light_summary.then(|| actual_light_debug(&light));
+            let actual_debug = emit_light_summary.then(|| actual_light_debug(&light, has_skylight));
             let expected_light_bytes = reference_lights
                 .as_ref()
                 .and_then(|lights| lights.get(&(chunk_x, chunk_z)));
-            let actual_light_bytes = expected_light_bytes.map(|_| actual_light_bytes(&light));
+            let actual_light_bytes =
+                expected_light_bytes.map(|_| actual_light_bytes(&light, has_skylight));
+            if audit_expected_source_light
+                && let Some(expected_light_bytes) = expected_light_bytes
+                && let Some(audit) = format_expected_source_light_audit(
+                    expected_light_bytes,
+                    &chunk,
+                    chunk_x,
+                    chunk_z,
+                )
+            {
+                eprintln!(
+                    "[{dim_short}/{LIGHT_STAGE}] ({chunk_x},{chunk_z}) expected source-light audit:\n{audit}"
+                );
+            }
             let summary = actual_debug.as_ref().map(|debug| {
                 let mut summary = format_light_debug(debug);
                 let section_summary = debug_chunk_section_summary(&chunk);
@@ -1719,8 +2329,10 @@ fn chunk_light_hashes_inner() {
                 }
                 summary
             });
-            let actual_hash = compute_light_hash(&light);
-            let raw_light_diff = if actual_hash == expected_hash {
+            let actual_hash = compute_light_hash(&light, has_skylight);
+            let raw_light_diff = if actual_hash == expected_hash
+                || debug_raw_light_chunk.is_some_and(|target| target != (chunk_x, chunk_z))
+            {
                 None
             } else if let (Some(expected_light_bytes), Some(actual_light_bytes)) =
                 (expected_light_bytes, actual_light_bytes.as_ref())
@@ -1863,6 +2475,7 @@ fn chunk_stage_hashes_inner() {
         .get_radius_of(ChunkStatus::Carvers) as i32;
     let debug_dimension = debug_dimension_filter();
     let debug_stage = debug_stage_filter();
+    let debug_structure_refs = debug_structure_refs_filter();
     let stop_after_first_mismatch = env::var_os(DEBUG_STOP_AFTER_FIRST_MISMATCH_ENV).is_some();
 
     for &dim_key in DIMENSION_ORDER {
@@ -2146,6 +2759,45 @@ fn chunk_stage_hashes_inner() {
                             panic!("Feature center chunk ({chunk_x}, {chunk_z}) missing");
                         };
                         chunk.prime_final_heightmaps();
+                        if debug_structure_refs == Some((chunk_x, chunk_z)) {
+                            eprintln!(
+                                "[{dim_short}/{CARVERS_STAGE}] ({chunk_x},{chunk_z}) deterministic structure references before {FEATURE_STAGE}:\n{}",
+                                format_structure_references(&chunk)
+                            );
+                            let mut start_summary = String::new();
+                            for source_pos in
+                                referenced_structure_positions(&chunk, "minecraft:mineshaft")
+                            {
+                                let _ = writeln!(
+                                    start_summary,
+                                    "    source ({}, {})",
+                                    source_pos.0.x, source_pos.0.y
+                                );
+                                if let Some(source_holder) =
+                                    holders.get(&(source_pos.0.x, source_pos.0.y))
+                                {
+                                    if let Some(source_chunk) =
+                                        source_holder.try_chunk(ChunkStatus::StructureStarts)
+                                    {
+                                        start_summary.push_str(&format_structure_start_summary(
+                                            &source_chunk,
+                                            "minecraft:mineshaft",
+                                        ));
+                                    } else {
+                                        start_summary.push_str(
+                                            "      source chunk missing StructureStarts\n",
+                                        );
+                                    }
+                                } else {
+                                    start_summary.push_str("      source holder missing\n");
+                                }
+                            }
+                            if !start_summary.is_empty() {
+                                eprintln!(
+                                    "[{dim_short}/{CARVERS_STAGE}] ({chunk_x},{chunk_z}) deterministic referenced mineshaft starts before {FEATURE_STAGE}:\n{start_summary}"
+                                );
+                            }
+                        }
                     }
                     let cache_holders = holders.clone();
                     let cache = Arc::new(StaticCache2D::create(

@@ -354,6 +354,11 @@ impl<T> LightSectionSlotArray<T> {
             .and_then(|slot| slot.replace(value))
     }
 
+    /// Removes and returns the value at a raw section slot.
+    pub fn take_slot(&mut self, section_slot: usize) -> Option<T> {
+        self.values.get_mut(section_slot).and_then(Option::take)
+    }
+
     /// Returns the value at a cached section slot.
     #[must_use]
     pub fn get(&self, section: CachedLightSection) -> Option<&T> {

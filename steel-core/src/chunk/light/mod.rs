@@ -1,7 +1,7 @@
 //! Light storage primitives used by chunk and world lighting.
 
 use steel_registry::blocks::{block_state_ext::BlockStateExt, shapes::VoxelShape};
-use steel_utils::{BlockStateId, Direction};
+use steel_utils::{BlockStateId, Direction, SectionPos};
 
 use crate::physics::shapes::{face_shape_occludes, merged_face_occludes};
 
@@ -36,6 +36,15 @@ pub enum LightLayer {
     Sky,
     /// Block light emitted by blocks.
     Block,
+}
+
+/// Real chunk-section emptiness transition that must be applied before block checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LightSectionEmptinessChange {
+    /// World section whose real block-section emptiness changed.
+    pub section_pos: SectionPos,
+    /// New emptiness value for the real block section.
+    pub empty: bool,
 }
 
 /// Returns whether vanilla must re-check lighting after a block-state change.
@@ -128,7 +137,9 @@ pub use packet::{
 };
 pub use propagation::{
     BlockLightChunkEdgeChecks, BlockLightPropagationContext, BlockLightPropagationContextError,
-    BlockLightUpdateResult, propagate_block_light_changes, propagate_block_light_chunk,
+    BlockLightUpdateResult, check_block_light_chunk_edges, force_load_block_light_chunk,
+    load_block_light_chunk, propagate_block_light_changes,
+    propagate_block_light_changes_with_empty_sections, propagate_block_light_chunk,
 };
 pub(crate) use queue::{
     ADD_SKY_SOURCE_ENTRY, REMOVE_SKY_SOURCE_ENTRY, REMOVE_TOP_SKY_SOURCE_ENTRY,
@@ -144,7 +155,9 @@ pub use section_storage::{
 };
 pub use sky_propagation::{
     SkyLightChunkEdgeChecks, SkyLightPropagationContext, SkyLightPropagationContextError,
-    SkyLightUpdateResult, propagate_sky_light_changes, propagate_sky_light_chunk,
+    SkyLightUpdateResult, check_sky_light_chunk_edges, force_load_sky_light_chunk,
+    load_sky_light_chunk, propagate_sky_light_changes,
+    propagate_sky_light_changes_with_empty_sections, propagate_sky_light_chunk,
     propagate_sky_light_chunk_without_edge_checks,
 };
 pub use sky_sources::{ChunkSkyLightSources, SkyLightSourceNeighborhood};
@@ -623,7 +636,7 @@ mod tests {
         hidden_nibble.set_hidden();
         assert!(hidden_nibble.update_visible());
 
-        let packet = build_chunk_light_update_packet(&light);
+        let packet = build_chunk_light_update_packet(&light, true);
 
         assert_eq!(packet.sky_y_mask.0[0], 0);
         assert_eq!(packet.empty_sky_y_mask.0[0], 0b010);
@@ -641,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_light_update_packet_sends_empty_sky_for_dark_light_only_sections() {
+    fn chunk_light_update_packet_sends_empty_sky_for_uninitialized_sections() {
         let Ok(mut light) = ChunkLightData::new(0, 48) else {
             panic!("valid three-section height rejected");
         };
@@ -654,13 +667,105 @@ mod tests {
             .block
             .set_emptiness_map(vec![true, true, false].into_boxed_slice())
             .expect("matching block emptiness map length should be accepted");
+        let Some(sky_nibble) = light.sky.nibble_mut(1) else {
+            panic!("section 1 sky nibble should exist");
+        };
+        sky_nibble.set_non_null();
+        assert!(sky_nibble.update_visible());
 
-        let packet = build_chunk_light_update_packet(&light);
+        let packet = build_chunk_light_update_packet(&light, true);
 
         assert_eq!(packet.empty_sky_y_mask.0[0] & (1 << 2), 1 << 2);
         assert_eq!(packet.empty_sky_y_mask.0[0] & (1 << 4), 0);
         assert_eq!(packet.sky_y_mask.0[0], 0);
         assert!(packet.sky_updates.is_empty());
+    }
+
+    #[test]
+    fn chunk_light_update_packet_omits_sky_when_dimension_has_no_skylight() {
+        let Ok(mut light) = ChunkLightData::new(0, 16) else {
+            panic!("valid single-section height rejected");
+        };
+        let Some(sky_nibble) = light.sky.nibble_mut(0) else {
+            panic!("single-section light range should contain section 0");
+        };
+        sky_nibble.set(0, 0, 0, 15);
+        assert!(sky_nibble.update_visible());
+
+        let packet = build_chunk_light_update_packet(&light, false);
+
+        assert_eq!(packet.sky_y_mask.0[0], 0);
+        assert_eq!(packet.empty_sky_y_mask.0[0], 0);
+        assert!(packet.sky_updates.is_empty());
+    }
+
+    #[test]
+    fn chunk_light_update_packet_sends_initialized_sky_without_matching_block_layer() {
+        let Ok(mut light) = ChunkLightData::new(0, 16) else {
+            panic!("valid single-section height rejected");
+        };
+        light
+            .sky
+            .set_emptiness_map(vec![true].into_boxed_slice())
+            .expect("matching sky emptiness map length should be accepted");
+        light
+            .block
+            .set_emptiness_map(vec![true].into_boxed_slice())
+            .expect("matching block emptiness map length should be accepted");
+        let Some(sky_nibble) = light.sky.nibble_mut(0) else {
+            panic!("single-section light range should contain section 0");
+        };
+        sky_nibble.fill(super::MAX_LIGHT_LEVEL);
+        assert!(sky_nibble.update_visible());
+
+        let packet = build_chunk_light_update_packet(&light, true);
+
+        assert_eq!(packet.sky_y_mask.0[0] & 0b10, 0b10);
+        assert_eq!(packet.empty_sky_y_mask.0[0], 0);
+        assert_eq!(packet.sky_updates.len(), 1);
+        assert!(packet.sky_updates[0].iter().all(|byte| *byte == 0xff));
+
+        let chunk_pos = ChunkPos::new(0, 0);
+        let section_pos = SectionPos::new(0, 0, 0);
+        let packet = build_chunk_light_update_packet_for_sections(
+            chunk_pos,
+            &light,
+            true,
+            &[section_pos],
+            &[],
+        );
+
+        assert_eq!(packet.sky_y_mask.0[0] & 0b10, 0b10);
+        assert_eq!(packet.empty_sky_y_mask.0[0], 0);
+        assert_eq!(packet.sky_updates.len(), 1);
+        assert!(packet.sky_updates[0].iter().all(|byte| *byte == 0xff));
+
+        let Some(block_nibble) = light.block.nibble_mut(0) else {
+            panic!("single-section light range should contain section 0");
+        };
+        block_nibble.set_non_null();
+        assert!(block_nibble.update_visible());
+
+        let packet = build_chunk_light_update_packet(&light, true);
+
+        assert_eq!(packet.sky_y_mask.0[0] & 0b10, 0b10);
+        assert_eq!(packet.empty_sky_y_mask.0[0], 0);
+        assert_eq!(packet.sky_updates.len(), 1);
+        assert!(packet.sky_updates[0].iter().all(|byte| *byte == 0xff));
+        assert_eq!(packet.empty_block_y_mask.0[0] & 0b10, 0b10);
+
+        let packet = build_chunk_light_update_packet_for_sections(
+            chunk_pos,
+            &light,
+            true,
+            &[section_pos],
+            &[],
+        );
+
+        assert_eq!(packet.sky_y_mask.0[0] & 0b10, 0b10);
+        assert_eq!(packet.empty_sky_y_mask.0[0], 0);
+        assert_eq!(packet.sky_updates.len(), 1);
+        assert!(packet.sky_updates[0].iter().all(|byte| *byte == 0xff));
     }
 
     #[test]
@@ -1397,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_light_update_packet_omits_full_sky_above_sources_until_block_section_exists() {
+    fn chunk_light_update_packet_sends_initialized_full_sky_above_sources() {
         let Ok(mut light) = ChunkLightData::new(0, 48) else {
             panic!("valid three-section height rejected");
         };
@@ -1422,21 +1527,9 @@ mod tests {
             assert!(sky_above_sources.update_visible());
         }
 
-        let packet = build_chunk_light_update_packet(&light);
-        assert_eq!(packet.sky_y_mask.0[0] & 0b1000, 0);
-        assert_eq!(packet.empty_sky_y_mask.0[0] & 0b1000, 0);
-
-        {
-            let Some(block_above_sources) = light.block.nibble_mut(2) else {
-                panic!("above-source block nibble missing");
-            };
-            block_above_sources.set_non_null();
-            assert!(block_above_sources.update_visible());
-        }
-
-        let packet = build_chunk_light_update_packet(&light);
+        let packet = build_chunk_light_update_packet(&light, true);
         assert_eq!(packet.sky_y_mask.0[0] & 0b1000, 0b1000);
-        assert_eq!(packet.empty_block_y_mask.0[0] & 0b1000, 0b1000);
+        assert_eq!(packet.empty_sky_y_mask.0[0] & 0b1000, 0);
         assert_eq!(packet.sky_updates.len(), 1);
         assert!(packet.sky_updates[0].iter().all(|byte| *byte == 0xff));
     }
@@ -1466,8 +1559,13 @@ mod tests {
             assert!(upper_nibble.update_visible());
         }
 
-        let packet =
-            build_chunk_light_update_packet_for_sections(chunk_pos, &light, &[], &[upper, lower]);
+        let packet = build_chunk_light_update_packet_for_sections(
+            chunk_pos,
+            &light,
+            true,
+            &[],
+            &[upper, lower],
+        );
 
         assert_eq!(packet.sky_y_mask.0[0], 0);
         assert_eq!(packet.block_y_mask.0[0], 0b0110);

@@ -32,6 +32,7 @@ use crate::chunk::{
     chunk_holder::ChunkHolder,
     chunk_pyramid::ChunkStep,
     heightmap::{Heightmap, HeightmapType},
+    light::MAX_LIGHT_LEVEL,
     section::{BlockStateSectionCounts, ChunkSection, SectionHolder},
 };
 use crate::entity::SharedEntity;
@@ -1228,6 +1229,10 @@ impl LevelReader for WorldGenRegion<'_> {
         } else {
             0
         };
+
+        if sky_light == MAX_LIGHT_LEVEL {
+            return MAX_LIGHT_LEVEL;
+        }
 
         sky_light.max(self.block_light_at(pos))
     }

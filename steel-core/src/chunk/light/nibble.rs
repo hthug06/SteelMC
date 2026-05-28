@@ -482,6 +482,14 @@ mod tests {
         upper_nibble.set(1, 0, 3, 9);
         assert!(upper_nibble.update_visible());
 
+        assert_eq!(
+            light.get_light_value(LightLayer::Sky, block_pos),
+            MAX_LIGHT_LEVEL
+        );
+        if let Err(error) = light.sky.set_emptiness_map(vec![false].into_boxed_slice()) {
+            panic!("matching sky emptiness map length should be accepted: {error:?}");
+        }
+
         assert_eq!(light.get_light_value(LightLayer::Sky, block_pos), 9);
 
         let Some(current_nibble) = light.sky.nibble_mut(0) else {
@@ -492,6 +500,32 @@ mod tests {
         assert!(current_nibble.update_visible());
 
         assert_eq!(light.get_light_value(LightLayer::Sky, block_pos), 7);
+    }
+
+    #[test]
+    fn chunk_light_data_reads_full_sky_above_highest_non_empty_section() {
+        let mut light = ChunkLightData::for_valid_world_height(0, 48);
+        let upper_dark_pos = BlockPos::new(1, 16, 3);
+        let lower_pos = BlockPos::new(1, 15, 3);
+        if let Err(error) = light
+            .sky
+            .set_emptiness_map(vec![false, true, true].into_boxed_slice())
+        {
+            panic!("matching sky emptiness map length should be accepted: {error:?}");
+        }
+
+        let Some(upper_nibble) = light.sky.nibble_mut(2) else {
+            panic!("upper test section should be inside light range");
+        };
+        upper_nibble.set_non_null();
+        upper_nibble.set(1, 0, 3, 9);
+        assert!(upper_nibble.update_visible());
+
+        assert_eq!(
+            light.get_light_value(LightLayer::Sky, upper_dark_pos),
+            MAX_LIGHT_LEVEL
+        );
+        assert_eq!(light.get_light_value(LightLayer::Sky, lower_pos), 9);
     }
 }
 
@@ -569,6 +603,31 @@ impl ChunkLightLayerStorage {
         }
     }
 
+    /// Applies ScalableLux's loaded-sky-data normalization.
+    ///
+    /// Vanilla may omit zero sky-light `DataLayer`s below initialized sky data.
+    /// ScalableLux turns those null sections into explicit zero nibbles when
+    /// loading chunk-owned sky light so later reads and saves preserve the
+    /// same shape.
+    pub(crate) fn fill_loaded_null_sky_sections_below_data_with_zero(&mut self) {
+        if self.layer != LightLayer::Sky {
+            return;
+        }
+
+        let mut below_loaded_data = false;
+        for nibble in self.nibbles.iter_mut().rev() {
+            if !nibble.is_null_visible() {
+                below_loaded_data = true;
+                continue;
+            }
+
+            if below_loaded_data {
+                nibble.set_non_null();
+                nibble.update_visible();
+            }
+        }
+    }
+
     /// Returns the visible light value for one block position.
     #[must_use]
     pub fn get_light_value(&self, block_pos: BlockPos) -> u8 {
@@ -611,6 +670,19 @@ impl ChunkLightLayerStorage {
         self.emptiness_map
             .as_deref()
             .and_then(|emptiness_map| emptiness_map.get(index).copied())
+    }
+
+    /// Returns the highest real chunk section known to contain blocks.
+    #[must_use]
+    pub(crate) fn highest_non_empty_section_y(&self) -> Option<i32> {
+        let emptiness_map = self.emptiness_map.as_deref()?;
+        for (index, empty) in emptiness_map.iter().copied().enumerate().rev() {
+            if !empty {
+                return self.range.chunk_section_y(index);
+            }
+        }
+
+        None
     }
 
     /// Replaces the section emptiness map.
@@ -656,16 +728,24 @@ impl ChunkLightLayerStorage {
             return value;
         }
 
+        let section_y = SectionPos::block_to_section_coord(block_pos.y());
+        let Some(highest_non_empty_section_y) = self.highest_non_empty_section_y() else {
+            return MAX_LIGHT_LEVEL;
+        };
+        if section_y > highest_non_empty_section_y {
+            return MAX_LIGHT_LEVEL;
+        }
+
         let local_x = section_relative_coord(block_pos.x());
         let local_z = section_relative_coord(block_pos.z());
-        let mut section_y = SectionPos::block_to_section_coord(block_pos.y()) + 1;
-        while section_y < self.range.max_section_y_exclusive() {
-            if let Some(nibble) = self.nibble(section_y)
+        let mut search_section_y = section_y + 1;
+        while search_section_y < self.range.max_section_y_exclusive() {
+            if let Some(nibble) = self.nibble(search_section_y)
                 && !nibble.is_null_visible()
             {
                 return nibble.get_visible(local_x, 0, local_z);
             }
-            section_y += 1;
+            search_section_y += 1;
         }
 
         MAX_LIGHT_LEVEL

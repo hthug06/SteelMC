@@ -11,15 +11,17 @@ use std::{
 };
 
 use crate::chunk::chunk_access::{ChunkAccess, ChunkStatus};
-use crate::chunk::light::{LightLayer, has_different_light_properties};
+use crate::chunk::light::{
+    LightLayer, LightSectionEmptinessChange, MAX_LIGHT_LEVEL, has_different_light_properties,
+};
 use crate::world::game_event_context::GameEventContext;
 use crate::world::game_event_listener::{GameEventListenerStorage, SharedGameEventListener};
 use crate::{chunk::chunk_map::ChunkMapGameTickTimings, world::weather::Weather};
 
 use sha2::{Digest, Sha256};
 use steel_protocol::packets::game::{
-    CBlockDestruction, CBlockEvent, CGameEvent, CLevelEvent, CPlayerChat, CPlayerInfoUpdate,
-    CRemoveEntities, CSound, CSystemChat, GameEventType, SoundSource,
+    CBlockDestruction, CBlockEntityData, CBlockEvent, CGameEvent, CLevelEvent, CPlayerChat,
+    CPlayerInfoUpdate, CRemoveEntities, CSound, CSystemChat, GameEventType, SoundSource,
 };
 use steel_protocol::utils::ConnectionProtocol;
 use steel_protocol::{
@@ -62,6 +64,7 @@ pub enum RaytraceAction {
 use glam::DVec3;
 use steel_utils::{
     BlockPos, BlockStateId, ChunkPos, Identifier, SectionPos,
+    serial::OptionalNbt,
     types::{Difficulty, GameType, UpdateFlags},
 };
 use tokio::{runtime::Runtime, time::Instant};
@@ -93,7 +96,7 @@ mod world_entities;
 pub use crate::config::WorldStorageConfig;
 use crate::worldgen::{ChunkGenerator, ChunkGeneratorType};
 pub use level_reader::{LevelReader, ScheduledTickAccess};
-pub use player_area_map::PlayerAreaMap;
+pub use player_area_map::{ChunkUpdateRecipients, PlayerAreaMap};
 pub use player_map::PlayerMap;
 pub use tick_scheduler::ScheduledTick;
 
@@ -684,20 +687,20 @@ impl World {
             .unwrap_or_else(|| REGISTRY.blocks.get_base_state_id(&vanilla_blocks::AIR))
     }
 
-    pub(crate) fn propagate_light_change_after_block_set(
+    pub(crate) fn queue_light_change_after_block_set(
         &self,
         pos: BlockPos,
         old_state: BlockStateId,
         new_state: BlockStateId,
+        empty_section_change: Option<LightSectionEmptinessChange>,
     ) {
-        if !has_different_light_properties(old_state, new_state) {
+        let light_properties_changed = has_different_light_properties(old_state, new_state);
+        if !light_properties_changed && empty_section_change.is_none() {
             return;
         }
 
-        if self.dimension_type.has_skylight {
-            self.chunk_map.propagate_sky_light_change(pos);
-        }
-        self.chunk_map.propagate_block_light_change(pos);
+        self.chunk_map
+            .queue_light_change(pos, light_properties_changed, empty_section_change);
     }
 
     fn light_value_at(&self, layer: LightLayer, pos: BlockPos) -> u8 {
@@ -710,7 +713,7 @@ impl World {
 
         let chunk_pos = Self::chunk_pos_for_block(pos);
         self.chunk_map
-            .with_full_chunk(chunk_pos, |chunk| {
+            .with_chunk_at_status(chunk_pos, ChunkStatus::Light, |chunk| {
                 let light = chunk.light();
                 light.get_light_value(layer, pos)
             })
@@ -728,11 +731,8 @@ impl World {
     ///
     /// Vanilla delays `LevelChunk.postProcessGeneration` until neighboring
     /// chunks are full because that hook runs during the ticking-chunk
-    /// transition. Steel runs it as the center chunk reaches full. At that
-    /// point the chunk pyramid guarantees the 3x3 neighbors have reached
-    /// `Light`, which means they have completed `Features`, the last
-    /// block-mutating generation stage. Postprocessing only needs block
-    /// states, so reading light-stage proto chunks here is intentional.
+    /// transition. Postprocessing only needs block states, so reading
+    /// feature-or-later chunks here is intentional.
     #[must_use]
     pub(crate) fn get_postprocessing_block_state(&self, pos: BlockPos) -> BlockStateId {
         if !self.is_in_valid_bounds(pos) {
@@ -961,6 +961,29 @@ impl World {
     pub fn block_entity_changed(&self, pos: BlockPos) {
         let chunk_pos = Self::chunk_pos_for_block(pos);
         self.mark_chunk_dirty(chunk_pos);
+    }
+
+    /// Builds the block entity data packet vanilla sends after a matching block update.
+    #[must_use]
+    pub(crate) fn block_entity_update_packet_for_state(
+        &self,
+        pos: BlockPos,
+        state: BlockStateId,
+    ) -> Option<CBlockEntityData> {
+        let behavior = BLOCK_BEHAVIORS.get_behavior(state.get_block());
+        if !behavior.has_block_entity() {
+            return None;
+        }
+
+        let block_entity = self.get_block_entity(pos)?;
+        let guard = block_entity.lock();
+        let nbt = guard.get_update_tag()?;
+
+        Some(CBlockEntityData {
+            pos,
+            block_entity_type: guard.get_type().id() as i32,
+            nbt: OptionalNbt(Some(nbt)),
+        })
     }
 
     /// Marks a chunk as dirty (unsaved) so it will be persisted to disk.
@@ -1555,9 +1578,6 @@ impl World {
         block_entity_type: BlockEntityTypeRef,
         nbt: NbtCompound,
     ) {
-        use steel_protocol::packets::game::CBlockEntityData;
-        use steel_utils::serial::OptionalNbt;
-
         let chunk = ChunkPos::new(
             SectionPos::block_to_section_coord(pos.x()),
             SectionPos::block_to_section_coord(pos.z()),
@@ -2499,6 +2519,10 @@ impl LevelReader for World {
             0
         };
 
+        if sky_light == MAX_LIGHT_LEVEL {
+            return MAX_LIGHT_LEVEL;
+        }
+
         sky_light.max(self.light_value_at(LightLayer::Block, pos))
     }
 
@@ -2551,16 +2575,19 @@ mod tests {
 
     use rayon::ThreadPoolBuilder;
     use steel_registry::{
-        test_support::init_test_registry, vanilla_blocks, vanilla_dimension_types,
+        test_support::init_test_registry, vanilla_block_entity_types, vanilla_blocks,
+        vanilla_dimension_types,
     };
     use steel_utils::{
         BlockPos, ChunkPos, Identifier, SectionPos,
+        locks::SyncMutex,
         types::{Difficulty, GameType, UpdateFlags},
     };
     use tokio::runtime::Builder as RuntimeBuilder;
 
     use super::*;
     use crate::behavior::init_behaviors;
+    use crate::block_entity::entities::{BarrelBlockEntity, SignBlockEntity};
     use crate::chunk::{
         chunk_access::{ChunkAccess, ChunkStatus},
         chunk_holder::ChunkHolder,
@@ -2708,6 +2735,31 @@ mod tests {
         insert_full_proto_chunk(world, proto);
     }
 
+    fn proto_chunk_with_single_block(
+        world: &Arc<World>,
+        chunk_pos: ChunkPos,
+        pos: BlockPos,
+        state: BlockStateId,
+    ) -> ProtoChunk {
+        let section_index = ((pos.y() - world.get_min_y()) / 16) as usize;
+        let local_x = (pos.x() & 15) as usize;
+        let local_y = (pos.y() & 15) as usize;
+        let local_z = (pos.z() & 15) as usize;
+
+        let mut sections = (0..(world.get_height() / 16) as usize)
+            .map(|_| ChunkSection::new_empty())
+            .collect::<Vec<_>>();
+        sections[section_index].set_block_state(local_x, local_y, local_z, state);
+
+        ProtoChunk::new(
+            Sections::from_owned(sections.into_boxed_slice()),
+            chunk_pos,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(world),
+        )
+    }
+
     fn set_visible_block_light(proto: &ProtoChunk, pos: BlockPos, level: u8) {
         let section_y = SectionPos::block_to_section_coord(pos.y());
         let local_x = (pos.x() & 15) as usize;
@@ -2723,6 +2775,39 @@ mod tests {
         assert!(block.update_visible());
     }
 
+    fn insert_proto_light_change_fixture(
+        world: &Arc<World>,
+        status: ChunkStatus,
+    ) -> (ChunkPos, BlockPos, BlockPos, BlockPos) {
+        let chunk_pos = ChunkPos::new(0, 0);
+        let source = BlockPos::new(0, world.get_min_y() + 1, 1);
+        let opened = BlockPos::new(1, world.get_min_y() + 1, 1);
+        let east = BlockPos::new(2, world.get_min_y() + 1, 1);
+        let local_y = (source.y() & 15) as usize;
+
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(0, local_y, 1, vanilla_blocks::LIGHT.default_state());
+        section.set_block_state(1, local_y, 1, vanilla_blocks::STONE.default_state());
+
+        let mut sections = (0..(world.get_height() / 16) as usize)
+            .map(|_| ChunkSection::new_empty())
+            .collect::<Vec<_>>();
+        sections[0] = section;
+        let proto = ProtoChunk::new(
+            Sections::from_owned(sections.into_boxed_slice()),
+            chunk_pos,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(world),
+        );
+        proto.initialize_light_sources();
+        proto.set_status(status);
+        set_visible_block_light(&proto, source, 15);
+        insert_proto_chunk_at_status(world, proto, status);
+
+        (chunk_pos, source, opened, east)
+    }
+
     #[test]
     fn raw_brightness_reads_visible_chunk_light() {
         init_tests();
@@ -2733,6 +2818,44 @@ mod tests {
 
         assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 0), 9);
         assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 7), 3);
+    }
+
+    #[test]
+    fn raw_brightness_reads_lit_proto_chunk_light() {
+        init_tests();
+        let world = empty_test_world();
+        let chunk_pos = ChunkPos::new(0, 0);
+        let pos = BlockPos::new(1, 2, 3);
+        let proto = ProtoChunk::new(
+            empty_sections(world.as_ref()),
+            chunk_pos,
+            world.get_min_y(),
+            world.get_height(),
+            Arc::downgrade(&world),
+        );
+        {
+            let mut light = proto.light.write();
+            let section_y = SectionPos::block_to_section_coord(pos.y());
+            let local_x = (pos.x() & 15) as usize;
+            let local_y = (pos.y() & 15) as usize;
+            let local_z = (pos.z() & 15) as usize;
+
+            let Some(block) = light.block.nibble_mut(section_y) else {
+                panic!("test block light section should be inside light range");
+            };
+            block.set(local_x, local_y, local_z, 6);
+            assert!(block.update_visible());
+
+            let Some(sky) = light.sky.nibble_mut(section_y) else {
+                panic!("test sky light section should be inside light range");
+            };
+            sky.set(local_x, local_y, local_z, 4);
+            assert!(sky.update_visible());
+        }
+        insert_proto_chunk_at_status(&world, proto, ChunkStatus::Light);
+
+        assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 0), 6);
+        assert_eq!(LevelReader::raw_brightness(world.as_ref(), pos, 2), 6);
     }
 
     #[test]
@@ -2775,12 +2898,16 @@ mod tests {
             .flatten();
 
         assert_eq!(changed, Some(vanilla_blocks::STONE.default_state()));
+        assert_eq!(world.light_value_at(LightLayer::Block, opened), 0);
+
+        world.chunk_map.propagate_queued_light_changes();
+
         assert_eq!(world.light_value_at(LightLayer::Block, opened), 14);
         assert_eq!(world.light_value_at(LightLayer::Block, east), 13);
     }
 
     #[test]
-    fn direct_initialized_proto_block_change_updates_light() {
+    fn broadcast_changed_chunks_drains_queued_light_changes() {
         init_tests();
         let world = empty_test_world();
         let chunk_pos = ChunkPos::new(0, 0);
@@ -2804,10 +2931,60 @@ mod tests {
             world.get_height(),
             Arc::downgrade(&world),
         );
-        proto.initialize_light_sources();
-        proto.set_status(ChunkStatus::InitializeLight);
         set_visible_block_light(&proto, source, 15);
-        insert_proto_chunk_at_status(&world, proto, ChunkStatus::InitializeLight);
+        insert_full_proto_chunk(&world, proto);
+
+        let changed = world
+            .chunk_map
+            .with_full_chunk(chunk_pos, |chunk| {
+                chunk.set_block_state(
+                    opened,
+                    vanilla_blocks::AIR.default_state(),
+                    UpdateFlags::UPDATE_NONE,
+                )
+            })
+            .flatten();
+
+        assert_eq!(changed, Some(vanilla_blocks::STONE.default_state()));
+        assert_eq!(world.light_value_at(LightLayer::Block, opened), 0);
+
+        world.chunk_map.broadcast_changed_chunks();
+
+        assert_eq!(world.light_value_at(LightLayer::Block, opened), 14);
+        assert_eq!(world.light_value_at(LightLayer::Block, east), 13);
+    }
+
+    #[test]
+    fn emptiness_only_change_does_not_run_block_recheck() {
+        init_tests();
+        let world = empty_test_world();
+        let chunk_pos = ChunkPos::new(0, 0);
+        let pos = BlockPos::new(1, world.get_min_y() + 1, 1);
+        insert_full_chunk_with_visible_light(&world, chunk_pos, pos);
+
+        let air = vanilla_blocks::AIR.default_state();
+        let structure_void = vanilla_blocks::STRUCTURE_VOID.default_state();
+        assert!(!structure_void.is_air());
+        assert!(!has_different_light_properties(air, structure_void));
+
+        let changed = world
+            .chunk_map
+            .with_full_chunk(chunk_pos, |chunk| {
+                chunk.set_block_state(pos, structure_void, UpdateFlags::UPDATE_NONE)
+            })
+            .flatten();
+
+        assert_eq!(changed, Some(air));
+        world.chunk_map.propagate_queued_light_changes();
+        assert_eq!(world.light_value_at(LightLayer::Block, pos), 3);
+    }
+
+    #[test]
+    fn initialized_proto_block_change_does_not_live_propagate_light() {
+        init_tests();
+        let world = empty_test_world();
+        let (chunk_pos, _source, opened, east) =
+            insert_proto_light_change_fixture(&world, ChunkStatus::InitializeLight);
 
         let changed = world
             .chunk_map
@@ -2835,7 +3012,114 @@ mod tests {
         };
 
         assert_eq!(changed, Some(vanilla_blocks::STONE.default_state()));
+        assert_eq!(opened_light, 0);
+        assert_eq!(east_light, 0);
+    }
+
+    #[test]
+    fn queued_light_change_is_discarded_before_light_status() {
+        init_tests();
+        let world = empty_test_world();
+        let (chunk_pos, _source, opened, _east) =
+            insert_proto_light_change_fixture(&world, ChunkStatus::InitializeLight);
+
+        world.queue_light_change_after_block_set(
+            opened,
+            vanilla_blocks::STONE.default_state(),
+            vanilla_blocks::AIR.default_state(),
+            None,
+        );
+
+        assert!(!world.chunk_map.has_pending_light_update_for_test(chunk_pos));
+    }
+
+    #[test]
+    fn lit_proto_block_change_updates_light() {
+        init_tests();
+        let world = empty_test_world();
+        let (chunk_pos, _source, opened, east) =
+            insert_proto_light_change_fixture(&world, ChunkStatus::Light);
+
+        let changed = world
+            .chunk_map
+            .with_chunk_at_status(chunk_pos, ChunkStatus::Light, |chunk| {
+                chunk.set_block_state(
+                    opened,
+                    vanilla_blocks::AIR.default_state(),
+                    UpdateFlags::UPDATE_NONE,
+                )
+            })
+            .flatten();
+
+        world.chunk_map.propagate_queued_light_changes();
+
+        let Some((opened_light, east_light)) =
+            world
+                .chunk_map
+                .with_chunk_at_status(chunk_pos, ChunkStatus::Light, |chunk| {
+                    let light = chunk.light();
+                    (
+                        light.get_light_value(LightLayer::Block, opened),
+                        light.get_light_value(LightLayer::Block, east),
+                    )
+                })
+        else {
+            panic!("test proto chunk should remain available");
+        };
+
+        assert_eq!(changed, Some(vanilla_blocks::STONE.default_state()));
         assert_eq!(opened_light, 14);
         assert_eq!(east_light, 13);
+    }
+
+    #[test]
+    fn block_entity_update_packet_for_state_uses_update_tag() {
+        init_tests();
+        let world = empty_test_world();
+        let chunk_pos = ChunkPos::new(0, 0);
+        let pos = BlockPos::new(1, world.get_min_y() + 1, 1);
+        let state = vanilla_blocks::OAK_SIGN.default_state();
+        let proto = proto_chunk_with_single_block(&world, chunk_pos, pos, state);
+
+        proto.add_and_register_block_entity(Arc::new(SyncMutex::new(SignBlockEntity::new(
+            Arc::downgrade(&world),
+            pos,
+            state,
+        ))));
+        insert_full_proto_chunk(&world, proto);
+
+        let Some(packet) = world.block_entity_update_packet_for_state(pos, state) else {
+            panic!("sign block entity should produce an update packet");
+        };
+
+        assert_eq!(packet.pos, pos);
+        assert_eq!(
+            packet.block_entity_type,
+            vanilla_block_entity_types::SIGN.id() as i32
+        );
+        assert!(packet.nbt.0.is_some());
+    }
+
+    #[test]
+    fn block_entity_update_packet_for_state_skips_entities_without_update_tag() {
+        init_tests();
+        let world = empty_test_world();
+        let chunk_pos = ChunkPos::new(0, 0);
+        let pos = BlockPos::new(1, world.get_min_y() + 1, 1);
+        let state = vanilla_blocks::BARREL.default_state();
+        let proto = proto_chunk_with_single_block(&world, chunk_pos, pos, state);
+
+        proto.add_and_register_block_entity(Arc::new(SyncMutex::new(BarrelBlockEntity::new(
+            Arc::downgrade(&world),
+            pos,
+            state,
+        ))));
+        insert_full_proto_chunk(&world, proto);
+
+        assert!(
+            world
+                .block_entity_update_packet_for_state(pos, state)
+                .is_none()
+        );
     }
 }

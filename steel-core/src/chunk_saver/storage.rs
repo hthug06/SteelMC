@@ -858,10 +858,18 @@ impl ChunkStorage {
         persistent: &PersistentLightData,
         min_y: i32,
         height: i32,
+        status: ChunkStatus,
     ) -> ChunkLightData {
         let mut light = ChunkLightData::for_valid_world_height(min_y, height);
+        if status < ChunkStatus::Light {
+            return light;
+        }
+
         Self::apply_persistent_light_layer(&mut light.block, &persistent.block, "block");
         Self::apply_persistent_light_layer(&mut light.sky, &persistent.sky, "sky");
+        light
+            .sky
+            .fill_loaded_null_sky_sections_below_data_with_zero();
         light
     }
 
@@ -969,7 +977,7 @@ impl ChunkStorage {
         let structure_starts = Self::persistent_to_structure_starts(&persistent.structure_starts);
         let structure_references =
             Self::persistent_to_structure_references(&persistent.structure_references);
-        let light = Self::persistent_to_light(&persistent.light, min_y, height);
+        let light = Self::persistent_to_light(&persistent.light, min_y, height, status);
 
         if status == ChunkStatus::Full {
             // Reconstruct scheduled ticks from persistent data
@@ -2806,13 +2814,74 @@ mod tests {
     }
 
     #[test]
+    fn persisted_light_is_ignored_before_light_status() {
+        init_test_registry();
+        let persistent = PersistentLightData {
+            block: vec![PersistentLightNibble::Initialized {
+                section_index: 1,
+                data: vec![0x77; DATA_LAYER_SIZE],
+            }],
+            sky: vec![PersistentLightNibble::Initialized {
+                section_index: 1,
+                data: vec![0x77; DATA_LAYER_SIZE],
+            }],
+        };
+
+        let light =
+            ChunkStorage::persistent_to_light(&persistent, 0, 16, ChunkStatus::InitializeLight);
+
+        let Some(block) = light.block.nibble(0) else {
+            panic!("block light section should exist");
+        };
+        assert_eq!(block.visible_state(), LightNibbleState::Null);
+
+        let Some(sky) = light.sky.nibble(0) else {
+            panic!("sky light section should exist");
+        };
+        assert_eq!(sky.visible_state(), LightNibbleState::Null);
+    }
+
+    #[test]
+    fn loaded_sky_light_fills_null_sections_below_loaded_data_with_zero() {
+        init_test_registry();
+        let persistent = PersistentLightData {
+            block: Vec::new(),
+            sky: vec![PersistentLightNibble::Initialized {
+                section_index: 1,
+                data: vec![0x77; DATA_LAYER_SIZE],
+            }],
+        };
+
+        let light = ChunkStorage::persistent_to_light(&persistent, 0, 16, ChunkStatus::Light);
+
+        let Some(above) = light.sky.nibble(1) else {
+            panic!("top padded sky section should exist");
+        };
+        assert_eq!(above.visible_state(), LightNibbleState::Null);
+
+        let Some(loaded) = light.sky.nibble(0) else {
+            panic!("loaded sky section should exist");
+        };
+        assert_eq!(loaded.visible_state(), LightNibbleState::Initialized);
+        assert_eq!(loaded.get_visible(0, 0, 0), 7);
+
+        let Some(below) = light.sky.nibble(-1) else {
+            panic!("bottom padded sky section should exist");
+        };
+        assert_eq!(below.visible_state(), LightNibbleState::Uninitialized);
+        assert_eq!(below.get_visible(0, 0, 0), 0);
+    }
+
+    #[test]
     fn chunk_owned_light_roundtrips_through_persistent_chunk() {
         init_test_registry();
         init_behaviors();
 
         let pos = ChunkPos::new(2, -3);
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(0, 0, 0, vanilla_blocks::STONE.default_state());
         let chunk = LevelChunk::from_disk(
-            single_empty_section(),
+            Sections::from_owned(vec![section].into_boxed_slice()),
             pos,
             0,
             16,
@@ -2888,12 +2957,16 @@ mod tests {
         };
         assert_eq!(block.visible_state(), LightNibbleState::Initialized);
         assert_eq!(block.get_visible(1, 2, 3), 12);
+        assert_eq!(light.block.section_empty(0), Some(false));
+        assert_eq!(light.block.section_empty(-1), None);
 
         let Some(sky_bottom) = light.sky.nibble(-1) else {
             panic!("bottom sky light section should reload");
         };
         assert_eq!(sky_bottom.visible_state(), LightNibbleState::Uninitialized);
         assert_eq!(sky_bottom.get_visible(0, 0, 0), 0);
+        assert_eq!(light.sky.section_empty(0), Some(false));
+        assert_eq!(light.sky.section_empty(1), None);
 
         let Some(sky_hidden) = light.sky.nibble(0) else {
             panic!("hidden sky light section should reload");

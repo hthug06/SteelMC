@@ -2,7 +2,7 @@ use rayon::{
     ThreadPool,
     iter::{IntoParallelIterator, ParallelIterator},
 };
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::{
     io, mem,
     sync::{
@@ -31,9 +31,10 @@ use crate::chunk::chunk_ticket_manager::{
     ChunkTicketManager, LevelChange, MAX_VIEW_DISTANCE, is_full,
 };
 use crate::chunk::light::{
-    LightCacheLayout, LightCacheSetupRadius, LightLayer, LightSectionRange, LightWorkset,
-    build_chunk_light_update_packet_for_sections, propagate_block_light_changes,
-    propagate_sky_light_changes,
+    LightCacheLayout, LightCacheSetupRadius, LightLayer, LightSectionEmptinessChange,
+    LightSectionRange, LightWorkset, build_chunk_light_update_packet_for_sections,
+    propagate_block_light_changes_with_empty_sections,
+    propagate_sky_light_changes_with_empty_sections,
 };
 use crate::chunk::player_chunk_view::PlayerChunkView;
 use crate::chunk::{chunk_access::ChunkAccess, chunk_ticket_manager::is_ticked};
@@ -41,8 +42,8 @@ use crate::chunk::{chunk_access::ChunkStatus, chunk_generation_task::ChunkGenera
 use crate::chunk_saver::ChunkStorage;
 use crate::player::Player;
 use crate::player::connection::NetworkConnection;
-use crate::world::World;
 use crate::world::tick_scheduler::{BlockTick, FluidTick};
+use crate::world::{ChunkUpdateRecipients, World};
 use crate::worldgen::{ChunkGeneratorType, WorldGenContext};
 
 /// Timing information for the game tick portion of chunk map operations.
@@ -77,6 +78,80 @@ pub struct ChunkMapSchedulingTimings {
     pub process_unloads: Duration,
 }
 
+#[derive(Debug, Default)]
+struct PendingLightUpdates {
+    chunks: FxHashMap<ChunkPos, PendingChunkLightUpdates>,
+    queued_chunks: Vec<ChunkPos>,
+}
+
+impl PendingLightUpdates {
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn queue_change(
+        &mut self,
+        chunk_pos: ChunkPos,
+        pos: BlockPos,
+        check_block: bool,
+        empty_section_change: Option<LightSectionEmptinessChange>,
+    ) {
+        if !self.chunks.contains_key(&chunk_pos) {
+            self.queued_chunks.push(chunk_pos);
+        }
+
+        let task = self.chunks.entry(chunk_pos).or_default();
+        if check_block {
+            task.changed_positions.insert(pos);
+        }
+        if let Some(change) = empty_section_change {
+            task.changed_sections
+                .insert(change.section_pos, change.empty);
+        }
+    }
+
+    fn remove_chunk(&mut self, chunk_pos: ChunkPos) {
+        self.chunks.remove(&chunk_pos);
+    }
+
+    fn drain(&mut self) -> Vec<(ChunkPos, PendingChunkLightUpdates)> {
+        let mut chunks = mem::take(&mut self.chunks);
+        let queued_chunks = mem::take(&mut self.queued_chunks);
+        queued_chunks
+            .into_iter()
+            .filter_map(|chunk_pos| chunks.remove(&chunk_pos).map(|task| (chunk_pos, task)))
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingChunkLightUpdates {
+    changed_positions: FxHashSet<BlockPos>,
+    changed_sections: FxHashMap<SectionPos, bool>,
+}
+
+impl PendingChunkLightUpdates {
+    fn is_empty(&self) -> bool {
+        self.changed_positions.is_empty() && self.changed_sections.is_empty()
+    }
+
+    fn empty_section_changes(&self) -> Vec<LightSectionEmptinessChange> {
+        let mut changes = self
+            .changed_sections
+            .iter()
+            .map(|(&section_pos, &empty)| LightSectionEmptinessChange { section_pos, empty })
+            .collect::<Vec<_>>();
+        changes.sort_by(|left, right| {
+            left.section_pos
+                .x()
+                .cmp(&right.section_pos.x())
+                .then_with(|| left.section_pos.z().cmp(&right.section_pos.z()))
+                .then_with(|| right.section_pos.y().cmp(&left.section_pos.y()))
+        });
+        changes
+    }
+}
+
 /// A map of chunks managing their state, loading, and generation.
 pub struct ChunkMap {
     /// Map of active chunks.
@@ -101,6 +176,8 @@ pub struct ChunkMap {
     pub storage: Arc<ChunkStorage>,
     /// Chunk holders with pending block changes to broadcast.
     pub chunks_to_broadcast: SyncMutex<Vec<Arc<ChunkHolder>>>,
+    /// Coalesced block and section changes waiting for one ScalableLux-style light pass.
+    pending_light_updates: SyncMutex<PendingLightUpdates>,
     /// Last length of `tickable_chunks` to pre-allocate with appropriate capacity.
     last_tickable_len: AtomicUsize,
     /// Parent cancellation token for all generation tasks.
@@ -132,6 +209,7 @@ impl ChunkMap {
             chunk_runtime,
             storage,
             chunks_to_broadcast: SyncMutex::new(Vec::new()),
+            pending_light_updates: SyncMutex::new(PendingLightUpdates::default()),
             last_tickable_len: AtomicUsize::new(0),
             cancel_token: CancellationToken::new(),
         }
@@ -239,6 +317,104 @@ impl ChunkMap {
         }
     }
 
+    /// Queues a block or section light change for the next light propagation drain.
+    ///
+    /// ScalableLux batches changed block positions and section emptiness changes
+    /// by chunk before running sky and block propagation. Steel keeps the same
+    /// coalescing shape on the main tick thread.
+    pub fn queue_light_change(
+        &self,
+        pos: BlockPos,
+        check_block: bool,
+        empty_section_change: Option<LightSectionEmptinessChange>,
+    ) {
+        if !check_block && empty_section_change.is_none() {
+            return;
+        }
+
+        let chunk_pos = ChunkPos::new(
+            SectionPos::block_to_section_coord(pos.0.x),
+            SectionPos::block_to_section_coord(pos.0.z),
+        );
+        if !self.can_accept_queued_light_change(chunk_pos) {
+            return;
+        }
+
+        let mut pending = self.pending_light_updates.lock();
+        pending.queue_change(chunk_pos, pos, check_block, empty_section_change);
+    }
+
+    /// Drains all queued light updates and runs one scoped propagation per changed chunk.
+    pub fn propagate_queued_light_changes(&self) {
+        let tasks = {
+            let mut pending = self.pending_light_updates.lock();
+            if pending.is_empty() {
+                return;
+            }
+            pending.drain()
+        };
+
+        for (center, task) in tasks {
+            if task.is_empty() {
+                continue;
+            }
+            self.propagate_queued_light_change(center, task);
+        }
+    }
+
+    fn can_accept_queued_light_change(&self, center: ChunkPos) -> bool {
+        self.chunks
+            .read_sync(&center, |_, holder| {
+                holder.try_chunk(ChunkStatus::Light).is_some()
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_light_update_for_test(&self, chunk_pos: ChunkPos) -> bool {
+        self.pending_light_updates
+            .lock()
+            .chunks
+            .contains_key(&chunk_pos)
+    }
+
+    fn propagate_queued_light_change(&self, center: ChunkPos, task: PendingChunkLightUpdates) {
+        let Some(workset) = self.light_workset_for_change(center) else {
+            log::warn!("Failed to set up light workset for queued light update at {center:?}");
+            return;
+        };
+
+        let empty_sections = task.empty_section_changes();
+        let positions = task.changed_positions.into_iter().collect::<Vec<_>>();
+        let world = self.world_gen_context.world();
+
+        if world.dimension_type.has_skylight {
+            let Ok(result) = propagate_sky_light_changes_with_empty_sections(
+                &workset,
+                positions.iter().copied(),
+                empty_sections.iter().copied(),
+            ) else {
+                log::warn!("Failed to propagate queued sky-light change for {center:?}");
+                return;
+            };
+
+            for section_pos in result.updated_sections {
+                self.light_changed(LightLayer::Sky, section_pos);
+            }
+        }
+
+        let Ok(result) =
+            propagate_block_light_changes_with_empty_sections(&workset, positions, empty_sections)
+        else {
+            log::warn!("Failed to propagate queued block-light change for {center:?}");
+            return;
+        };
+
+        for section_pos in result.updated_sections {
+            self.light_changed(LightLayer::Block, section_pos);
+        }
+    }
+
     fn light_workset_for_change(&self, center: ChunkPos) -> Option<LightWorkset> {
         let Ok(range) = LightSectionRange::from_world_height(
             self.world_gen_context.min_y(),
@@ -250,13 +426,13 @@ impl ChunkMap {
         let layout = LightCacheLayout::new(center, range);
         LightWorkset::setup(
             layout,
-            LightCacheSetupRadius::Inner,
+            LightCacheSetupRadius::Full,
             true,
             |chunk_pos| {
                 let holder = self
                     .chunks
                     .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))?;
-                if holder.try_chunk(ChunkStatus::InitializeLight).is_none() {
+                if holder.try_chunk(ChunkStatus::Light).is_none() {
                     return None;
                 }
                 Some(holder)
@@ -266,53 +442,11 @@ impl ChunkMap {
         .ok()
     }
 
-    /// Runs a scoped ScalableLux-style sky-light update for one changed block.
-    pub fn propagate_sky_light_change(&self, pos: BlockPos) {
-        let center = ChunkPos::new(
-            SectionPos::block_to_section_coord(pos.0.x),
-            SectionPos::block_to_section_coord(pos.0.z),
-        );
-        let Some(workset) = self.light_workset_for_change(center) else {
-            log::warn!("Failed to set up sky-light workset for {pos:?}");
-            return;
-        };
-
-        let Ok(result) = propagate_sky_light_changes(&workset, [pos]) else {
-            log::warn!("Failed to propagate sky-light change for {pos:?}");
-            return;
-        };
-
-        for section_pos in result.updated_sections {
-            self.light_changed(LightLayer::Sky, section_pos);
-        }
-    }
-
-    /// Runs a scoped ScalableLux-style block-light update for one changed block.
-    pub fn propagate_block_light_change(&self, pos: BlockPos) {
-        let center = ChunkPos::new(
-            SectionPos::block_to_section_coord(pos.0.x),
-            SectionPos::block_to_section_coord(pos.0.z),
-        );
-        let Some(workset) = self.light_workset_for_change(center) else {
-            log::warn!("Failed to set up block-light workset for {pos:?}");
-            return;
-        };
-
-        let Ok(result) = propagate_block_light_changes(&workset, [pos]) else {
-            log::warn!("Failed to propagate block-light change for {pos:?}");
-            return;
-        };
-
-        for section_pos in result.updated_sections {
-            self.light_changed(LightLayer::Block, section_pos);
-        }
-    }
-
     /// Broadcasts all pending block and light changes to nearby players.
     ///
-    /// # Panics
-    /// Panics if a section has exactly one change (should never happen).
     pub fn broadcast_changed_chunks(&self) {
+        self.propagate_queued_light_changes();
+
         let holders = {
             let mut guard = self.chunks_to_broadcast.lock();
             if guard.is_empty() {
@@ -322,6 +456,7 @@ impl ChunkMap {
         };
 
         let world = self.world_gen_context.world();
+        let has_skylight = world.dimension_type.has_skylight;
 
         for holder in holders {
             let chunk_pos = holder.get_pos();
@@ -332,26 +467,52 @@ impl ChunkMap {
             let light_changes = holder.take_changed_light_sections();
             // Take all pending changes from this chunk holder
             let changes_by_section = holder.take_changed_blocks();
+            let has_publishable_light_changes =
+                !light_changes.block.is_empty() || (has_skylight && !light_changes.sky.is_empty());
 
-            if light_changes.is_empty() && changes_by_section.is_empty() {
+            if !has_publishable_light_changes && changes_by_section.is_empty() {
                 continue;
             }
 
-            // Get players tracking this chunk
-            let tracking_players = world.player_area_map.get_tracking_players(chunk_pos);
-            if tracking_players.is_empty() {
+            let light_players = if has_publishable_light_changes {
+                world.player_area_map.get_chunk_update_players(
+                    chunk_pos,
+                    ChunkUpdateRecipients::TrackedBorder,
+                    |entity_id, chunk| Self::is_chunk_pending_for_player(&world, entity_id, chunk),
+                )
+            } else {
+                Vec::new()
+            };
+            let block_players = if changes_by_section.is_empty() {
+                Vec::new()
+            } else {
+                world.player_area_map.get_chunk_update_players(
+                    chunk_pos,
+                    ChunkUpdateRecipients::Tracked,
+                    |entity_id, chunk| Self::is_chunk_pending_for_player(&world, entity_id, chunk),
+                )
+            };
+
+            if light_players.is_empty() && block_players.is_empty() {
                 continue;
             }
 
-            if !light_changes.is_empty()
+            if has_publishable_light_changes
+                && !light_players.is_empty()
                 && let Some(chunk) = holder.try_chunk(ChunkStatus::Full)
             {
                 let light_data = {
                     let light = chunk.light();
+                    let sky_sections = if has_skylight {
+                        light_changes.sky.as_slice()
+                    } else {
+                        &[]
+                    };
                     build_chunk_light_update_packet_for_sections(
                         chunk_pos,
                         &light,
-                        &light_changes.sky,
+                        has_skylight,
+                        sky_sections,
                         &light_changes.block,
                     )
                 };
@@ -368,7 +529,7 @@ impl ChunkMap {
                 );
                 match encoded {
                     Ok(encoded) => {
-                        for entity_id in &tracking_players {
+                        for entity_id in &light_players {
                             if let Some(player) = world.players.get_by_entity_id(*entity_id) {
                                 player.connection.send_encoded(encoded.clone());
                             }
@@ -385,14 +546,16 @@ impl ChunkMap {
 
                 if changed_positions.len() == 1 {
                     // Single block change - use CBlockUpdate
-                    let packed = *changed_positions.iter().next().expect("len == 1");
+                    let Some(&packed) = changed_positions.iter().next() else {
+                        continue;
+                    };
                     let block_pos = section_pos.relative_to_block_pos(packed);
                     let block_state = world.get_block_state(block_pos);
 
                     tracing::debug!(
                         ?block_pos,
                         ?block_state,
-                        player_count = tracking_players.len(),
+                        player_count = block_players.len(),
                         "Broadcasting single block update"
                     );
 
@@ -410,11 +573,18 @@ impl ChunkMap {
                         continue;
                     };
 
-                    for entity_id in &tracking_players {
+                    for entity_id in &block_players {
                         if let Some(player) = world.players.get_by_entity_id(*entity_id) {
                             player.connection.send_encoded(encoded.clone());
                         }
                     }
+
+                    Self::broadcast_block_entity_if_needed(
+                        &world,
+                        &block_players,
+                        block_pos,
+                        block_state,
+                    );
                 } else {
                     // Multiple block changes - use CSectionBlocksUpdate
                     let changes: Vec<BlockChange> = changed_positions
@@ -432,9 +602,19 @@ impl ChunkMap {
                     tracing::debug!(
                         change_count = changes.len(),
                         ?section_pos,
-                        player_count = tracking_players.len(),
+                        player_count = block_players.len(),
                         "Broadcasting section block updates"
                     );
+
+                    let block_entity_updates = changes
+                        .iter()
+                        .map(|change| {
+                            (
+                                section_pos.relative_to_block_pos(change.pos),
+                                change.block_state,
+                            )
+                        })
+                        .collect::<Vec<_>>();
 
                     let packet = CSectionBlocksUpdate {
                         section_pos,
@@ -450,14 +630,63 @@ impl ChunkMap {
                         continue;
                     };
 
-                    for entity_id in &tracking_players {
+                    for entity_id in &block_players {
                         if let Some(player) = world.players.get_by_entity_id(*entity_id) {
                             player.connection.send_encoded(encoded.clone());
                         }
                     }
+
+                    for (block_pos, block_state) in block_entity_updates {
+                        Self::broadcast_block_entity_if_needed(
+                            &world,
+                            &block_players,
+                            block_pos,
+                            block_state,
+                        );
+                    }
                 }
             }
         }
+    }
+
+    fn broadcast_block_entity_if_needed(
+        world: &World,
+        players: &[i32],
+        pos: BlockPos,
+        state: steel_utils::BlockStateId,
+    ) {
+        let Some(packet) = world.block_entity_update_packet_for_state(pos, state) else {
+            return;
+        };
+
+        Self::broadcast_encoded_to_players(world, players, packet, "block entity update");
+    }
+
+    fn broadcast_encoded_to_players<P: steel_protocol::packet_traits::ClientPacket>(
+        world: &World,
+        players: &[i32],
+        packet: P,
+        packet_name: &'static str,
+    ) {
+        let Ok(encoded) =
+            EncodedPacket::from_bare(packet, world.compression, ConnectionProtocol::Play)
+        else {
+            log::warn!("Failed to encode {packet_name} packet");
+            return;
+        };
+
+        for entity_id in players {
+            if let Some(player) = world.players.get_by_entity_id(*entity_id) {
+                player.connection.send_encoded(encoded.clone());
+            }
+        }
+    }
+
+    fn is_chunk_pending_for_player(world: &World, entity_id: i32, chunk: ChunkPos) -> bool {
+        world
+            .players
+            .get_by_entity_id(entity_id)
+            .is_some_and(|player| player.chunk_sender.lock().is_pending(chunk))
     }
 
     /// Schedules a new generation task.
@@ -550,6 +779,7 @@ impl ChunkMap {
             // Clean up POI data for this chunk column
             let world = self.world_gen_context.world();
             world.poi_storage.lock().remove_chunk(pos);
+            self.pending_light_updates.lock().remove_chunk(pos);
 
             // Move to unloading_chunks for deferred unload
             if let Some((_, holder)) = self.chunks.remove_sync(&pos) {
@@ -626,6 +856,7 @@ impl ChunkMap {
                 .entered();
                 let start = Instant::now();
                 for holder in &tickable_chunks {
+                    holder.post_process_generation();
                     if let Some(chunk_guard) = holder.try_chunk(ChunkStatus::Full) {
                         chunk_guard.tick(
                             random_tick_speed,
@@ -1028,5 +1259,53 @@ impl ChunkMap {
         );
 
         Ok(saved_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_empty_section_changes_are_drained_top_down() {
+        let mut pending = PendingChunkLightUpdates::default();
+        pending
+            .changed_sections
+            .insert(SectionPos::new(3, -2, 4), true);
+        pending
+            .changed_sections
+            .insert(SectionPos::new(3, 5, 4), false);
+        pending
+            .changed_sections
+            .insert(SectionPos::new(3, 0, 4), true);
+
+        let changes = pending.empty_section_changes();
+        let section_ys = changes
+            .iter()
+            .map(|change| change.section_pos.y())
+            .collect::<Vec<_>>();
+
+        assert_eq!(section_ys, vec![5, 0, -2]);
+    }
+
+    #[test]
+    fn pending_light_updates_drain_in_first_queue_order() {
+        let mut pending = PendingLightUpdates::default();
+        let first_chunk = ChunkPos::new(2, 0);
+        let second_chunk = ChunkPos::new(-1, 4);
+
+        pending.queue_change(first_chunk, BlockPos::new(32, 0, 0), true, None);
+        pending.queue_change(second_chunk, BlockPos::new(-16, 0, 64), true, None);
+        pending.queue_change(first_chunk, BlockPos::new(33, 0, 0), true, None);
+
+        let drained = pending.drain();
+        let chunks = drained
+            .iter()
+            .map(|(chunk_pos, _)| *chunk_pos)
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks, vec![first_chunk, second_chunk]);
+        assert_eq!(drained[0].1.changed_positions.len(), 2);
+        assert!(pending.is_empty());
     }
 }
