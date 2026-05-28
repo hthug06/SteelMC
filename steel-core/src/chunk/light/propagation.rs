@@ -1188,6 +1188,7 @@ mod tests {
         let mut section = ChunkSection::new_empty();
         section.set_block_state(1, 1, 1, vanilla_blocks::LIGHT.default_state());
         let holder = holder_with_section(center, section);
+        set_block_nibble_non_null(&holder, 0);
         let layout = LightCacheLayout::new(center, range());
         let Ok(workset) = LightWorkset::setup(
             layout,

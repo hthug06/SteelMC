@@ -619,7 +619,7 @@ fn bench_overworld_features(c: &mut Criterion) {
     );
 }
 
-const PROFILE_FEATURE_SEED: i64 = 2_965_282_071_327_931_563;
+const BENCHMARK_SEED: i64 = 2_965_282_071_327_931_563;
 const CONCURRENT_FEATURE_GRID_MIN: i32 = -1;
 const CONCURRENT_FEATURE_GRID_MAX: i32 = 2;
 const CONCURRENT_FEATURE_THREAD_COUNT: usize = 8;
@@ -914,17 +914,17 @@ fn build_concurrent_full_pipeline_fixture(
     }
 }
 
-fn build_overworld_light_fixture(seed: i64, center: ChunkPos) -> LightFixture {
-    let generator_key = Identifier::vanilla_static("overworld");
+fn build_light_fixture(generator_path: &'static str, seed: i64, center: ChunkPos) -> LightFixture {
+    let generator_key = Identifier::vanilla_static(generator_path);
     let generator_config = toml::Value::Table(Map::new());
     let output = WorldGeneratorRegistry::new_with_builtins()
         .expect("built-in world generators should register")
         .create(&generator_key, &generator_config, seed)
-        .expect("light benchmark should use the built-in overworld generator");
+        .expect("light benchmark should use a built-in generator");
     let dim = output.dimension_type;
     let generator = Arc::new(output.generator);
     let generation_settings = WorldGenerationSettings::from_generator_config(
-        Identifier::vanilla_static("overworld"),
+        Identifier::vanilla_static(generator_path),
         &output.config,
         dim.key.clone(),
         dim.min_y,
@@ -959,7 +959,7 @@ fn build_overworld_light_fixture(seed: i64, center: ChunkPos) -> LightFixture {
     let world = chunk_runtime
         .block_on(World::new_with_config(
             Arc::clone(&chunk_runtime),
-            Identifier::new("bench", "overworld_light"),
+            Identifier::new("bench", format!("{generator_path}_light")),
             dim,
             seed,
             world_config,
@@ -1017,7 +1017,7 @@ fn bench_overworld_features_concurrent_overlap(c: &mut Criterion) {
             || {
                 build_concurrent_feature_fixture(
                     Identifier::vanilla_static("overworld"),
-                    PROFILE_FEATURE_SEED,
+                    BENCHMARK_SEED,
                 )
             },
             |fixture| {
@@ -1041,13 +1041,13 @@ fn bench_overworld_features_concurrent_overlap(c: &mut Criterion) {
     });
 }
 
-fn bench_overworld_light(c: &mut Criterion) {
+fn bench_light(c: &mut Criterion, name: &str, generator_path: &'static str) {
     ensure_registry();
     let step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Light);
 
-    c.bench_function("overworld_generate_light", |b| {
+    c.bench_function(name, |b| {
         b.iter_batched(
-            || build_overworld_light_fixture(PROFILE_FEATURE_SEED, ChunkPos::new(0, 0)),
+            || build_light_fixture(generator_path, BENCHMARK_SEED, ChunkPos::new(0, 0)),
             |fixture| {
                 let LightFixture {
                     context,
@@ -1062,6 +1062,18 @@ fn bench_overworld_light(c: &mut Criterion) {
     });
 }
 
+fn bench_overworld_light(c: &mut Criterion) {
+    bench_light(c, "overworld_generate_light", "overworld");
+}
+
+fn bench_nether_light(c: &mut Criterion) {
+    bench_light(c, "nether_generate_light", "the_nether");
+}
+
+fn bench_end_light(c: &mut Criterion) {
+    bench_light(c, "end_generate_light", "the_end");
+}
+
 fn bench_overworld_full_pipeline_concurrent_overlap(c: &mut Criterion) {
     ensure_registry();
 
@@ -1070,7 +1082,7 @@ fn bench_overworld_full_pipeline_concurrent_overlap(c: &mut Criterion) {
             || {
                 build_concurrent_full_pipeline_fixture(
                     Identifier::vanilla_static("overworld"),
-                    PROFILE_FEATURE_SEED,
+                    BENCHMARK_SEED,
                 )
             },
             run_concurrent_full_pipeline_batch,
@@ -1582,6 +1594,8 @@ criterion_group!(
     bench_end_features,
     // Light
     bench_overworld_light,
+    bench_nether_light,
+    bench_end_light,
     // Structure starts
     bench_overworld_structure_starts,
     bench_nether_structure_starts,

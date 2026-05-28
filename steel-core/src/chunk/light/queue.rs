@@ -20,12 +20,6 @@ const PACKED_LIGHT_QUEUE_DIRECTIONS_SHIFT: u64 =
     PACKED_LIGHT_QUEUE_LEVEL_SHIFT + PACKED_LIGHT_QUEUE_LEVEL_BITS;
 const PACKED_LIGHT_QUEUE_POSITION_MASK: u64 = (1_u64 << PACKED_LIGHT_QUEUE_POSITION_BITS) - 1;
 const PACKED_LIGHT_QUEUE_FLAGS_MASK: u64 = (1_u64 << 61) | (1_u64 << 62) | (1_u64 << 63);
-pub(crate) const REMOVE_TOP_SKY_SOURCE_ENTRY: LightQueueEntry =
-    LightQueueEntry::decrease_all_directions(MAX_LIGHT_LEVEL);
-pub(crate) const REMOVE_SKY_SOURCE_ENTRY: LightQueueEntry =
-    LightQueueEntry::decrease_skip_one_direction(MAX_LIGHT_LEVEL, Direction::Up);
-pub(crate) const ADD_SKY_SOURCE_ENTRY: LightQueueEntry =
-    LightQueueEntry::increase_skip_one_direction(MAX_LIGHT_LEVEL, false, Direction::Up);
 
 /// ScalableLux axis direction order used by packed light propagation queues.
 ///

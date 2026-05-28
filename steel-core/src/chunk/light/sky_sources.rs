@@ -18,41 +18,6 @@ pub struct ChunkSkyLightSources {
     pub(super) heightmap: [i32; CHUNK_COLUMN_COUNT],
 }
 
-/// Center chunk and four horizontal neighbor skylight source caches.
-#[derive(Debug, Clone, Copy)]
-pub struct SkyLightSourceNeighborhood<'a> {
-    /// Skylight sources for the chunk being updated.
-    pub center: &'a ChunkSkyLightSources,
-    /// Skylight sources for the north neighbor chunk.
-    pub north: &'a ChunkSkyLightSources,
-    /// Skylight sources for the south neighbor chunk.
-    pub south: &'a ChunkSkyLightSources,
-    /// Skylight sources for the west neighbor chunk.
-    pub west: &'a ChunkSkyLightSources,
-    /// Skylight sources for the east neighbor chunk.
-    pub east: &'a ChunkSkyLightSources,
-}
-
-impl<'a> SkyLightSourceNeighborhood<'a> {
-    /// Creates a skylight source neighborhood for one center chunk.
-    #[must_use]
-    pub const fn new(
-        center: &'a ChunkSkyLightSources,
-        north: &'a ChunkSkyLightSources,
-        south: &'a ChunkSkyLightSources,
-        west: &'a ChunkSkyLightSources,
-        east: &'a ChunkSkyLightSources,
-    ) -> Self {
-        Self {
-            center,
-            north,
-            south,
-            west,
-            east,
-        }
-    }
-}
-
 impl ChunkSkyLightSources {
     /// Creates an empty skylight-source cache for a level height.
     pub fn new(min_y: i32, height: i32) -> Result<Self, LightSectionRangeError> {
