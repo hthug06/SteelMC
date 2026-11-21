@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_graph_matches_vanilla_argument_shape() {
+    fn kick_graph_matches_vanilla_argument_shape() {
         init_vanilla_registry();
         let Ok(dispatcher) = create_dispatcher() else {
             panic!("built-in commands should register");
